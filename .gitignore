@@ -32,8 +32,8 @@ data/process/*
 !submissions/sample_submission.csv
 
 # ==================== Model Files ====================
-models/
-oof/
+# models/
+# oof/
 *.pkl
 *.pickle
 *.joblib
