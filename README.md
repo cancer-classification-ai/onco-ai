@@ -76,33 +76,94 @@ python src/predict.py
 
 ```
 onco-ai/
-├── data/                  # 원본 및 정제된 피처 (.parquet, .csv) - Git 관리 제외
-│   ├── raw/               # train.csv, test.csv 등 원본 데이터
-│   └── processed/         # features_v1.parquet 등 전처리된 데이터
-├── notebooks/             # 팀원별 프로토타입/실험용 Jupyter Notebook
-│   ├── eda_and_baseline.ipynb
-│   ├── feature_exp_rwr.ipynb
-│   └── model_exp_lgb.ipynb
-├── oof/                   # 모델별 Out-Of-Fold 예측값 (.csv) - Stacking 입력용
-│   ├── oof_lightgbm_v1.csv
-│   ├── oof_catboost_v1.csv
-│   └── oof_gcn_v1.csv
-├── src/                   # 모듈화된 파이썬 코드
-│   ├── __init__.py
-│   ├── data_loader.py     # Data Loading 및 Parquet 변환 로직
-│   ├── features.py        # CCF, CADD, NMF, RWR 등 피처 생성 클래스
-│   ├── models.py          # LightGBM, CatBoost, GNN 등 모델 클래스
-│   └── utils.py           # Seed 고정, Stratified K-Fold, Evaluation Metric
-├── models/                # 학습된 모델 저장
-│   └── model.pkl
-├── submission/            # 해커톤 제출용 파일
-│   └── submission.csv
-├── config.py              # 하이퍼파라미터 및 경로 설정
-├── main_train.py          # 1차 모델 학습 및 OOF 생성 실행 스크립트
-├── main_stacking.py       # Level-2 Stacking 및 최종 제출 파일 생성 스크립트
-├── requirements.txt       # 의존성 패키지 목록
-├── .gitignore             # data/, oof/, *.parquet 등 대용량 파일 제외 설정
-└── README.md
+├── data/
+│   ├── raw/                     # 원본 데이터 (train.csv, test.csv, sample_submission.csv)
+│   ├── interim/                 # 가공 중간 결과 (예: raw parser output)
+│   └── processed/               # 모델 학습용 정제 피처 (Parquet/CSV)
+│
+├── artifacts/                   # 결과 및 로그 폴더
+│   ├── features/                # 생성된 feature 파일 (features_v*.parquet)
+│   ├── embeddings/              # 사전학습 임베딩 결과
+│   ├── models/                  # 학습된 모델 weights/pkl
+│   ├── oof/                     # OOF 예측 CSV
+│   ├── test_predictions/        # Test 데이터 최종 예측 확률/클래스
+│   ├── submissions/            # 최종 제출 파일
+│   └── logs/                   # 학습/평가 로그 파일
+│
+├── pretrained/                 # 허용된 사전학습 모델 관리
+│   ├── README.md                # 다운로드/사용 방법 명시
+│   └── .gitkeep                 # 빈 디렉토리 유지 (weights는 Git제외)
+│
+├── notebooks/                  # 탐색적 분석 및 프로토타입 노트북
+│   ├── 00_data_audit.ipynb      # 데이터 구조·통계 탐색(EDA)
+│   ├── 01_baseline_parser.ipynb # 변이 파싱 및 baseline 분류
+│   ├── 02_sparse_token_model.ipynb
+│   ├── 03_latent_feature_experiments.ipynb
+│   ├── 04_tabular_models.ipynb
+│   ├── 05_deep_models.ipynb
+│   └── 06_ensemble_analysis.ipynb
+│
+├── src/
+│   └── cancer_hack/            # 프로젝트 모듈 패키지
+│       ├── __init__.py
+│       ├── io.py               # 데이터 로드/저장 (parquet 변환 등)
+│       ├── validation.py       # StratifiedKFold 생성, CV 관리
+│       ├── parser.py           # 변이 문자열 파서(기본 특성 추출)
+│       ├── features_basic.py   # Gene binary, burden 등 Tier1 피처 생성
+│       ├── features_sparse.py  # Token TF-IDF 등 희소 피처 생성
+│       ├── features_latent.py  # NMF, SVD, Autoencoder 등 잠재 피처
+│       ├── features_graph.py   # 공변이 네트워크 피처 등
+│       ├── models_linear.py    # 로지스틱/선형 SVM 모델 클래스
+│       ├── models_gbdt.py      # LightGBM, CatBoost, XGBoost 클래스
+│       ├── models_dl.py       # 딥러닝 모델 정의 (Autoencoder, MLP, CNN, GNN 등)
+│       ├── ensemble.py        # OOF 집계 및 Stacking/Calibration 메타 모델
+│       ├── calibration.py     # 클래스별 확률 보정, 로그잇 바이어스 적용
+│       └── metrics.py         # Macro F1 등 평가 지표 함수
+│
+├── configs/                   # 하이퍼파라미터 및 경로 설정 YAML
+│   ├── paths.yaml
+│   ├── folds.yaml
+│   ├── features.yaml
+│   ├── lgbm.yaml
+│   ├── catboost.yaml
+│   ├── linear.yaml
+│   ├── autoencoder.yaml
+│   └── ensemble.yaml
+│
+├── scripts/                   # 실행 스크립트
+│   ├── audit_data.py           # 데이터 검사·EDA
+│   ├── make_folds.py           # Stratified K-Fold 생성
+│   ├── make_features.py        # 피처 생성 파이프라인 실행
+│   ├── train_linear.py         # 로지스틱/Linear 모델 학습 (OOF 생성)
+│   ├── train_gbdt.py           # GBDT 모델 학습 (LightGBM/CatBoost/XGB)
+│   ├── train_dl.py             # 딥러닝 모델 학습 (CNN/GNN/Autoencoder)
+│   ├── train_meta.py           # Level-2 메타 모델 학습 (Stacking)
+│   └── make_submission.py      # 테스트 예측 및 최종 제출 파일 생성
+│
+├── manifests/                 # 실험·피처·제출 기록
+│   ├── feature_registry.csv    # 생성한 피처 목록 및 버전
+│   ├── experiment_registry.csv # 실험 설정(모델·피처 조합) 기록
+│   ├── pretrained_model_registry.csv  # 사용 사전학습 모델 목록(출처,버전)
+│   └── submission_registry.csv # 제출 이력 및 결과 기록
+│
+├── compliance/                # 규정 준수 문서
+│   ├── COMPETITION_RULES.md    # 대회 규칙 요약
+│   ├── DATA_POLICY.md         # 데이터 사용 정책
+│   ├── PRETRAINED_MODEL_POLICY.md # 사전학습 모델 정책
+│   └── data_leakage_checklist.md  # 누수 방지 확인서
+│
+├── tests/                     # 자동화된 무결성 테스트
+│   ├── test_raw_data_integrity.py   # 원본 데이터 파일 무결성
+│   ├── test_fold_integrity.py       # Fold 별 데이터 일관성
+│   ├── test_feature_alignment.py    # Train/Val/OOF 피처 정렬 일치
+│   ├── test_fold_fit_only.py        # Trainer가 Fold Train만 사용
+│   ├── test_no_external_features.py # 외부 데이터 사용 차단 테스트
+│   ├── test_oof_completeness.py     # 모든 Sample에 OOF 예측 포함 여부
+│   └── test_submission_schema.py    # 제출 파일 스키마 검증
+│
+├── README.md                 # 프로젝트 개요 및 실행 가이드
+└── Makefile                  # 자동화 명령(예: make features, make train, make submit)
+
 ```
 
 
