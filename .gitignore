@@ -1,0 +1,47 @@
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.Python
+
+# ==================== Jupyter Notebook ====================
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+*.ipynb_metadata
+
+# ==================== Virtual Environment ====================
+venv/
+.venv/
+env/
+.env/
+
+# ==================== Data Files ====================
+data/raw/
+data/process/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.h5
+*.hdf5
+!submissions/sample_submission.csv
+
+# ==================== Model Files ====================
+models/
+oof/
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.cbm
+*.lgb
+
+# ==================== macOS ====================
+.DS_Store
