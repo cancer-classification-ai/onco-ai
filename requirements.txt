@@ -1,5 +1,16 @@
+# pip install -r requirements.txt
+
 # Core
 numpy
 pandas
+scipy
 scikit-learn
 pyarrow
+joblib
+
+# GBDT
+xgboost
+lightgbm
+catboost
+
+# 설치 확인: python scripts/check_models.py
