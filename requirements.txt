@@ -5,6 +5,7 @@ numpy
 pandas
 scipy
 scikit-learn
+pyarrow
 joblib
 
 # GBDT
