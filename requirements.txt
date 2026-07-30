@@ -1,0 +1,4 @@
+# Core
+numpy
+pandas
+scikit-learn
