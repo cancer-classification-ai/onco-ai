@@ -45,6 +45,8 @@ def encode_mutation(value: str) -> int:
 def make_mutation_encoding(df: pd.DataFrame) -> pd.DataFrame:
     gene_cols = [c for c in df.columns if c not in _GENE_EXCLUDE]
     meta_cols = [c for c in df.columns if c in _GENE_EXCLUDE]
+    encoded = df[gene_cols].map(encode_mutation).astype("int8")
+    return pd.concat([df[meta_cols], encoded], axis=1)
     
 
 
@@ -175,5 +177,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-    encoded = df[gene_cols].map(encode_mutation).astype("int8")
-    return pd.concat([df[meta_cols], encoded], axis=1)
+    
