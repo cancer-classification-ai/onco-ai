@@ -17,8 +17,10 @@ env/
 .env/
 
 # ==================== Data Files ====================
-data/raw/
-data/process/
+data/raw/*
+!data/raw/.gitkeep
+data/process/*
+!data/process/.gitkeep
 *.csv
 *.tsv
 *.xlsx
