@@ -5,10 +5,7 @@
 원본 데이터 없이 합성 데이터로 몇 초 안에 끝난다. 하나라도 실패하면 종료코드 1.
 """
 
-from __future__ import annotations
-
 import sys
-import traceback
 from pathlib import Path
 
 import numpy as np
