@@ -11,6 +11,7 @@ import pytest
 import re
 
 from cancer_hack.parser import (
+    _COARSE_KIND,
     CELL_FEATURE_COLUMNS,
     DELETION,
     DELINS,
@@ -260,6 +261,38 @@ def test_has_duplicate_token_agrees_with_the_count():
     for value in [v for v, _, _ in DUPLICATE_TABLE]:
         cell = parse_cell(value)
         assert cell.has_duplicate_token == int(cell.duplicate_token_count > 0)
+
+
+# --- 6종 축약 매핑 -----------------------------------------------------------
+# `features_basic` 의 `compute_*` 계열이 타는 경로다. 예전에는 여기가 별도 규칙으로
+# 다시 판정했고, 그 규칙이 정지코돈을 `\*$` 로만 봐서 test 가 `X` 로 재코딩한 토큰
+# 14,355 개를 missense 로 분류했다. 지금은 `classify_token` 에 위임하므로 두 경로가
+# 어긋날 수 없다. 별도 규칙으로 되돌리면 이 표가 깨진다.
+COARSE_TABLE = [
+    ("Q369*", "nonsense"),  # train 표기
+    ("Q369X", "nonsense"),  # test 표기 — 별도 규칙은 여기서 missense 를 냈다
+    ("C3X", "nonsense"),
+    ("R649del", "indel"),
+    ("P11_K12insP", "indel"),  # 범위 표기 — complex 로 새면 안 된다
+    ("R376_A377delinsP", "indel"),
+    ("V600E", "missense"),
+    ("S622S", "synonymous"),
+    ("K16fs", "frameshift"),
+    ("312_313QY>HH", "complex"),
+]
+
+
+@pytest.mark.parametrize("token,coarse", COARSE_TABLE)
+def test_coarse_kind_mapping(token, coarse):
+    assert _COARSE_KIND[classify_token(token)] == coarse
+
+
+def test_coarse_mapping_covers_every_kind():
+    """새 유형을 추가하고 매핑을 빼먹으면 KeyError 로 조용히 죽는다."""
+    from cancer_hack.parser import ALL_KINDS
+
+    for kind in ALL_KINDS:
+        assert kind in _COARSE_KIND
 
 
 def test_duplicate_counts_are_dataclass_fields():

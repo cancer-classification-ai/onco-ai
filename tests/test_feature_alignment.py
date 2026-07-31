@@ -12,6 +12,7 @@ from cancer_hack.features_basic import (
     SAMPLE_FEATURE_COLUMNS,
     _ROLLUP_ANY_COLUMNS,
     _ROLLUP_SUM_COLUMNS,
+    compute_all_burden_features,
     make_gene_event_count_matrix,
     make_gene_mutated_matrix,
     make_sample_mutation_features,
@@ -139,6 +140,74 @@ def test_gene_matrices_are_prefixed_and_aligned(toy_frame):
 def test_missing_gene_column_raises(toy_frame):
     with pytest.raises(ValueError, match="Missing gene columns"):
         make_sample_mutation_features(toy_frame, gene_columns=["TP53", "NOPE"])
+
+
+#: 두 피처 경로가 **토큰 분류에만** 의존하는 열. 여기가 갈리면 분류기가 어긋난 것이다.
+CLASSIFIER_SENSITIVE_COLUMNS = (
+    "mutated_gene_count",
+    "mutation_event_count",
+    "synonymous_event_count",
+    "missense_event_count",
+    "nonsense_event_count",
+    "frameshift_event_count",
+    "multihit_gene_count",
+    "max_events_per_gene",
+    "no_mutation_flag",
+)
+
+#: 이름은 같지만 두 경로가 **정의를 다르게** 쓰는 열. 분류기와 무관한 별개 사안이라
+#: 이번 범위에서 건드리지 않고, 대신 목록으로 고정해 조용히 늘어나는 걸 막는다.
+#:
+#:   complex_event_count            compute_* 는 complex + indel, parse_cell 은 complex 만
+#:   explicit_deletion_*            `del$` 부분일치 대 DELETION_KINDS(deletion + delins)
+#:   functional_event_count         미분류(other) 토큰을 functional 에 넣느냐 마느냐
+KNOWN_DEFINITION_MISMATCHES = frozenset(
+    {
+        "complex_event_count",
+        "explicit_deletion_event_count",
+        "explicit_deletion_gene_count",
+        "has_explicit_deletion",
+        "functional_event_count",
+    }
+)
+
+
+def test_two_feature_paths_agree_on_classification(toy_frame):
+    """토큰 분류에 의존하는 열은 두 경로가 같은 값을 내야 한다.
+
+    `make_sample_mutation_features` 는 `parse_cell`(8종 배타 분류)을 타고,
+    `compute_all_burden_features` 는 `_COARSE_KIND[classify_token(...)]`(6종 축약)을
+    탄다. 예전에는 6종 쪽이 별도 규칙으로 다시 판정했고, 그 규칙이 test 의 `X`
+    정지코돈을 missense 로 봐서 실제 데이터 400행 중 128행에서
+    `nonsense_event_count` 가 갈렸다. 판정을 한 군데로 모은 지금은 어긋날 수 없다.
+    """
+    genes = ["TP53", "KRAS", "EGFR"]
+    sample = make_sample_mutation_features(toy_frame, gene_columns=genes)
+    burden = compute_all_burden_features(toy_frame, genes)
+
+    for column in CLASSIFIER_SENSITIVE_COLUMNS:
+        assert column in sample.columns and column in burden.columns
+        assert list(sample[column]) == list(burden[column]), f"{column} 이 갈린다"
+
+
+def test_known_definition_mismatches_do_not_grow(toy_frame):
+    """정의가 다른 열 목록이 늘어나면 알아채야 한다.
+
+    줄어드는 건 환영이므로 통과시킨다. 늘어나면 새 불일치가 생긴 것이다.
+    """
+    genes = ["TP53", "KRAS", "EGFR"]
+    sample = make_sample_mutation_features(toy_frame, gene_columns=genes)
+    burden = compute_all_burden_features(toy_frame, genes)
+
+    shared = set(sample.columns) & set(burden.columns)
+    mismatched = {
+        column
+        for column in shared
+        if list(sample[column]) != list(burden[column])
+    }
+    assert mismatched <= KNOWN_DEFINITION_MISMATCHES, (
+        f"새로 갈린 열: {sorted(mismatched - KNOWN_DEFINITION_MISMATCHES)}"
+    )
 
 
 def test_rollup_width_follows_the_constants(toy_frame):
