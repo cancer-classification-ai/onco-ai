@@ -15,7 +15,8 @@ import pandas as pd
 
 from .parser import (
     _check_columns,
-    _classify_token,
+    _COARSE_KIND,
+    classify_token,
     _INDEL_RE,
     _MUTATION_EMPTY,
     _parse_mutation_tokens,
@@ -1034,7 +1035,7 @@ def _compute_row_burden(row: pd.Series, gene_columns: list[str]) -> dict:
         gene_has_del = False
         for t in tokens:
             all_tokens.append(t)
-            cls = _classify_token(t)
+            cls = _COARSE_KIND[classify_token(t)]
             if cls == "synonymous":
                 synonymous += 1
             elif cls == "missense":

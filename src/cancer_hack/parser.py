@@ -139,14 +139,6 @@ _INDEL_RE = re.compile(r"del$", re.IGNORECASE)
 #: `EMPTY_VALUES` 의 별칭. 값이 같은 집합을 두 벌 두면 한쪽만 고쳤을 때 어긋난다.
 _MUTATION_EMPTY: frozenset[str] = EMPTY_VALUES
 
-# --- 6종 축약 분류(`_classify_token`) 전용 -----------------------------------
-# develop 의 PR#14 가 위쪽 8종 배타 분류와 이름이 겹치지 않게 `_ROWCOUNT_` 접두사를
-# 붙여 뒀다. 패턴이 서로 다르므로(예: 이쪽 nonsense 는 `\*$` 부분일치, 위쪽은
-# `^[A-Z]\d+[*X]$` 전체일치) 두 벌을 다 둔다. 한쪽으로 합치면 분류가 조용히 달라진다.
-_ROWCOUNT_COMPLEX_RE = re.compile(r"[_>]|del|ins|dup|splice", re.IGNORECASE)
-_ROWCOUNT_FRAMESHIFT_RE = re.compile(r"fs", re.IGNORECASE)
-_ROWCOUNT_NONSENSE_RE = re.compile(r"\*$")
-_MISSENSE_RE = re.compile(r"^[A-Z]\d+[A-Z]$")
 
 
 def split_tokens(value: object) -> list[str]:
@@ -439,30 +431,6 @@ def _parse_mutation_tokens(value: object) -> list[str]:
     return split_tokens(value)
 
 
-def _classify_token(token: str) -> str:
-    """`classify_token` 의 결과를 6종 이름으로 접어 준다.
-
-    분류 규칙은 `classify_token` 하나뿐이다. 예전에는 이 함수가 별도 규칙으로
-    다시 판정했는데, 그쪽이 쓰던 `_NONSENSE_RE` 가 위쪽 정의를 덮어써서
-    `classify_token` 까지 망가뜨렸다. 이제 판정은 한 군데서만 한다.
-
-    ## develop(PR#14) 의 별도 규칙판을 안 쓰는 이유
-
-    PR#14 는 같은 이름 충돌을 정규식에 `_ROWCOUNT_` 접두사를 붙여 해결했고 별도
-    규칙은 그대로 뒀다. 그 규칙은 정지코돈을 `\\*$` 로만 보기 때문에 test 가 `X` 로
-    재코딩한 토큰을 `_MISSENSE_RE` 가 먼저 삼킨다 — 실측 14,477 토큰이 nonsense
-    대신 missense 가 된다. `P11_K12insP` 같은 범위 표기 insertion 도 complex 로
-    간다. 두 판정의 실측 차이는 `analysis` 기록을 참고할 것.
-
-    `_ROWCOUNT_*` 정규식은 지운 게 아니라 위에 그대로 남겨 뒀다. 외부에서 import
-    하는 코드가 있어도 깨지지 않는다.
-
-    >>> _classify_token("Q369*"), _classify_token("Q369X")
-    ('nonsense', 'nonsense')
-    >>> _classify_token("R649del"), _classify_token("P11_K12insP")
-    ('indel', 'indel')
-    """
-    return _COARSE_KIND[classify_token(token)]
 
 # 지정한 유전자 컬럼이 모두 존재하는지 확인
 def _check_columns(df: pd.DataFrame, gene_columns: list[str]) -> None:
@@ -475,5 +443,5 @@ def _row_token_class_counts(row: pd.Series, gene_columns: list[str]) -> Counter:
     counts: Counter = Counter()
     for gene in gene_columns:
         for token in _parse_mutation_tokens(row[gene]):
-            counts[_classify_token(token)] += 1
+            counts[_COARSE_KIND[classify_token(token)]] += 1
     return counts
