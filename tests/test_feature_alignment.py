@@ -10,6 +10,8 @@ import pytest
 
 from cancer_hack.features_basic import (
     SAMPLE_FEATURE_COLUMNS,
+    _ROLLUP_ANY_COLUMNS,
+    _ROLLUP_SUM_COLUMNS,
     make_gene_event_count_matrix,
     make_gene_mutated_matrix,
     make_sample_mutation_features,
@@ -137,3 +139,41 @@ def test_gene_matrices_are_prefixed_and_aligned(toy_frame):
 def test_missing_gene_column_raises(toy_frame):
     with pytest.raises(ValueError, match="Missing gene columns"):
         make_sample_mutation_features(toy_frame, gene_columns=["TP53", "NOPE"])
+
+
+def test_rollup_width_follows_the_constants(toy_frame):
+    """상수만 고치고 소비부를 안 고치면 열이 안 늘어난다. 그걸 잡는다."""
+    genes = ["TP53", "KRAS", "EGFR"]
+    rolled = make_sample_mutation_features(
+        toy_frame, gene_columns=genes, include_cell_rollup=True
+    )
+    assert len(rolled.columns) == (
+        len(TEAM_SCHEMA) + len(_ROLLUP_ANY_COLUMNS) + len(_ROLLUP_SUM_COLUMNS)
+    )
+
+
+def test_rollup_carries_both_duplicate_counts(toy_frame):
+    """샘플 단위까지 올라와야 학습 피처가 된다 — 셀 단위 자동 반영과 별개다."""
+    genes = ["TP53", "KRAS", "EGFR"]
+    rolled = make_sample_mutation_features(
+        toy_frame, gene_columns=genes, include_cell_rollup=True
+    )
+    for name in ("duplicate_token_count", "duplicate_signature_count"):
+        assert name in rolled.columns
+    # toy_frame 의 KRAS `V600E V600E` 한 건이 두 기준 모두에 잡힌다.
+    assert rolled["duplicate_token_count"].sum() == 1
+    assert rolled["duplicate_signature_count"].sum() == 1
+
+
+def test_duplicate_signature_count_stays_out_of_robust_rollup():
+    """train 1.30 / test 52.8 로 40배 시프트다. 시프트 내성 블록에 새면 안 된다."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from train_gbdt import ROBUST_ROLLUP_COLUMNS
+
+    assert "duplicate_signature_count" not in ROBUST_ROLLUP_COLUMNS
+    assert "duplicate_token_count" not in ROBUST_ROLLUP_COLUMNS
+    # 플래그 버전은 배율이 안정적이라 남아 있어야 한다.
+    assert "has_duplicate_token" in ROBUST_ROLLUP_COLUMNS
