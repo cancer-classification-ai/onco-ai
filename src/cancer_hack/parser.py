@@ -131,16 +131,16 @@ _MUTATION_EMPTY: frozenset[str] = frozenset({"", "WT", "0", "NA", "NAN", "NONE",
 _SYNONYMOUS_RE = re.compile(r"^([A-Z])\d+\1$")
 
 # 복합 변이 (del, ins, dup, splice, _, > 포함)
-_COMPLEX_RE = re.compile(r"[_>]|del|ins|dup|splice", re.IGNORECASE)
+_ROWCOUNT_COMPLEX_RE = re.compile(r"[_>]|del|ins|dup|splice", re.IGNORECASE)
 
 # 삽입/결실 변이 - del로 끝나는 토큰 (예: R649del, 490del, E746_A750del)
 _INDEL_RE = re.compile(r"del$", re.IGNORECASE)
 
 # 프레임시프트 변이 (fs 포함)
-_FRAMESHIFT_RE = re.compile(r"fs", re.IGNORECASE)
+_ROWCOUNT_FRAMESHIFT_RE = re.compile(r"fs", re.IGNORECASE)
 
 # 넌센스 변이 (종결 코돈, *로 끝남)
-_NONSENSE_RE = re.compile(r"\*$")
+_ROWCOUNT_NONSENSE_RE = re.compile(r"\*$")
 
 # 미스센스 변이 (예: R175H)
 _MISSENSE_RE = re.compile(r"^[A-Z]\d+[A-Z]$")
@@ -334,11 +334,11 @@ def _classify_token(token: str) -> str:
         return "synonymous"
     if _INDEL_RE.search(token):
         return "indel"
-    if _COMPLEX_RE.search(token):
+    if _ROWCOUNT_COMPLEX_RE.search(token):
         return "complex"
-    if _FRAMESHIFT_RE.search(token):
+    if _ROWCOUNT_FRAMESHIFT_RE.search(token):
         return "frameshift"
-    if _NONSENSE_RE.search(token):
+    if _ROWCOUNT_NONSENSE_RE.search(token):
         return "nonsense"
     if _MISSENSE_RE.match(token):
         return "missense"

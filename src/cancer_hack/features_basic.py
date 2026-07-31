@@ -452,6 +452,78 @@ class BurdenBinner:
         return out
 
 
+# 비율·변환 변수 10종 — make_sample_mutation_features() 가 낸 8개(stateless)와
+# BurdenBinner 가 만드는 2개(stateful)를 정본 순서 하나로 묶는다. 모델 입력 X 의
+# 컬럼 순서는 항상 이 상수와 일치한다.
+RATIO_TRANSFORM_FEATURE_COLUMNS: tuple[str, ...] = (
+    "log1p_mutated_gene_count",
+    "log1p_mutation_event_count",
+    "functional_ratio",
+    "synonymous_ratio",
+    "missense_ratio",
+    "nonsense_ratio",
+    "frameshift_ratio",
+    "multihit_gene_ratio",
+    "hypermutated_flag",
+    "burden_quantile_bin",
+)
+
+
+class RatioTransformFeatures:
+    """비율·변환 변수 10종을 모델 입력 `X`로 바로 쓸 수 있게 묶는 fit/transform.
+
+    새 계산식은 없다. 앞 8개는 `make_sample_mutation_features()`가 이미 계산해 둔
+    값을 그대로 고르고, 뒤 2개(`hypermutated_flag`, `burden_quantile_bin`)는 내부
+    `BurdenBinner`가 만든다. `fit()`은 train(또는 train fold)에서만 부른다.
+
+    >>> feats = pd.DataFrame({
+    ...     "log1p_mutated_gene_count": [0.0, 1.0],
+    ...     "log1p_mutation_event_count": [0.0, 1.0],
+    ...     "functional_ratio": [0.0, 1.0],
+    ...     "synonymous_ratio": [0.0, 0.0],
+    ...     "missense_ratio": [0.0, 1.0],
+    ...     "nonsense_ratio": [0.0, 0.0],
+    ...     "frameshift_ratio": [0.0, 0.0],
+    ...     "multihit_gene_ratio": [0.0, 0.0],
+    ...     "mutation_event_count": [0, 5],
+    ... })
+    >>> out = RatioTransformFeatures().fit(feats).transform(feats)
+    >>> list(out.columns) == list(RATIO_TRANSFORM_FEATURE_COLUMNS)
+    True
+    """
+
+    def __init__(self, *, burden_binner: BurdenBinner | None = None) -> None:
+        self._binner = burden_binner if burden_binner is not None else BurdenBinner()
+        self._fitted = False
+
+    def fit(self, train_features: pd.DataFrame) -> "RatioTransformFeatures":
+        """`train_features`의 mutation burden 정보만 써서 `BurdenBinner`를 fit한다."""
+        burden_column = self._binner.burden_column
+        if burden_column not in train_features.columns:
+            raise ValueError(f"Missing feature columns: ['{burden_column}']")
+        self._binner.fit(train_features)
+        self._fitted = True
+        return self
+
+    def transform(self, features: pd.DataFrame) -> pd.DataFrame:
+        """fit에서 저장한 경계만 써서 정확히 10개 컬럼을 정본 순서로 반환한다."""
+        if not self._fitted:
+            raise RuntimeError(
+                "RatioTransformFeatures.fit() 을 먼저 호출해야 한다 "
+                "(train 또는 train fold 에서)."
+            )
+        required = set(RATIO_TRANSFORM_FEATURE_COLUMNS[:8]) | {self._binner.burden_column}
+        missing = sorted(required - set(features.columns))
+        if missing:
+            raise ValueError(f"Missing feature columns: {missing}")
+        binned = self._binner.transform(features)
+        return binned[list(RATIO_TRANSFORM_FEATURE_COLUMNS)].copy()
+
+    def fit_transform(self, train_features: pd.DataFrame) -> pd.DataFrame:
+        """`fit(train_features).transform(train_features)`의 편의 함수."""
+        return self.fit(train_features).transform(train_features)
+
+
 def row_to_exact_mutation_document(
     row: pd.Series,
     gene_columns: list[str],
