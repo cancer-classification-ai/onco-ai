@@ -14,7 +14,7 @@ import pandas as pd
 from .parser import (
     _check_columns,
     _classify_token,
-    _EXPLICIT_DEL_RE,
+    _INDEL_RE,
     _MUTATION_EMPTY,
     _parse_mutation_tokens,
     _row_token_class_counts,
@@ -226,7 +226,7 @@ def compute_synonymous_event_count(
     ).rename("synonymous_event_count")
 
 
-# functional_event_count: 단백질 변화를 유발하는 변이 token 수 (missense + nonsense + frameshift + complex)
+# functional_event_count: 단백질 변화를 유발하는 변이 token 수 (missense + nonsense + frameshift + complex + indel)
 def compute_functional_event_count(
     df: pd.DataFrame,
     gene_columns: list[str],
@@ -235,7 +235,7 @@ def compute_functional_event_count(
 
     def _count(row: pd.Series) -> int:
         counts = _row_token_class_counts(row, gene_columns)
-        return counts["missense"] + counts["nonsense"] + counts["frameshift"] + counts["complex"]
+        return counts["missense"] + counts["nonsense"] + counts["frameshift"] + counts["complex"] + counts["indel"]
 
     return df.apply(_count, axis=1).rename("functional_event_count")
 
@@ -276,16 +276,18 @@ def compute_frameshift_event_count(
     ).rename("frameshift_event_count")
 
 
-# complex_event_count: 구조적 복합 변이 token 수 (예: 468_469LG>F*, E746_A750del)
+# complex_event_count: 구조적 복합 변이 token 수 (예: 468_469LG>F*, E746_A750del) - indel 포함
 def compute_complex_event_count(
     df: pd.DataFrame,
     gene_columns: list[str],
 ) -> pd.Series:
     _check_columns(df, gene_columns)
-    return df.apply(
-        lambda row: _row_token_class_counts(row, gene_columns)["complex"],
-        axis=1,
-    ).rename("complex_event_count")
+
+    def _count(row: pd.Series) -> int:
+        counts = _row_token_class_counts(row, gene_columns)
+        return counts["complex"] + counts["indel"]
+
+    return df.apply(_count, axis=1).rename("complex_event_count")
 
 
 # multihit_gene_count: 한 유전자에 2개 이상의 변이가 있는 유전자 수
@@ -384,7 +386,7 @@ def compute_explicit_deletion_event_count(
             1
             for g in gene_columns
             for t in _parse_mutation_tokens(row[g])
-            if _EXPLICIT_DEL_RE.search(t)
+            if _INDEL_RE.search(t)
         ),
         axis=1,
     ).rename("explicit_deletion_event_count")
@@ -400,7 +402,7 @@ def compute_explicit_deletion_gene_count(
         lambda row: sum(
             1
             for g in gene_columns
-            if any(_EXPLICIT_DEL_RE.search(t) for t in _parse_mutation_tokens(row[g]))
+            if any(_INDEL_RE.search(t) for t in _parse_mutation_tokens(row[g]))
         ),
         axis=1,
     ).rename("explicit_deletion_gene_count")
@@ -415,7 +417,7 @@ def compute_has_explicit_deletion(
     return df.apply(
         lambda row: int(
             any(
-                _EXPLICIT_DEL_RE.search(t)
+                _INDEL_RE.search(t)
                 for g in gene_columns
                 for t in _parse_mutation_tokens(row[g])
             )
@@ -464,7 +466,7 @@ def _compute_row_burden(row: pd.Series, gene_columns: list[str]) -> dict:
                 frameshift += 1
             else:
                 complex_ += 1
-            if _EXPLICIT_DEL_RE.search(t):
+            if _INDEL_RE.search(t):
                 explicit_del_event_count += 1
                 gene_has_del = True
         if gene_has_del:

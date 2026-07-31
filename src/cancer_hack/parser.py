@@ -14,8 +14,8 @@ _SYNONYMOUS_RE = re.compile(r"^([A-Z])\d+\1$")
 # 복합 변이 (del, ins, dup, splice, _, > 포함)
 _COMPLEX_RE = re.compile(r"[_>]|del|ins|dup|splice", re.IGNORECASE)
 
-# 명시적 deletion token (예: R649del, 490del, E746_A750del)
-_EXPLICIT_DEL_RE = re.compile(r"del", re.IGNORECASE)
+# 삽입/결실 변이 - del로 끝나는 토큰 (예: R649del, 490del, E746_A750del)
+_INDEL_RE = re.compile(r"del$", re.IGNORECASE)
 
 # 프레임시프트 변이 (fs 포함)
 _FRAMESHIFT_RE = re.compile(r"fs", re.IGNORECASE)
@@ -39,6 +39,8 @@ def _parse_mutation_tokens(value: object) -> list[str]:
 def _classify_token(token: str) -> str:
     if _SYNONYMOUS_RE.match(token):
         return "synonymous"
+    if _INDEL_RE.search(token):
+        return "indel"
     if _COMPLEX_RE.search(token):
         return "complex"
     if _FRAMESHIFT_RE.search(token):
