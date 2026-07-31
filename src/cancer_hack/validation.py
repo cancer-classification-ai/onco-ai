@@ -20,13 +20,29 @@
 Jaccard 로 찾은 422쌍이 전부 이미 문자열이 동일한 중복이었고, 최종 분할이 5,636그룹 /
 다중 멤버 451개 / 최대 94명으로 두 방식이 일치했다. union-find 는 6,201² 밀집 행렬을
 세 개 만들어 피크 1.9GB 를 쓰는데 기여가 정확히 0이다. 그래서 기본은 해시다.
+
+## 두 갈래 API — 어느 쪽을 쓰나
+
+프로파일 해시의 **정의는 `make_profile_hash` 하나**다(PR#16). 아래
+`mutation_profile_group_keys` 는 그 해시를 정수 코드로 접어 주는 얇은 껍데기이고,
+학습 파이프라인은 정수 코드 쪽을 쓴다 — `train_gbdt` 의 fold 루프가 0-based 정수
+fold 번호를 쓰고 `group_size_inverse_weight` 가 그룹 크기를 세기 때문이다.
+
+fold 생성도 두 갈래다.
+
+    make_stratified_kfold / make_profile_group_kfold   (index 쌍을 내는 제너레이터)
+    make_splitter / iter_folds / fold_assignment       (fold 번호 배열을 내는 쪽)
+
+앞쪽은 노트북에서 fold 를 눈으로 확인할 때, 뒤쪽은 `train_folds.parquet` 에
+`fold_skf5`·`fold_group5` 두 열을 함께 저장할 때 쓴다. 뒤쪽만 skf 를 만들 수 있고
+0-based 라 학습 스크립트가 그대로 인덱싱한다.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
 import numpy as np
 import pandas as pd
@@ -37,22 +53,39 @@ from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 SEED = 42
 META_COLUMNS = ("ID", "SUBCLASS")
 CVKind = Literal["skf", "sgkf"]
+FoldIndex = tuple[pd.Index, pd.Index]
 
 #: fold 파일·아티팩트 이름에 쓰는 약칭. 기존 `oof_..._group5_...csv` 규약을 잇는다.
 CV_SLUG: dict[str, str] = {"skf": "skf5", "sgkf": "group5"}
 
 
 # ---------------------------------------------------------------- 그룹 키
+def make_profile_hash(df: pd.DataFrame, gene_columns: list[str]) -> pd.Series:
+    """유전자 변이 벡터를 해시로 변환해 동일 변이 프로파일을 식별한다.
+
+    동일한 유전자 변이 벡터를 가진 행은 같은 해시값을 가진다.
+    StratifiedGroupKFold의 groups 인자로 직접 사용할 수 있다.
+    """
+    return (
+        pd.util.hash_pandas_object(df[gene_columns], index=False)
+        .astype(str)
+        .rename("profile_hash")
+        .reset_index(drop=True)
+    )
+
+
 def mutation_profile_group_keys(
     frame: pd.DataFrame,
     gene_columns: Sequence[str] | None = None,
 ) -> np.ndarray:
     """변이 프로파일이 완전히 같은 행에 같은 정수를 준다.
 
-    `frame` 은 원본 csv 를 `dtype=str, na_filter=False` 로 읽은 것이어야 한다.
+    해시 자체는 `make_profile_hash` 가 만든다 — 정의를 두 벌 두지 않는다. 여기서는
+    그 해시를 **등장 순서대로 정수 코드**로 접기만 한다. 학습 파이프라인이 정수를
+    요구해서다(`fold_assignment` 의 0-based fold 번호, `group_size_inverse_weight`
+    의 `np.bincount`).
 
-    `DataFrame.apply(axis=1)` 로 join 하면 실측 80초가 걸린다. numpy object 배열을
-    직접 도는 쪽이 8.6초다.
+    `frame` 은 원본 csv 를 `dtype=str, na_filter=False` 로 읽은 것이어야 한다.
 
     >>> f = pd.DataFrame({"A": ["WT", "WT", "R1H"], "B": ["Q2*", "Q2*", "WT"]})
     >>> keys = mutation_profile_group_keys(f)
@@ -61,10 +94,8 @@ def mutation_profile_group_keys(
     """
     if gene_columns is None:
         gene_columns = [c for c in frame.columns if c not in META_COLUMNS]
-    values = frame[list(gene_columns)].to_numpy(dtype=object)
-    # \x1f (unit separator) — 변이 문자열에 절대 나오지 않는 구분자
-    joined = np.array(["\x1f".join(row) for row in values], dtype=object)
-    codes, _ = pd.factorize(joined)
+    hashed = make_profile_hash(frame, list(gene_columns))
+    codes, _ = pd.factorize(hashed)
     return codes.astype(np.int64)
 
 
@@ -148,6 +179,118 @@ def twin_group_keys_jaccard(
     for node in list(parent):
         groups[node] = find(node)
     return groups
+
+
+# ------------------------------------------------- fold (PR#16 · 제너레이터)
+# 아래 네 함수는 PR#16 원문 그대로다. index 쌍을 내는 제너레이터 계열이라
+# 노트북에서 fold 를 눈으로 확인할 때 쓴다. fold 번호는 1-based 이고 group CV
+# 하나만 만든다 — 학습 스크립트는 아래 `fold_assignment`(0-based, skf+sgkf)를
+# 쓴다. 두 갈래가 같은 프로파일 해시를 보므로 그룹 경계는 서로 같다.
+def make_stratified_kfold(
+    df: pd.DataFrame,
+    gene_columns: list[str],
+    label_column: str = "SUBCLASS",
+    n_splits: int = 5,
+    random_state: int = 42,
+) -> Iterator[FoldIndex]:
+    """일반 StratifiedKFold를 생성한다.
+
+    샘플 단위 예측 성능 측정에 사용한다.
+    Profile-Grouped CV와 점수 차이를 비교해 데이터 누수 규모를 확인한다.
+
+    Yields:
+        (train_index, valid_index) — DataFrame의 정수 위치 인덱스 쌍
+    """
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    X = df[gene_columns].reset_index(drop=True)
+    y = df[label_column].reset_index(drop=True)
+
+    for train_pos, valid_pos in skf.split(X, y):
+        yield X.index[train_pos], X.index[valid_pos]
+
+
+def make_profile_group_kfold(
+    df: pd.DataFrame,
+    gene_columns: list[str],
+    label_column: str = "SUBCLASS",
+    n_splits: int = 5,
+    random_state: int = 42,
+) -> Iterator[FoldIndex]:
+    """Profile Hash 기반 StratifiedGroupKFold를 생성한다.
+
+    동일 변이 벡터(profile_hash)를 가진 행들을 항상 같은 Fold에 배치한다.
+    Train Fold와 Validation Fold 사이에 동일 변이 벡터가 섞이지 않아
+    CV 점수의 낙관적 편향을 방지한다.
+
+    모든-WT 그룹(94행)처럼 매우 큰 그룹이 존재하므로
+    Fold별 클래스 분포가 완벽히 균등하지 않을 수 있다.
+    반드시 fold_class_distribution()으로 실제 분포를 확인해야 한다.
+
+    Yields:
+        (train_index, valid_index) — DataFrame의 정수 위치 인덱스 쌍
+    """
+    sgkf = StratifiedGroupKFold(
+        n_splits=n_splits, shuffle=True, random_state=random_state
+    )
+    X = df[gene_columns].reset_index(drop=True)
+    y = df[label_column].reset_index(drop=True)
+    groups = make_profile_hash(df, gene_columns)
+
+    for train_pos, valid_pos in sgkf.split(X, y, groups=groups):
+        yield X.index[train_pos], X.index[valid_pos]
+
+
+def assign_fold_column(
+    df: pd.DataFrame,
+    gene_columns: list[str],
+    label_column: str = "SUBCLASS",
+    n_splits: int = 5,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """각 행에 fold 번호(1-based)를 부여한 DataFrame을 반환한다.
+
+    반환된 DataFrame은 원본과 같은 행 순서를 유지하며
+    'fold' 컬럼(int, 1~n_splits)이 추가된다.
+    make_folds.py 스크립트에서 Parquet로 저장하는 용도로 사용한다.
+    """
+    result = df.reset_index(drop=True).copy()
+    result["fold"] = -1
+
+    for fold_num, (_, valid_pos) in enumerate(
+        make_profile_group_kfold(
+            df,
+            gene_columns=gene_columns,
+            label_column=label_column,
+            n_splits=n_splits,
+            random_state=random_state,
+        ),
+        start=1,
+    ):
+        result.loc[valid_pos, "fold"] = fold_num
+
+    return result
+
+
+def fold_class_distribution(
+    df: pd.DataFrame,
+    label_column: str = "SUBCLASS",
+    fold_column: str = "fold",
+) -> pd.DataFrame:
+    """Fold별 클래스 분포를 비율(%)로 반환한다.
+
+    assign_fold_column() 이후 반드시 호출해 Fold 균형을 확인한다.
+    반환값: MultiIndex(fold, SUBCLASS) → count, ratio(%) DataFrame
+    """
+    counts = (
+        df.groupby([fold_column, label_column])
+        .size()
+        .rename("count")
+        .reset_index()
+    )
+    counts["ratio"] = counts.groupby(fold_column)["count"].transform(
+        lambda s: s / s.sum() * 100
+    )
+    return counts.set_index([fold_column, label_column])
 
 
 # ---------------------------------------------------------------- fold
