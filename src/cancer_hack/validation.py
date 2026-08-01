@@ -36,6 +36,15 @@ fold 생성도 두 갈래다.
 앞쪽은 노트북에서 fold 를 눈으로 확인할 때, 뒤쪽은 `train_folds.parquet` 에
 `fold_skf5`·`fold_group5` 두 열을 함께 저장할 때 쓴다. 뒤쪽만 skf 를 만들 수 있고
 0-based 라 학습 스크립트가 그대로 인덱싱한다.
+
+## fold 파일은 누가 만드나
+
+`build_fold_frame` 이 그 두 열을 한 프레임으로 묶고, **파일로 쓰는 건
+`scripts/make_folds.py` 하나뿐이다.** `scripts/train_gbdt.py` 는 읽기만 한다.
+예전에는 학습 스크립트가 파일이 없으면 제 손으로 만들어 저장했는데, 그러면 같은
+이름의 파일이 두 경로에서 나오고 `artifacts/oof/` 의 예측이 어느 분할에서
+나왔는지 사후에 확인할 방법이 없어진다. fold 방식을 바꿀 일이 생기면
+`make_folds.py` 만 다시 돌린다.
 """
 
 from __future__ import annotations
@@ -56,7 +65,11 @@ CVKind = Literal["skf", "sgkf"]
 FoldIndex = tuple[pd.Index, pd.Index]
 
 #: fold 파일·아티팩트 이름에 쓰는 약칭. 기존 `oof_..._group5_...csv` 규약을 잇는다.
+#: 5-fold 를 전제로 굳어 있다 — 열 이름은 `fold_column()` 으로 만든다.
 CV_SLUG: dict[str, str] = {"skf": "skf5", "sgkf": "group5"}
+
+#: fold 파일에서 fold 번호가 아닌 열. 순서가 파일의 앞 두 열 순서다.
+FOLD_META_COLUMNS: tuple[str, ...] = ("ID", "group_key")
 
 
 # ---------------------------------------------------------------- 그룹 키
@@ -376,6 +389,71 @@ def fold_assignment(
     if (assignment < 0).any():
         raise RuntimeError("어느 fold 에도 안 들어간 행이 있다")
     return assignment
+
+
+def fold_column(kind: CVKind, n_splits: int = 5) -> str:
+    """fold 파일의 열 이름을 만든다.
+
+    `CV_SLUG` 는 아티팩트 이름 규약이라 5-fold 가 문자열에 박혀 있다. 열 이름은
+    실제 분할 수를 따라가야 `--n-splits 10` 으로 만든 파일이 5-fold 인 척하지
+    않는다. 기본값에서는 두 규약이 같은 문자열을 낸다.
+
+    >>> fold_column("skf"), fold_column("sgkf")
+    ('fold_skf5', 'fold_group5')
+    >>> fold_column("sgkf", 10)
+    'fold_group10'
+    """
+    if kind not in CV_SLUG:
+        raise ValueError(f"알 수 없는 CV 방식: {kind!r} (skf 또는 sgkf)")
+    return f"fold_{'skf' if kind == 'skf' else 'group'}{n_splits}"
+
+
+def build_fold_frame(
+    raw_csv_path: str | Path,
+    *,
+    label_column: str = "SUBCLASS",
+    n_splits: int = 5,
+    seed: int = SEED,
+    group_cache_path: str | Path | None = None,
+) -> pd.DataFrame:
+    """원본 csv -> `ID · group_key · fold_skf{n} · fold_group{n}` 프레임.
+
+    **fold 를 만드는 정의는 여기 하나다.** 파일로 떨어뜨리는 건 `make_folds.py`
+    뿐이고 `train_gbdt.py` 는 그 파일을 읽기만 한다. 학습 스크립트가 자기 fold 를
+    따로 만들면 "이 OOF 가 어느 분할에서 나왔나"를 아무도 답할 수 없게 된다.
+
+    행 순서는 원본 csv 그대로다. 피처 parquet 들이 전부 같은 순서라 소비하는 쪽은
+    ID 배열만 대조하면 된다.
+
+    `sgkf` 의 groups 로 `build_group_keys` 의 **정수 코드**를 넘긴다.
+    `make_profile_group_kfold` 는 같은 해시를 문자열로 넘기는데,
+    `StratifiedGroupKFold` 가 내부에서 `np.unique` 로 그룹을 정렬하므로 문자열과
+    정수는 순서가 달라 분할이 갈린다. `artifacts/oof/` 에 쌓인 예측이 전부 정수
+    코드 쪽에서 나왔으므로 이 경로를 정본으로 둔다.
+    """
+    groups = build_group_keys(raw_csv_path, cache_path=group_cache_path)
+    labels = pd.read_csv(
+        raw_csv_path, usecols=["ID", label_column], dtype=str, na_filter=False
+    )
+
+    ids = labels["ID"].astype(str).to_numpy()
+    if not np.array_equal(groups["ID"].astype(str).to_numpy(), ids):
+        raise ValueError(
+            "그룹 키의 ID 순서가 원본 csv 와 다르다. "
+            f"캐시({group_cache_path})가 오래된 것일 수 있다."
+        )
+
+    y = labels[label_column].to_numpy()
+    frame = pd.DataFrame({"ID": ids, "group_key": groups["group_key"].to_numpy()})
+    for kind in ("skf", "sgkf"):
+        frame[fold_column(kind, n_splits)] = fold_assignment(
+            y,
+            kind=kind,
+            n_splits=n_splits,
+            seed=seed,
+            groups=frame["group_key"].to_numpy(),
+        )
+    return frame
 
 
 # ---------------------------------------------------------------- 선택기

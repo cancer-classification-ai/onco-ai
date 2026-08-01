@@ -22,9 +22,11 @@
 
 ## CV
 
-`data/process/train_folds.parquet` 의 사전계산 폴드를 쓴다. 없으면 그 자리에서
-만들어 저장한다. `fold_skf5` 는 `StratifiedKFold(5, shuffle=True, random_state=42)`
-와 배열 단위로 동일함이 확인돼 있어 팀 기존 기록과 그대로 비교된다.
+`data/process/train_folds.parquet` 의 사전계산 폴드를 **읽기만** 한다. 파일이 없으면
+만들지 않고 멈춘다 — `scripts/make_folds.py` 가 fold 를 만드는 유일한 곳이다. 그래서
+`--seed` 는 모델 시드일 뿐 분할에는 영향을 주지 않는다(분할 시드는
+`make_folds.py --seed`). `fold_skf5` 는 `StratifiedKFold(5, shuffle=True,
+random_state=42)` 와 배열 단위로 동일함이 확인돼 있어 팀 기존 기록과 그대로 비교된다.
 
 **주 지표는 skf 다.** sgkf 가 늘 0.006 쯤 높지만 그 이득은 전부 쌍둥이 행에서 나온다
 (단독 행 5,185개에서는 두 CV 차이가 +0.0006 로 사실상 동률). sgkf 는 변이 프로파일이
@@ -84,10 +86,10 @@ from cancer_hack.models_gbdt import (  # noqa: E402
 )
 from cancer_hack.validation import (  # noqa: E402
     CV_SLUG,
+    FOLD_META_COLUMNS,
     Chi2TopKSelector,
-    build_group_keys,
     check_all_classes_present,
-    fold_assignment,
+    fold_column,
 )
 
 RAW_DIR = PROJECT_ROOT / "data/raw"
@@ -324,7 +326,7 @@ class Dataset:
     바뀌어서 미리 만들어 둘 수가 없다.
     """
 
-    def __init__(self, blocks: set[str], *, seed: int, n_splits: int) -> None:
+    def __init__(self, blocks: set[str], *, n_splits: int) -> None:
         t0 = time.perf_counter()
 
         # 라벨과 ID 는 도메인 블록에서 받는다 — 어떤 config 든 domain 을 쓴다.
@@ -352,7 +354,7 @@ class Dataset:
             target[name] = (columns, train_array, test_array)
             log(f"[block] {name:9s} {len(columns):>6,}열  {BLOCK_DESC[name]}")
 
-        self.folds = self._load_folds(seed=seed, n_splits=n_splits)
+        self.folds = self._load_folds(n_splits=n_splits)
         sizes = self.folds.groupby("group_key").size()
         singleton_groups = set(sizes[sizes == 1].index)
         self.singleton_mask = self.folds["group_key"].isin(singleton_groups).to_numpy()
@@ -462,36 +464,49 @@ class Dataset:
             aligned[columns].to_numpy(np.float32),
         )
 
-    def _load_folds(self, *, seed: int, n_splits: int) -> pd.DataFrame:
-        path = PROC_DIR / "train_folds.parquet"
-        if path.exists():
-            folds = pd.read_parquet(path)
-            if (folds["ID"].astype(str).to_numpy() == self.train_ids).all():
-                log(f"[folds] {path.name} 재사용")
-                return folds
-            log(f"[folds] {path.name} 의 ID 순서가 달라 다시 만든다")
+    def _load_folds(self, *, n_splits: int) -> pd.DataFrame:
+        """사전계산 fold 파일을 **읽기만** 한다. 없으면 만들지 않고 멈춘다.
 
-        groups = build_group_keys(
-            RAW_DIR / "train.csv", cache_path=PROC_DIR / "train_group_keys.parquet"
-        )
-        groups = pd.DataFrame({"ID": self.train_ids}).merge(
-            groups, on="ID", how="left", validate="one_to_one"
-        )
-        if groups["group_key"].isna().any():
-            raise ValueError("그룹 키가 없는 train 행이 있다")
-        folds = pd.DataFrame(
-            {"ID": self.train_ids, "group_key": groups["group_key"].to_numpy()}
-        )
-        for kind in ("skf", "sgkf"):
-            folds[f"fold_{CV_SLUG[kind]}"] = fold_assignment(
-                self.y,
-                kind=kind,
-                n_splits=n_splits,
-                seed=seed,
-                groups=folds["group_key"].to_numpy(),
+        예전에는 파일이 없으면 여기서 만들어 저장했다. 그러면 같은 이름의 파일이
+        두 경로에서 나오고, `artifacts/oof/` 의 예측이 어느 분할에서 나왔는지
+        사후에 확인할 수 없다. fold 를 쓰는 쪽과 만드는 쪽을 갈라 둔다.
+        """
+        path = PROC_DIR / "train_folds.parquet"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"{path} 가 없다. scripts/make_folds.py 로 먼저 만든다."
             )
-        folds.to_parquet(path, index=False)
-        log(f"[folds] {path} 새로 생성")
+
+        folds = pd.read_parquet(path)
+        if not (folds["ID"].astype(str).to_numpy() == self.train_ids).all():
+            raise ValueError(
+                f"{path.name} 의 ID 순서가 피처 블록과 다르다. "
+                "scripts/make_folds.py --overwrite 로 다시 만든다."
+            )
+
+        wanted = [fold_column(kind, n_splits) for kind in ("skf", "sgkf")]
+        missing = [c for c in (*FOLD_META_COLUMNS, *wanted) if c not in folds.columns]
+        if missing:
+            raise ValueError(
+                f"{path.name} 에 없는 열 {missing}. "
+                f"--n-splits {n_splits} 로 만든 파일이 맞는지 확인한다 "
+                f"(있는 열: {list(folds.columns)})."
+            )
+        for column in wanted:
+            observed = int(folds[column].max()) + 1
+            if observed != n_splits:
+                raise ValueError(
+                    f"{path.name} 의 {column} 은 {observed}-fold 인데 "
+                    f"--n-splits 는 {n_splits} 다."
+                )
+
+        meta = path.with_suffix(".json")
+        detail = ""
+        if meta.exists():
+            with open(meta, encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            detail = f" (seed={loaded.get('seed')} · n_splits={loaded.get('n_splits')})"
+        log(f"[folds] {path.name} 재사용{detail}")
         return folds
 
     # -- 조립 -------------------------------------------------------------
@@ -534,7 +549,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
 
     names, dense_train, dense_test = data.assemble(config)
     burden_positions = [i for i, n in enumerate(names) if n in BURDEN_COLUMNS]
-    fold_ids = data.folds[f"fold_{CV_SLUG[cv]}"].to_numpy()
+    fold_ids = data.folds[fold_column(cv, args.n_splits)].to_numpy()
     group_keys = data.folds["group_key"].to_numpy()
 
     oof = np.zeros((len(data.y), len(data.classes)), dtype=np.float64)
@@ -787,8 +802,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tfidf-min-df", type=int, default=3, help="TF-IDF 최소 문서 빈도"
     )
-    parser.add_argument("--n-splits", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--n-splits",
+        type=int,
+        default=5,
+        help="fold 파일에서 읽을 분할 수. 파일과 다르면 멈춘다 (분할은 make_folds.py 담당)",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="모델 시드. fold 분할과는 무관하다."
+    )
     parser.add_argument(
         "--set",
         dest="overrides",
@@ -828,7 +850,7 @@ def main() -> None:
     needed: set[str] = set()
     for config in configs:
         needed |= set(CONFIGS[config]["blocks"])
-    data = Dataset(needed, seed=args.seed, n_splits=args.n_splits)
+    data = Dataset(needed, n_splits=args.n_splits)
 
     results = []
     for config in configs:
