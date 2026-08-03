@@ -286,3 +286,17 @@ def test_train_gbdt_does_not_create_folds() -> None:
         assert forbidden not in source, (
             f"train_gbdt.py 가 {forbidden} 를 부른다 — fold 생성은 make_folds.py 담당이다"
         )
+
+
+def test_train_gbdt_does_not_write_full_train_module_map() -> None:
+    """모듈맵은 **fold 별로만** 쓴다.
+
+    전체 train 으로 fit 한 모듈맵 자체는 규정 위반이 아니다(test 를 안 본다). 다만
+    fold 를 넘는 산출물이라 나중에 누가 무심코 test 예측에 재사용하기 쉽고, 그 순간
+    fold-fit-only 규율이 조용히 깨진다. fold 생성 금지와 같은 방식으로 소스에서 막고,
+    진단용 전체 맵이 필요하면 scripts/inspect_latent.py 가 따로 만든다.
+    """
+    source = (PROJECT_ROOT / "scripts/train_gbdt.py").read_text(encoding="utf-8")
+    assert "full_train_module_map" not in source, (
+        "train_gbdt.py 가 전체 train 모듈맵을 쓴다 — fold 별 맵만 남긴다"
+    )
