@@ -321,13 +321,8 @@ def test_blocks_keep_their_own_columns_when_loaded_together():
 
     for name in shared:
         # `Dataset.pairs` 는 "원본 유전자 행렬을 들고 있다가 fold 안에서 가공"하는
-        # 블록을 전부 담는다 — 공변이 쌍뿐 아니라 잠재·모듈 블록도 여기로 간다.
-        in_pairs = (
-            name in module.PAIR_BLOCKS
-            or name in module.LATENT_BLOCKS
-            or name in module.MODULE_BLOCKS
-        )
-        pocket = "pairs" if in_pairs else (
+        # 블록을 전부 담는다 — 공변이 쌍뿐 아니라 잠재·모듈·서명 블록도 여기로 간다.
+        pocket = "pairs" if name in module.FOLD_MATRIX_BLOCKS else (
             "gene" if name in module.GENE_BLOCKS else "dense"
         )
         expected = getattr(solo[name], pocket)[name][0]
