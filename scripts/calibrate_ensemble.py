@@ -54,6 +54,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--folds", type=Path, default=DEFAULT_FOLDS)
     parser.add_argument("--fold-column", default="fold_skf5")
     parser.add_argument("--tag", required=True)
+    parser.add_argument(
+        "--weights",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "가중치를 학습하지 않고 이 값으로 고정한다. --oof 와 개수·순서가 같아야 한다. "
+            "합이 1 이 아니면 정규화한다. 로짓 보정은 이 위에 그대로 얹는다"
+        ),
+    )
     parser.add_argument("--tvd-warning-threshold", type=float, default=0.10)
     parser.add_argument("--submission", action="store_true")
     parser.add_argument("--sample-submission", type=Path, default=DEFAULT_SAMPLE)
@@ -145,22 +155,46 @@ def main() -> None:
         raise ValueError("OOF와 test의 클래스 열 또는 순서가 다르다")
     fold_values = _load_fold_values(args.folds, oof_ids, args.fold_column)
 
+    # 고정 가중치. 학습된 가중치는 fold 마다 흔들리는데(실측 폭 0.23) 그 흔들림이
+    # 그대로 test 로 이전된다는 보장이 없다. 사람이 값을 박아 두면 fold 노이즈를
+    # 줍지 않는다. 대신 그 값이 맞다는 근거는 사람이 져야 한다.
+    fixed_weights = None
+    if args.weights is not None:
+        if len(args.weights) != len(args.oof):
+            raise ValueError(
+                f"--weights 는 {len(args.oof)}개여야 한다 (--oof 개수). "
+                f"받은 값 {len(args.weights)}개: {args.weights}"
+            )
+        weights = np.asarray(args.weights, dtype=np.float64)
+        if (weights < 0).any():
+            raise ValueError(f"음수 가중치는 받지 않는다: {args.weights}")
+        total = float(weights.sum())
+        if total <= 0:
+            raise ValueError("가중치 합이 0 이다")
+        fixed_weights = weights / total
+        if abs(total - 1.0) > 1e-9:
+            print(f"가중치 합 {total:g} -> 1 로 정규화: {fixed_weights.round(4).tolist()}")
+
     crossfit_raw_blend = np.zeros_like(oof_arrays[0], dtype=np.float64)
     crossfit_proba = np.zeros_like(oof_arrays[0], dtype=np.float64)
     fold_results = []
     for fold in sorted(np.unique(fold_values).tolist()):
         train_mask = fold_values != fold
         valid_mask = ~train_mask
-        blender = MacroF1Blender().fit(
-            [values[train_mask] for values in oof_arrays], y_true[train_mask], classes
-        )
-        train_blend = blender.predict_proba(
-            [values[train_mask] for values in oof_arrays]
-        )
+        if fixed_weights is None:
+            blender = MacroF1Blender().fit(
+                [values[train_mask] for values in oof_arrays], y_true[train_mask], classes
+            )
+            fold_weights = blender.weights_
+            blend = blender.predict_proba
+        else:
+            # fold 밖에서 학습할 게 없다. 보정만 이 fold 의 train 부분에서 fit 한다.
+            fold_weights = fixed_weights
+            blend = lambda values: weighted_average(values, fixed_weights)  # noqa: E731
+
+        train_blend = blend([values[train_mask] for values in oof_arrays])
         calibrator = MacroF1LogitBias().fit(train_blend, y_true[train_mask], classes)
-        valid_blend = blender.predict_proba(
-            [values[valid_mask] for values in oof_arrays]
-        )
+        valid_blend = blend([values[valid_mask] for values in oof_arrays])
         crossfit_raw_blend[valid_mask] = valid_blend
         valid_adjusted = calibrator.predict_proba(valid_blend)
         crossfit_proba[valid_mask] = valid_adjusted
@@ -170,7 +204,7 @@ def main() -> None:
                 "fold": int(fold),
                 "n_train": int(train_mask.sum()),
                 "n_valid": int(valid_mask.sum()),
-                "weights": blender.weights_.tolist(),
+                "weights": [float(w) for w in fold_weights],
                 "bias": calibrator.bias_by_class(),
                 "raw_blend_macro_f1": macro_f1(
                     y_true[valid_mask],
@@ -193,14 +227,20 @@ def main() -> None:
     crossfit_summary = evaluate_classification(y_true, crossfit_pred, classes)
 
     # 최종 test 변환용. 이 학습 점수는 같은 OOF를 fit/evaluate하므로 모델 선택에 쓰지 않는다.
-    final_blender = MacroF1Blender().fit(oof_arrays, y_true, classes)
-    final_oof_blend = final_blender.predict_proba(oof_arrays)
+    if fixed_weights is None:
+        final_blender = MacroF1Blender().fit(oof_arrays, y_true, classes)
+        final_weights = final_blender.weights_
+        final_blend = final_blender.predict_proba
+    else:
+        final_weights = fixed_weights
+        final_blend = lambda values: weighted_average(values, fixed_weights)  # noqa: E731
+    final_oof_blend = final_blend(oof_arrays)
     final_blend_pred = np.asarray(classes)[final_oof_blend.argmax(axis=1)]
     final_calibrator = MacroF1LogitBias().fit(final_oof_blend, y_true, classes)
     full_fit_oof = final_calibrator.predict_proba(final_oof_blend)
     full_fit_pred = np.asarray(classes)[full_fit_oof.argmax(axis=1)]
 
-    raw_test_blend = final_blender.predict_proba(test_arrays)
+    raw_test_blend = final_blend(test_arrays)
     raw_test_pred = np.asarray(classes)[raw_test_blend.argmax(axis=1)]
     uniform_test = weighted_average(test_arrays, uniform_weights)
     uniform_test_pred = np.asarray(classes)[uniform_test.argmax(axis=1)]
@@ -288,12 +328,15 @@ def main() -> None:
         "uniform_blend_oof_macro_f1": uniform_score,
         "crossfit_raw_blend": crossfit_raw_summary,
         "crossfit_calibrated": crossfit_summary,
+        # 가중치를 사람이 박았는지 학습했는지. 나중에 로그만 보고 구분이 안 되면
+        # "이 점수가 fold 에 맞춰 최적화된 값인가"를 되짚을 수 없다.
+        "weight_source": "fixed" if fixed_weights is not None else "learned",
         "crossfit_folds": fold_results,
         "final_full_oof_fit": {
             "warning": "optimistic_not_for_model_selection",
             "raw_blend_macro_f1": macro_f1(y_true, final_blend_pred),
             "macro_f1": macro_f1(y_true, full_fit_pred),
-            "weights": final_blender.weights_.tolist(),
+            "weights": [float(w) for w in final_weights],
             "bias": final_calibrator.bias_by_class(),
         },
         "test_distribution_guardrail": {
@@ -323,7 +366,10 @@ def main() -> None:
         "full OOF fit (낙관적·선택 금지): "
         f"{result['final_full_oof_fit']['macro_f1']:.6f}"
     )
-    print(f"final weights: {final_blender.weights_.round(4).tolist()}")
+    print(
+        f"final weights: {np.asarray(final_weights).round(4).tolist()}"
+        + ("  (고정)" if fixed_weights is not None else "  (학습)")
+    )
     print(
         "test TVD guardrail: "
         f"{raw_distribution['tvd']:.4f} -> {adjusted_distribution['tvd']:.4f} "
