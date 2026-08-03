@@ -246,3 +246,89 @@ def test_duplicate_signature_count_stays_out_of_robust_rollup():
     assert "duplicate_token_count" not in ROBUST_ROLLUP_COLUMNS
     # 플래그 버전은 배율이 안정적이라 남아 있어야 한다.
     assert "has_duplicate_token" in ROBUST_ROLLUP_COLUMNS
+
+
+# --- Dataset 블록 캐시 -----------------------------------------------------
+# 위 테스트는 상수 목록만 본다. 목록이 맞아도 `Dataset` 이 그 목록을 안 쓰고
+# 캐시에서 46열을 꺼내 주면 소용이 없다 — 아래는 실제로 전달되는 열을 본다.
+def _load_train_gbdt():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "train_gbdt.py"
+    spec = importlib.util.spec_from_file_location("train_gbdt_for_alignment", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_block_cache_key_separates_rollup_variants():
+    """같은 parquet 이라도 고르는 열이 다르면 캐시를 나눠 써야 한다."""
+    module = _load_train_gbdt()
+    assert module.BLOCK_SOURCES["rollup"] == module.BLOCK_SOURCES["rollup16"]
+    assert module.block_cache_key("rollup") != module.block_cache_key("rollup16")
+
+
+def test_block_cache_key_keeps_sharing_the_enc3_matrix():
+    """분리하느라 enc3/comut 공유까지 깨면 메모리가 두 배가 된다."""
+    module = _load_train_gbdt()
+    assert module.block_cache_key("enc3") == module.block_cache_key("comut")
+
+
+def test_every_name_specific_select_branch_has_its_own_kind():
+    """`_select` 가 이름으로 갈라지는 블록은 전부 `SELECT_KIND` 에 있어야 한다.
+
+    블록을 새로 추가하면서 분기만 넣고 여기 등록을 빠뜨리면, 그 블록이 기존 블록과
+    소스를 공유하는 순간 조용히 남의 열을 받는다. 소스로 grep 해서 강제한다.
+    """
+    import inspect
+
+    module = _load_train_gbdt()
+    source = inspect.getsource(module.Dataset._select)
+    branching = {name for name in module.BLOCK_SOURCES if f'"{name}"' in source}
+    missing = sorted(branching - set(module.SELECT_KIND))
+    assert not missing, f"SELECT_KIND 에 없는 이름별 분기: {missing}"
+
+
+def test_blocks_keep_their_own_columns_when_loaded_together():
+    """`--configs all` 처럼 한 프로세스가 여러 블록을 함께 읽어도 열이 안 섞여야 한다.
+
+    parquet 이 있어야 도는 테스트다. 없으면 건너뛴다(원본은 git 에 없다).
+    """
+    module = _load_train_gbdt()
+    shared = [
+        name
+        for name in module.BLOCK_SOURCES
+        if sum(
+            module.BLOCK_SOURCES[other] == module.BLOCK_SOURCES[name]
+            for other in module.BLOCK_SOURCES
+        )
+        > 1
+    ]
+    needed = {"train_folds.parquet"}
+    for name in [*shared, "domain"]:
+        for split in ("train", "test"):
+            needed.add(module.BLOCK_SOURCES[name].format(split=split))
+    absent = sorted(n for n in needed if not (module.PROC_DIR / n).exists())
+    if absent:
+        pytest.skip(f"{absent[:2]} 없음 — 피처 parquet 이 필요한 테스트")
+
+    solo = {
+        name: module.Dataset({"domain", name}, n_splits=5)
+        for name in shared
+    }
+    together = module.Dataset({"domain", *shared}, n_splits=5)
+
+    for name in shared:
+        pocket = "pairs" if name in module.PAIR_BLOCKS else (
+            "gene" if name in module.GENE_BLOCKS else "dense"
+        )
+        expected = getattr(solo[name], pocket)[name][0]
+        actual = getattr(together, pocket)[name][0]
+        assert list(actual) == list(expected), f"{name} 의 열이 함께 읽을 때 달라졌다"
+
+    # 이 버그의 실제 피해. rollup16 은 어떤 조합에서도 시프트 노출 열을 받으면 안 된다.
+    assert "duplicate_signature_count" not in together.dense["rollup16"][0]
+    assert len(together.dense["rollup16"][0]) == len(module.ROBUST_ROLLUP_COLUMNS) + len(
+        module.BURDEN_COLUMNS
+    )

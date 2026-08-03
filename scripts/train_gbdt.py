@@ -157,9 +157,34 @@ BLOCK_SOURCES = {
     "rollup16": "{split}_sample_mutation_features_rollup.parquet",
     "enc3": "{split}_mutation_encoded.parquet",
     "gec": "{split}_gene_event_count_matrix.parquet",
-    # enc3 와 같은 파일이다 — Dataset 이 소스 문자열 기준으로 캐시해 두 번 안 읽는다.
+    # enc3 와 같은 파일이다 — Dataset 이 `block_cache_key` 기준으로 캐시해 두 번 안 읽는다.
     "comut": "{split}_mutation_encoded.parquet",
 }
+
+#: `_select` 가 이름을 보고 갈라지는 블록 -> 그 분기의 이름. 여기 없는 블록은 전부
+#: 마지막 유전자 분기로 떨어져서, 소스가 같으면 결과도 같다.
+#:
+#: 캐시 키를 파일 이름만으로 잡으면 `rollup` 과 `rollup16` 이 충돌한다. 둘은 같은
+#: parquet 을 읽지만 고르는 열이 46개 / 16개로 다르고, `sorted(blocks)` 에서 `rollup`
+#: 이 먼저라 rollup16 자리에 46열이 그대로 들어간다. 그러면 일부러 뺀
+#: `duplicate_signature_count`(train 1.30 / test 52.8, 40배 시프트) 가 시프트 내성
+#: 블록에 되살아나는데, 예외도 안 나고 fold 로직도 멀쩡히 돌아서 로그의 열 수를
+#: 안 보면 모른다. `--configs` 기본값이 `all` 이라 config 를 안 적기만 해도 걸린다.
+SELECT_KIND = {
+    "domain": "domain",
+    "fe25": "fe25",
+    "rollup": "rollup46",
+    "rollup16": "rollup16",
+}
+
+
+def block_cache_key(name: str) -> tuple[str, str]:
+    """`_select` 결과를 공유해도 되는 블록끼리만 같은 값을 낸다.
+
+    `enc3`/`comut` 처럼 소스와 분기가 둘 다 같은 블록은 계속 배열 한 벌을 나눠 쓴다.
+    """
+    return BLOCK_SOURCES.get(name, name), SELECT_KIND.get(name, "gene")
+
 
 BLOCK_DESC = {
     "domain": "도메인 539",
@@ -374,24 +399,27 @@ class Dataset:
         self.rollup_train: pd.DataFrame | None = None
         self.rollup_test: pd.DataFrame | None = None
         # comut 과 enc3 는 같은 parquet(`{split}_mutation_encoded.parquet`)을 읽어
-        # 똑같은 (열 이름, train 배열, test 배열) 을 낸다. 소스 문자열로 캐시해 두 번
-        # 안 읽는다 — 안 그러면 6,201x4,384 + 2,546x4,384 float32 를 두 벌 들고
+        # 똑같은 (열 이름, train 배열, test 배열) 을 낸다. `block_cache_key` 로 캐시해
+        # 두 번 안 읽는다 — 안 그러면 6,201x4,384 + 2,546x4,384 float32 를 두 벌 들고
         # 153MB 가 306MB 가 된다. fold 루프는 항상 `.copy()`/`hstack` 사본을 쓰므로
-        # 두 블록이 같은 배열을 참조해도 안전하다.
-        self._block_cache: dict[str, tuple[list[str], np.ndarray, np.ndarray]] = {}
+        # 두 블록이 같은 배열을 참조해도 안전하다. 키가 파일 이름이 아니라
+        # (파일, `_select` 분기) 인 이유는 `SELECT_KIND` 주석 참고.
+        self._block_cache: dict[
+            tuple[str, str], tuple[list[str], np.ndarray, np.ndarray]
+        ] = {}
 
         for name in sorted(blocks):
             if name in SPARSE_BLOCKS:
                 self.docs[name] = self._load_documents(name)
                 log(f"[block] {name:9s} {'문서':>6s}  {BLOCK_DESC[name]}")
                 continue
-            source_key = BLOCK_SOURCES.get(name, name)
-            if source_key in self._block_cache:
-                columns, train_array, test_array = self._block_cache[source_key]
+            cache_key = block_cache_key(name)
+            if cache_key in self._block_cache:
+                columns, train_array, test_array = self._block_cache[cache_key]
             else:
                 train_frame, test_frame = self._load_pair(name, base, test_base)
                 columns, train_array, test_array = self._select(name, train_frame, test_frame)
-                self._block_cache[source_key] = (columns, train_array, test_array)
+                self._block_cache[cache_key] = (columns, train_array, test_array)
             if name in PAIR_BLOCKS:
                 target = self.pairs
             elif name in GENE_BLOCKS:
