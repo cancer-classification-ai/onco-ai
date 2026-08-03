@@ -406,6 +406,72 @@ def make_gene_event_count_matrix(
     )
 
 
+GENE_MUTATION_TYPES: tuple[str, ...] = (
+    "missense",
+    "nonsense",
+    "frameshift",
+    "indel",
+    "synonymous",
+    "complex",
+)
+
+
+def make_gene_mutation_type_matrix(
+    df: pd.DataFrame,
+    *,
+    gene_columns: list[str] | None = None,
+    prefix: str = "gene_",
+) -> pd.DataFrame:
+    """유전자별 변이 유형 존재 여부를 0/1 wide matrix로 만든다.
+
+    출력 컬럼은 입력 유전자 순서마다 ``GENE_MUTATION_TYPES`` 순서로 생성한다.
+    예를 들어 TP53 뒤에는 ``gene_missense__TP53``부터
+    ``gene_complex__TP53``까지 6개 컬럼이 붙는다. 같은 유형의 token이 한 셀에
+    여러 개 있어도 존재 여부이므로 값은 1이다.
+
+    이 함수는 각 행을 독립적으로 파싱하며 train 통계나 ``SUBCLASS``를 사용하지
+    않는다. 따라서 train/test split별 Parquet을 미리 만들어도 데이터 누수가 없다.
+
+    >>> frame = pd.DataFrame({"TP53": ["Q369* I368N"], "KRAS": ["WT"]})
+    >>> out = make_gene_mutation_type_matrix(
+    ...     frame, gene_columns=["TP53", "KRAS"]
+    ... )
+    >>> int(out["gene_nonsense__TP53"].iloc[0])
+    1
+    >>> int(out["gene_missense__TP53"].iloc[0])
+    1
+    """
+    gene_columns = _resolve_gene_columns(df, gene_columns)
+    values = df[gene_columns].to_numpy(dtype=object)
+    n_types = len(GENE_MUTATION_TYPES)
+    encoded = np.zeros(
+        (len(df), len(gene_columns) * n_types),
+        dtype=np.int8,
+    )
+    cache = _parse_cache()
+
+    for row_idx in range(values.shape[0]):
+        for gene_idx, value in enumerate(values[row_idx]):
+            # 원본의 대부분이 WT이므로 파서 호출 전에 빠르게 건너뛴다.
+            if value is None or value == "WT" or value == "":
+                continue
+            cell = _parse_cached(value, cache)
+            if cell.mutation_token_count == 0:
+                continue
+            offset = gene_idx * n_types
+            for type_idx, mutation_type in enumerate(GENE_MUTATION_TYPES):
+                encoded[row_idx, offset + type_idx] = getattr(
+                    cell, f"has_{mutation_type}"
+                )
+
+    columns = [
+        f"{prefix}{mutation_type}__{gene}"
+        for gene in gene_columns
+        for mutation_type in GENE_MUTATION_TYPES
+    ]
+    return pd.DataFrame(encoded, columns=columns, index=df.index)
+
+
 class BurdenBinner:
     """`hypermutated_flag` 와 `burden_quantile_bin` — fold 안에서만 fit 한다.
 

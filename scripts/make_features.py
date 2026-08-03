@@ -9,6 +9,8 @@
     python scripts/make_features.py sample --split test  --overwrite
     python scripts/make_features.py tokens --split train --overwrite
     python scripts/make_features.py gene   --split train --kind mutated --overwrite
+    python scripts/make_features.py gene-types --split train --overwrite
+    python scripts/make_features.py gene-types --split test  --overwrite
 
 `sample` 이 복합 변이 처리 전략의 산출물이다. train/test 를 **따로** 돌린다 —
 행마다 독립 계산이라 train 통계가 test 로 새지 않는다. fold 안에서 잡아야 하는
@@ -29,9 +31,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cancer_hack.features_basic import (  # noqa: E402
+    GENE_MUTATION_TYPES,
     SAMPLE_FEATURE_COLUMNS,
     make_exact_mutation_token_parquet,
     make_gene_event_count_matrix,
+    make_gene_mutation_type_matrix,
     make_gene_mutated_matrix,
     make_sample_mutation_features,
 )
@@ -126,6 +130,27 @@ def cmd_tokens(args: argparse.Namespace) -> dict[str, object]:
     )
 
 
+def cmd_gene_types(args: argparse.Namespace) -> dict[str, object]:
+    """유전자별 6종 변이 유형 존재 여부 행렬."""
+    output = _resolve_output(
+        args.output, f"{args.split}_gene_mutation_type_matrix.parquet"
+    )
+    _guard_existing(output, args.overwrite)
+
+    frame, genes = _load_split(args.split, args.input)
+    matrix = make_gene_mutation_type_matrix(frame, gene_columns=genes)
+    matrix.insert(0, "ID", frame["ID"].astype(str).to_numpy())
+
+    _write_parquet(matrix, output)
+    return {
+        "output_path": str(output),
+        "sample_count": len(matrix),
+        "gene_count": len(genes),
+        "type_count": len(GENE_MUTATION_TYPES),
+        "feature_count": len(matrix.columns) - 1,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -156,6 +181,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_tokens = sub.add_parser("tokens", help="Exact Mutation Token 문서")
     add_common(p_tokens)
     p_tokens.set_defaults(func=cmd_tokens)
+
+    p_gene_types = sub.add_parser(
+        "gene-types",
+        help="유전자별 6종 변이 유형 존재 여부 wide matrix",
+    )
+    add_common(p_gene_types)
+    p_gene_types.set_defaults(func=cmd_gene_types)
 
     return parser
 
