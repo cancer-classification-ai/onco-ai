@@ -597,7 +597,7 @@ class Dataset:
     바뀌어서 미리 만들어 둘 수가 없다.
     """
 
-    def __init__(self, blocks: set[str], *, n_splits: int) -> None:
+    def __init__(self, blocks: set[str], *, n_splits: int, folds_path: Path | None = None) -> None:
         t0 = time.perf_counter()
 
         # 라벨과 ID 는 도메인 블록에서 받는다 — 어떤 config 든 domain 을 쓴다.
@@ -648,7 +648,7 @@ class Dataset:
             target[name] = (columns, train_array, test_array)
             log(f"[block] {name:9s} {len(columns):>6,}열  {BLOCK_DESC[name]}")
 
-        self.folds = self._load_folds(n_splits=n_splits)
+        self.folds = self._load_folds(n_splits=n_splits, folds_path=folds_path)
         sizes = self.folds.groupby("group_key").size()
         singleton_groups = set(sizes[sizes == 1].index)
         self.singleton_mask = self.folds["group_key"].isin(singleton_groups).to_numpy()
@@ -773,14 +773,19 @@ class Dataset:
             aligned[columns].to_numpy(np.float32),
         )
 
-    def _load_folds(self, *, n_splits: int) -> pd.DataFrame:
+    def _load_folds(self, *, n_splits: int, folds_path: Path | None = None) -> pd.DataFrame:
         """사전계산 fold 파일을 **읽기만** 한다. 없으면 만들지 않고 멈춘다.
 
         예전에는 파일이 없으면 여기서 만들어 저장했다. 그러면 같은 이름의 파일이
         두 경로에서 나오고, `artifacts/oof/` 의 예측이 어느 분할에서 나왔는지
         사후에 확인할 수 없다. fold 를 쓰는 쪽과 만드는 쪽을 갈라 둔다.
+
+        `folds_path` 는 팀원이 쓴 분할로 다시 뽑을 때 쓴다. 스태킹은 모든 멤버가
+        같은 분할이어야 하는데, 팀원이 각자 만든 fold 는 우리 것과 다르다. 기본
+        파일을 덮어쓰면 기존 OOF 129개가 어느 분할에서 나왔는지 알 수 없게 되므로
+        경로를 갈아끼우는 쪽을 택한다.
         """
-        path = PROC_DIR / "train_folds.parquet"
+        path = Path(folds_path) if folds_path else PROC_DIR / "train_folds.parquet"
         if not path.exists():
             raise FileNotFoundError(
                 f"{path} 가 없다. scripts/make_folds.py 로 먼저 만든다."
@@ -1506,6 +1511,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="fold 파일에서 읽을 분할 수. 파일과 다르면 멈춘다 (분할은 make_folds.py 담당)",
     )
     parser.add_argument(
+        "--folds",
+        type=Path,
+        default=None,
+        help=(
+            "fold parquet 경로. 기본은 data/process/train_folds.parquet. "
+            "팀원이 쓴 분할로 다시 뽑아 스태킹 멤버를 맞출 때 갈아끼운다"
+        ),
+    )
+    parser.add_argument(
         "--seed", type=int, default=42, help="모델 시드. fold 분할과는 무관하다."
     )
     parser.add_argument(
@@ -1687,7 +1701,7 @@ def main() -> None:
     needed: set[str] = set()
     for config in configs:
         needed |= set(CONFIGS[config]["blocks"])
-    data = Dataset(needed, n_splits=args.n_splits)
+    data = Dataset(needed, n_splits=args.n_splits, folds_path=args.folds)
 
     results = []
     for config in configs:
