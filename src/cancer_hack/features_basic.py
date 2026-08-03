@@ -6,6 +6,7 @@ CLI 는 `scripts/make_features.py` 에 있고 이 모듈은 정의만 담는다.
 """
 
 from __future__ import annotations
+from collections import Counter
 import argparse
 from pathlib import Path
 import re
@@ -24,6 +25,9 @@ from .parser import (
     _SYNONYMOUS_RE,
     CELL_FEATURE_COLUMNS,
     CellMutation,
+    classify_token,
+    extract_token_string_features,
+    OTHER,
     parse_cell,
     split_tokens,
     token_signature,
@@ -1100,6 +1104,204 @@ def compute_repeated_mutation_token_count(
         return len(all_tokens) - len(set(all_tokens))
 
     return df.apply(_count, axis=1).rename("n_repeated_mutation_tokens")
+
+
+# ---------------------------------------------------------------------------
+# 변이 문자열 파싱 파생변수 19종
+# (① 파싱 성공 여부 3 · ② 위치 통계 5 · ③ 아미노산 변화 통계 3
+#  ④ 위치 구간 통계 2 · ⑤ 변이 유형 다양성 2 · ⑥ 유전자-위치 특징 2
+#  ⑦ 복합 변이 특징 2)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_POSITION_BIN_SIZE = 50
+
+MUTATION_STRING_PARSED_COLUMNS: tuple[str, ...] = (
+    # ① 파싱 성공 여부
+    "parsed_mutation_count",
+    "unparsed_mutation_count",
+    "parse_success_ratio",
+    # ② 위치 통계
+    "position_mean",
+    "position_std",
+    "position_min",
+    "position_max",
+    "position_median",
+    # ③ 아미노산 변화 통계
+    "unique_ref_aa_count",
+    "unique_alt_aa_count",
+    "unique_aa_change_count",
+    # ④ 위치 구간 통계
+    "unique_position_bin_count",
+    "most_common_position_bin_count",
+    # ⑤ 변이 유형 다양성
+    "mutation_type_diversity",
+    "dominant_mutation_type_ratio",
+    # ⑥ 유전자-위치 특징
+    "genes_with_hotspot",
+    "hotspot_ratio",
+    # ⑦ 복합 변이 특징
+    "genes_with_multiple_positions",
+    "mean_position_per_gene",
+)
+
+
+def _compute_row_parsed_features(
+    gene_values: "np.ndarray",
+    gene_columns: list[str],
+    position_bin_size: int,
+) -> dict:
+    """샘플 하나에 대해 19종 파싱 파생변수를 단일 순회로 계산한다."""
+    positions: list[int] = []
+    ref_aas: set[str] = set()
+    alt_aas: set[str] = set()
+    aa_changes: set[tuple[str, str]] = set()
+    pos_bins: list[int] = []
+    type_counts: Counter = Counter()
+    # gene → 위치 목록(중복 포함): hotspot 탐지용
+    gene_all_pos: dict[str, list[int]] = {}
+    # gene → 고유 위치 집합: multiple positions 탐지용
+    gene_uniq_pos: dict[str, set[int]] = {}
+
+    parsed = 0
+    unparsed = 0
+    total = 0
+
+    for gene, value in zip(gene_columns, gene_values):
+        if value is None or value == "WT" or value == "":
+            continue
+        tokens = _parse_mutation_tokens(value)
+        if not tokens:
+            continue
+
+        gene_pos_list: list[int] = []
+        for token in tokens:
+            total += 1
+            kind = classify_token(token)
+            type_counts[kind] += 1
+            if kind == OTHER:
+                unparsed += 1
+            else:
+                parsed += 1
+
+            tf = extract_token_string_features(token)
+            if tf.position >= 0:
+                positions.append(tf.position)
+                pos_bins.append((tf.position // position_bin_size) * position_bin_size)
+                gene_pos_list.append(tf.position)
+            if tf.ref_aa:
+                ref_aas.add(tf.ref_aa)
+            if tf.alt_aa:
+                alt_aas.add(tf.alt_aa)
+            if tf.ref_aa and tf.alt_aa:
+                aa_changes.add((tf.ref_aa, tf.alt_aa))
+
+        if gene_pos_list:
+            gene_all_pos[gene] = gene_pos_list
+            gene_uniq_pos[gene] = set(gene_pos_list)
+
+    # ① 파싱 성공 여부
+    parse_success_ratio = parsed / total if total > 0 else 0.0
+
+    # ② 위치 통계
+    if positions:
+        pos_arr = np.array(positions, dtype=np.float64)
+        position_mean = float(np.mean(pos_arr))
+        position_std = float(np.std(pos_arr))
+        position_min = float(np.min(pos_arr))
+        position_max = float(np.max(pos_arr))
+        position_median = float(np.median(pos_arr))
+    else:
+        position_mean = position_std = position_min = position_max = position_median = 0.0
+
+    # ④ 위치 구간 통계
+    if pos_bins:
+        bin_counter = Counter(pos_bins)
+        unique_position_bin_count = len(bin_counter)
+        most_common_position_bin_count = bin_counter.most_common(1)[0][1]
+    else:
+        unique_position_bin_count = 0
+        most_common_position_bin_count = 0
+
+    # ⑤ 변이 유형 다양성
+    non_other = {k: v for k, v in type_counts.items() if k != OTHER}
+    mutation_type_diversity = len(non_other)
+    total_non_other = sum(non_other.values())
+    dominant_mutation_type_ratio = (
+        max(non_other.values()) / total_non_other if total_non_other > 0 else 0.0
+    )
+
+    # ⑥ 유전자-위치 특징
+    # hotspot: 같은 유전자 내 같은 위치에 복수 변이 (V600E + V600K 등)
+    hotspot_genes = sum(
+        1 for pos_list in gene_all_pos.values() if len(pos_list) > len(set(pos_list))
+    )
+    mutated_genes_with_pos = len(gene_uniq_pos)
+    hotspot_ratio = (
+        hotspot_genes / mutated_genes_with_pos if mutated_genes_with_pos > 0 else 0.0
+    )
+
+    # ⑦ 복합 변이 특징
+    genes_with_multiple_positions = sum(
+        1 for pos_set in gene_uniq_pos.values() if len(pos_set) >= 2
+    )
+    mean_position_per_gene = (
+        sum(len(s) for s in gene_uniq_pos.values()) / mutated_genes_with_pos
+        if mutated_genes_with_pos > 0 else 0.0
+    )
+
+    return {
+        "parsed_mutation_count": parsed,
+        "unparsed_mutation_count": unparsed,
+        "parse_success_ratio": parse_success_ratio,
+        "position_mean": position_mean,
+        "position_std": position_std,
+        "position_min": position_min,
+        "position_max": position_max,
+        "position_median": position_median,
+        "unique_ref_aa_count": len(ref_aas),
+        "unique_alt_aa_count": len(alt_aas),
+        "unique_aa_change_count": len(aa_changes),
+        "unique_position_bin_count": unique_position_bin_count,
+        "most_common_position_bin_count": most_common_position_bin_count,
+        "mutation_type_diversity": mutation_type_diversity,
+        "dominant_mutation_type_ratio": dominant_mutation_type_ratio,
+        "genes_with_hotspot": hotspot_genes,
+        "hotspot_ratio": hotspot_ratio,
+        "genes_with_multiple_positions": genes_with_multiple_positions,
+        "mean_position_per_gene": mean_position_per_gene,
+    }
+
+
+def make_mutation_string_parsed_features(
+    df: pd.DataFrame,
+    *,
+    gene_columns: list[str] | None = None,
+    position_bin_size: int = _DEFAULT_POSITION_BIN_SIZE,
+) -> pd.DataFrame:
+    """샘플별 변이 문자열 파싱 파생변수 19종을 계산한다.
+
+    기존 make_sample_mutation_features()와 중복 없이 위치 통계·아미노산 변화
+    통계·변이 유형 다양성 등 19개 파생변수를 추가로 반환한다.
+
+    Parameters
+    ----------
+    position_bin_size:
+        위치 구간 크기 (기본 50). 실험 권장 후보: 10 / 25 / 50 / 100.
+
+    Returns
+    -------
+    DataFrame — MUTATION_STRING_PARSED_COLUMNS 순서로 19개 컬럼.
+    """
+    gene_columns = _resolve_gene_columns(df, gene_columns)
+    values = df[gene_columns].to_numpy(dtype=object)
+
+    rows = [
+        _compute_row_parsed_features(values[i], gene_columns, position_bin_size)
+        for i in range(len(df))
+    ]
+    return pd.DataFrame(
+        rows, columns=list(MUTATION_STRING_PARSED_COLUMNS), index=df.index
+    )
 
 
 # ---------------------------------------------------------------------------

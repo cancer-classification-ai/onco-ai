@@ -22,3 +22,16 @@ aa_transition:
   unique_transitions_per_sample: true
   frequency_basis: train_fold_sample_document_frequency
   conditional_smoothing_categories: 19
+
+amino_acid_penalty:
+  enabled: false
+  property_normalization: fixed_20_amino_acid_minmax
+  property_weights:
+    polarity: 1.0
+    hydrophobicity: 1.0
+    charge: 2.0
+    molecular_weight: 1.0
+  conservative_max: 0.5
+  radical_min: 1.0
+  unique_tokens_per_gene: true
+  gene_panel: []
