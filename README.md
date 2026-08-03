@@ -60,9 +60,6 @@ pip install -r requirements.txt
 
 ### 모델 학습
 
-```bash
-python src/train.py
-```
 
 ### 예측 생성
 
