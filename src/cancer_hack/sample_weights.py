@@ -51,9 +51,24 @@ def _check_inputs(y: Sequence, profile_hash: Sequence) -> tuple[np.ndarray, np.n
     return y, profile_hash
 
 
+def _check_weight_values(weight: np.ndarray) -> None:
+    """원소 단위 방어검사 — 집계값(합 등)만 보면 개별 NaN/inf/음수를 놓친다.
+
+    예: weight=[-5, 10]은 합이 5로 양수라 합계만 보는 검사는 통과하지만, 음수
+    가중치 자체가 이미 잘못된 입력이다. 여기서 원소 단위로 먼저 막는다.
+    """
+    if weight.size == 0:
+        raise ValueError("빈 weight 배열이다")
+    if not np.all(np.isfinite(weight)):
+        raise ValueError("weight에 NaN 또는 inf가 있다")
+    if np.any(weight < 0):
+        raise ValueError("weight에 음수가 있다")
+
+
 def normalize_to_unit_mean(weight: np.ndarray) -> np.ndarray:
     """평균이 1이 되도록 전역 정규화한다. 상대 비율은 그대로 유지된다."""
     weight = np.asarray(weight, dtype=np.float64)
+    _check_weight_values(weight)
     total = weight.sum()
     if not np.isfinite(total) or total <= 0:
         raise ValueError(f"weight 합이 정규화할 수 없는 값이다: {total}")
@@ -67,6 +82,7 @@ def effective_sample_size(weight: np.ndarray) -> float:
     10.0
     """
     weight = np.asarray(weight, dtype=np.float64)
+    _check_weight_values(weight)
     denom = float(np.sum(weight ** 2))
     if denom <= 0:
         raise ValueError("weight 제곱합이 0 이하라 ESS를 계산할 수 없다")

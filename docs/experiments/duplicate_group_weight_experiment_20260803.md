@@ -102,9 +102,16 @@ singleton에서는 전부 A보다 개선(부작용 없음). duplicate에서는 �
 | scheme | norm_std | norm_min | norm_max | ESS | ESS비율 | 클래스별총weight std |
 |---|---|---|---|---|---|---|
 | B | 0.702 | 0.30 | 6.30 | 3323 | 67.0% | 0.0000 |
-| C | 0.791 | 0.03 | 6.80 | 3053 | 61.5% | 26.62 |
-| D | 0.720 | 0.08 | 6.45 | 3267 | 65.9% | 11.70 |
+| C | 0.791 | 0.03 | 6.80 | 3053 | 61.5% | 27.14 |
+| D | 0.720 | 0.08 | 6.45 | 3267 | 65.9% | 11.93 |
 | E | 0.735 | 0.08 | 6.30 | 3222 | 65.0% | 0.0000 |
+
+(`weight_mean`/`std`/`min`/`max`/ESS는 최초 개인 workspace 실행과 canonical 재실행 사이에
+완전히 동일했다. 클래스별 총weight std만 27.14/11.93 vs 최초 실행의 26.62/11.70로 약
+2% 차이가 났다 — OOF Macro F1·fold별 점수·판정은 두 실행에서 소수점 4자리까지 완전히
+일치했으므로 실제 학습에 쓰인 weight 배열 자체는 동일한 것으로 판단하며, 이 차이는
+이 보조 통계량 하나의 계산 경로 차이로 보인다(원인 미확정). "D가 C보다 덜 불균형하고
+B/E는 정확히 0"이라는 결론 자체는 두 실행 모두 동일하다 — 16절 참고.)
 
 ## 9. Notion 단순곱의 클래스 총가중치 불균형
 
@@ -127,33 +134,40 @@ singleton에서는 전부 A보다 개선(부작용 없음). duplicate에서는 �
 
 ## 11. 재현 방법
 
-원본 데이터·feature parquet·OOF는 이 저장소에 포함돼 있지 않다(대회 규정·저장소
-용량 정책). 재현하려면:
+원본 데이터는 이 저장소에 포함돼 있지 않다(대회 규정·저장소 용량 정책). 그 외에는
+**개인 parquet·manifest·fold 파일이 전혀 필요 없다** — `notebooks/08_duplicate_group_weight_experiment.ipynb`가
+`cancer_hack.features_basic`/`cancer_hack.validation`/`cancer_hack.sample_weights`
+canonical 함수만으로 4,411열 피처·Group5 fold·A~E 가중치를 전부 실행 시점에 다시
+만든다. 재현하려면:
 
-1. `configs/duplicate_group_weight_experiment.yaml`의 `paths.raw_train_csv`,
-   `paths.train_feature_parquet`을 로컬 경로로 채운다.
-2. `cancer_hack.validation.make_profile_hash` + `make_profile_group_kfold`로
-   Group5 fold를 만든다(원본 4,384개 변이 문자열 열 기준, 0-based, 그룹 무교차
-   검증 필수).
-3. `cancer_hack.sample_weights.resolve_experiment_weight(scheme, y_train_fold,
-   profile_hash_train_fold)`로 fold-local 가중치를 계산한다 — **fold의 train
-   부분만** 넘긴다.
-4. `configs/duplicate_group_weight_experiment.yaml`의 XGBoost 하이퍼파라미터로
-   5-fold × 5-scheme(A~E) 학습, OOF 수집.
-5. 전체 OOF Macro F1, fold별 점수, singleton/duplicate 점수, 클래스별 F1을 비교.
+1. 환경변수 `DUPLICATE_WEIGHT_RAW_TRAIN_CSV=/path/to/train.csv`를 설정하거나,
+   `configs/duplicate_group_weight_experiment.yaml`의 `paths.raw_train_csv`를
+   로컬 경로로 채운다(커밋하지 않도록 주의).
+2. `notebooks/08_duplicate_group_weight_experiment.ipynb`를 처음부터 끝까지
+   실행한다 — 저장소 루트를 자동으로 찾고(`src/cancer_hack/validation.py` 존재
+   여부 기준), 피처·Group5 fold·가중치를 전부 그 자리에서 만든다.
+3. 6~16절 각 셀의 markdown 설명과 assertion을 그대로 따라가면 계약·누수 검증이
+   전부 노트북 안에서 다시 실행된다.
 
-코드 골격은 `notebooks/08_duplicate_group_weight_experiment.ipynb`(개인 workspace
-실행 기록의 사본, 실행 결과 보존)를 참고한다 — 이 사본은 개인 폴더 구조를 전제로
-한 경로 코드를 포함하므로 그대로 재실행되지는 않는다(노트북 상단 안내 참고).
+**실제로 검증됨**: 이 노트북을 canonical 모듈로 완전히 다시 작성한 뒤 실제 로컬
+데이터로 처음부터 끝까지 재실행했고, OOF Macro F1·fold별 점수·판정이 최초 개인
+workspace 실행과 **소수점 4자리까지 완전히 일치**했다(부록성 통계량 하나의 미세한
+차이는 8절 각주 참고). 배열 단위 parity test를 별도로 추가하지 않고 전체 재학습으로
+증명하는 쪽을 택했다.
 
 ## 12. 알려진 한계
 
 - Group5 CV 자체의 순수 효과(무가중 SKF vs 무가중 Group5)는 이 실험만으로는
   분리되지 않는다 — A~E 다섯 스킴이 전부 Group5를 공통으로 쓰기 때문이다.
-- 노트북 실행은 develop HEAD `26f8cc5`(PR #17 머지 직전) 기준이며, 권병학 개인
-  파이프라인은 `scripts/train_gbdt.py`가 아니라 별도 XGBoost 코드를 쓴다 — PR
-  #17이 이후 머지됐지만 이 실행의 숫자·판정에는 영향이 없다.
+- 이 노트북은 `scripts/train_gbdt.py`(팀 표준 학습 드라이버)를 쓰지 않고 별도
+  XGBoost 학습 루프를 쓴다 — 피처 블록(gene_encoding 4,384 + sample_stateless 17 +
+  ratio_transform 10)도 팀 표준 도메인 539 블록과 다르다. `cancer_hack.sample_weights`
+  가중치 로직 자체는 공용이지만, 이 결론이 팀 표준 피처/드라이버 조합에서도
+  그대로 성립하는지는 확인하지 않았다.
 - `power`(그룹 크기 감쇠 강도) 파라미터 탐색은 이번 범위 밖이다.
+- 8절의 클래스별 총weight std는 최초 실행과 재실행 사이에 ~2% 차이가 있었다
+  (26.62→27.14, 11.70→11.93) — OOF/fold/판정은 완전히 동일했으므로 실제 학습
+  weight는 같다고 보지만, 이 보조 통계량 자체의 원인은 확정하지 못했다.
 - 이 실험은 XGBoost 한 가지 백엔드·한 가지 하이퍼파라미터 설정에서만 확인했다 —
   LightGBM/CatBoost나 다른 피처 블록(팀 표준 도메인 539 등)에서도 같은 결론이
   나오는지는 확인하지 않았다.

@@ -130,6 +130,32 @@ def test_normalize_to_unit_mean_rejects_nonpositive_sum():
         normalize_to_unit_mean(np.array([0.0, 0.0]))
 
 
+def test_normalize_to_unit_mean_rejects_nan():
+    with pytest.raises(ValueError, match="NaN"):
+        normalize_to_unit_mean(np.array([1.0, np.nan, 2.0]))
+
+
+def test_normalize_to_unit_mean_rejects_inf():
+    with pytest.raises(ValueError, match="NaN 또는 inf"):
+        normalize_to_unit_mean(np.array([1.0, np.inf, 2.0]))
+
+
+def test_normalize_to_unit_mean_rejects_negative_inf():
+    with pytest.raises(ValueError, match="NaN 또는 inf"):
+        normalize_to_unit_mean(np.array([1.0, -np.inf, 2.0]))
+
+
+def test_normalize_to_unit_mean_rejects_negative_weight_even_if_sum_positive():
+    """합만 보면 5로 양수라 통과할 수 있지만, 음수 원소 자체가 잘못된 입력이다."""
+    with pytest.raises(ValueError, match="음수"):
+        normalize_to_unit_mean(np.array([-5.0, 10.0]))
+
+
+def test_normalize_to_unit_mean_rejects_empty_array():
+    with pytest.raises(ValueError, match="빈"):
+        normalize_to_unit_mean(np.array([]))
+
+
 def test_effective_sample_size_no_weight_equals_n():
     assert effective_sample_size(np.ones(12)) == pytest.approx(12.0)
 
@@ -138,6 +164,34 @@ def test_effective_sample_size_decreases_with_skew():
     uniform = np.ones(10)
     skewed = np.array([9.0] + [0.11111111] * 9)
     assert effective_sample_size(skewed) < effective_sample_size(uniform)
+
+
+def test_effective_sample_size_rejects_nan():
+    with pytest.raises(ValueError, match="NaN"):
+        effective_sample_size(np.array([1.0, np.nan]))
+
+
+def test_effective_sample_size_rejects_inf():
+    with pytest.raises(ValueError, match="NaN 또는 inf"):
+        effective_sample_size(np.array([1.0, np.inf]))
+
+
+def test_effective_sample_size_rejects_negative_weight():
+    with pytest.raises(ValueError, match="음수"):
+        effective_sample_size(np.array([-1.0, 2.0]))
+
+
+def test_effective_sample_size_rejects_empty_array():
+    with pytest.raises(ValueError, match="빈"):
+        effective_sample_size(np.array([]))
+
+
+@pytest.mark.parametrize("scheme", ["B_balanced", "C_balanced_profile", "D_balanced_same_label_naive", "E_same_label_rebalanced"])
+def test_resolved_weight_never_contains_nan_inf_or_negative(scheme):
+    """실제 스킴 출력 자체도 방어검사를 통과해야 한다 — 회귀 방지용 통합 점검."""
+    w = resolve_experiment_weight(scheme, TOY_Y, TOY_PH)
+    assert np.all(np.isfinite(w))
+    assert np.all(w >= 0)
 
 
 # ---------------------------------------------------------------------------
