@@ -426,6 +426,19 @@ CONFIGS: dict[str, dict] = {
         "weight": "balanced",
         "desc": "도메인 + 시프트내성 rollup + 클래스 서명 (enc3 없음, 중복성 대조군)",
     },
+    # 앙상블 입력: 캐시가 있는 11블록 전부. 사다리 규칙(한 번에 한 축)의 의도적
+    # 예외다 — 목적이 "한 축의 델타"가 아니라 "모델 여러 종에 같은 넓은 입력을 주고
+    # 앙상블 이득을 재는 것"이라서다. gtype/parsed19/burden8/aa9/ptok 은 뺐다 —
+    # data/process/ 에 test 쪽 parquet 이 없어 즉시 멈춘다. 특히 gtype 은 원본
+    # 26,304열(920MB)이라 다른 블록과 같은 프로세스에서 돌리면 안 된다.
+    "f11": {
+        "blocks": (
+            "domain", "rollup16", "enc3", "gec", "sigtok", "exacttok",
+            "comut", "lsvd", "lnmf", "gmod", "csig",
+        ),
+        "weight": "balanced",
+        "desc": "캐시 11블록 전부 — 앙상블 입력",
+    },
 }
 
 #: 모델별 기본 하이퍼파라미터.

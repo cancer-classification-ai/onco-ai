@@ -1059,3 +1059,21 @@ def test_every_config_block_belongs_to_a_known_family():
         for block in spec["blocks"]:
             assert block in known, f"{config} 의 {block} 이 소스 표에 없다"
             assert block in train_gbdt.BLOCK_DESC, f"{block} 설명이 없다"
+
+
+def test_f11_uses_only_cached_blocks():
+    """gtype·parsed19·burden8·aa9·ptok 은 test 쪽 parquet 이 없어 즉시 멈춘다.
+
+    앙상블 입력용 config 는 지금 캐시된 것만 써야 `--configs f11` 이 바로 돈다.
+    """
+    uncached = {"gtype", "parsed19", "burden8", "aa9", "ptok"}
+    assert not (set(train_gbdt.CONFIGS["f11"]["blocks"]) & uncached)
+
+
+def test_f11_covers_every_cached_block():
+    """11개가 다 들어 있어야 한다 — 누가 하나 빼면 앙상블 입력 열이 조용히 줄어든다."""
+    expected = {
+        "domain", "rollup16", "enc3", "gec", "sigtok", "exacttok",
+        "comut", "lsvd", "lnmf", "gmod", "csig",
+    }
+    assert set(train_gbdt.CONFIGS["f11"]["blocks"]) == expected
