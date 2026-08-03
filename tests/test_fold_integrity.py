@@ -1,6 +1,8 @@
 """Profile Hash 기반 Group CV 무결성 테스트."""
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -286,6 +288,35 @@ def test_train_gbdt_does_not_create_folds() -> None:
         assert forbidden not in source, (
             f"train_gbdt.py 가 {forbidden} 를 부른다 — fold 생성은 make_folds.py 담당이다"
         )
+
+
+def test_make_folds_cli_handles_external_input_path(tmp_path: Path, monkeypatch) -> None:
+    """`--input` 이 저장소 밖 경로면 크래시하지 않고 provenance `source` 에 파일명만 남는다.
+
+    RF 작업(Ticket 1b)의 원본 데이터는 저장소 밖 외부 디렉터리에 있다. 예전에는
+    `args.input.resolve().relative_to(PROJECT_ROOT)` 가 저장소 밖 경로에서 `ValueError`
+    를 내(parquet 저장 후, meta json 작성 전) 크래시했다 — 이 회귀를 잡는다.
+    """
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    import make_folds
+
+    raw_path = tmp_path / "train.csv"
+    _frame_with_duplicates().to_csv(raw_path, index=False)
+    out_path = tmp_path / "train_folds.parquet"
+
+    # `GROUP_CACHE` 는 CLI 인자가 아니라 모듈 상수(실제 repo 의 data/process/ 를
+    # 가리킨다) — 여기서 리다이렉트하지 않으면 테스트가 실제 데이터용 캐시를
+    # 합성 ID(`s0`..)로 덮어써 버린다.
+    monkeypatch.setattr(make_folds, "GROUP_CACHE", tmp_path / "group_keys_cache.parquet")
+    monkeypatch.setattr(
+        sys, "argv", ["make_folds.py", "--input", str(raw_path), "--out", str(out_path)]
+    )
+    make_folds.main()
+
+    assert out_path.exists()
+    meta = json.loads(out_path.with_suffix(".json").read_text(encoding="utf-8"))
+    assert meta["source"] == "train.csv"
+    assert str(tmp_path) not in json.dumps(meta)
 
 
 def test_train_gbdt_does_not_write_full_train_module_map() -> None:

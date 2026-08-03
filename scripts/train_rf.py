@@ -1,21 +1,25 @@
 #!/usr/bin/env python
-"""Random Forest / ExtraTrees 학습 CLI — RF stacking base model (Ticket 1a).
+"""Random Forest / ExtraTrees 학습 CLI — RF stacking base model (Ticket 1a/1b).
 
     python scripts/train_rf.py --data-dir <external-data-dir> \\
-        --folds-path data/process/train_folds.parquet --model rf
+        --folds-path data/process/train_folds.parquet --model rf \\
+        --feature-set f4r --class-order-path artifacts/metadata/class_order.json
 
 원본 `train.csv`/`test.csv`/`sample_submission.csv` 는 저장소 밖 외부 디렉터리에
 있다. `--data-dir` (CLI) 또는 `RF_DATA_DIR` (환경변수, CLI 가 우선) 로 그 경로를
 받는다 — 저장소 안으로 복사하거나 심볼릭 링크를 만들지 않고, 로그/provenance 에는
 파일명과 SHA-256 만 남긴다(절대경로 기록 금지).
 
-## Ticket 1a 범위
+## `--feature-set`
 
-이 스크립트는 인터페이스 뼈대다. `f4r`(1,055열) 피처 조립, Group5 fold 생성은
-하지 않는다 — `train.csv`/`test.csv` 의 `ID`/`SUBCLASS` 를 뺀 나머지 열을 그대로
-피처로 쓰고, fold 배정은 `--folds-path` 로 미리 만들어진 파일(`ID` + fold 열)을
-읽기만 한다. 둘 다 이 스크립트가 만들지 않는다 — `scripts/make_folds.py`(fold)와
-피처 파이프라인(f4r)은 각각 자기 자리에서 만든다(Ticket 1b 이후 범위).
+- `raw`(기본값, Ticket 1a): `train.csv`/`test.csv` 의 `ID`/`SUBCLASS` 를 뺀 나머지
+  열을 그대로 피처로 쓴다. 합성 데이터 CLI 스모크 전용 — 실제 대회 데이터의 변이
+  문자열 열을 이 경로로 통과시키지 않는다(문자열을 float 로 캐스팅하면 죽는다).
+- `f4r`(Ticket 1b): canonical f4r(도메인539+rollup16+enc3 fold-local chi2
+  top500=1,055열)을 조립한다. 피처 조립·fold-local chi2/burden fit 로직은
+  `scripts/train_gbdt.py` 의 `Dataset`/`BurdenBinner`/`Chi2TopKSelector` 를 그대로
+  가져와 쓴다(재구현 금지, spec §3.2/§6 Ticket 1b) — 이 스크립트가 새로 만드는
+  코드는 fold 마다 그 결과를 조립하는 순서(오케스트레이션)뿐이다.
 
 Random Forest/ExtraTrees 는 GBDT 의 `eval_set`/early stopping 같은 반복수 선택
 장치가 없다 — test 는 fold 마다 `predict_proba` 에만 쓰이고 fit 에는 전혀
@@ -37,12 +41,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import sklearn
+from sklearn.metrics import confusion_matrix
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from cancer_hack.class_order import load_class_order  # noqa: E402
+from cancer_hack.features_basic import BurdenBinner  # noqa: E402
 from cancer_hack.io import save_csv, write_submission  # noqa: E402
-from cancer_hack.metrics import build_prediction_frame, probability_columns  # noqa: E402
+from cancer_hack.metrics import build_prediction_frame, per_class_f1, probability_columns  # noqa: E402
 from cancer_hack.models_rf import create_model, default_n_jobs  # noqa: E402
 from cancer_hack.rf_artifact_validator import (  # noqa: E402
     macro_f1_with_labels,
@@ -50,11 +57,26 @@ from cancer_hack.rf_artifact_validator import (  # noqa: E402
     validate_submission_frame,
     validate_test_probability_frame,
 )
-from cancer_hack.validation import CV_SLUG, check_all_classes_present, fold_column  # noqa: E402
+from cancer_hack.validation import (  # noqa: E402
+    CV_SLUG,
+    Chi2TopKSelector,
+    check_all_classes_present,
+    fold_column,
+)
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - Windows 에는 resource 모듈이 없다
+    resource = None
 
 SEED = 42
 REQUIRED_DATA_FILES = ("train.csv", "test.csv", "sample_submission.csv")
 META_COLUMNS = ("ID", "SUBCLASS")
+
+#: f4r 블록 구성(spec §3.1) — domain 은 fold 와 무관, enc3 는 fold-local chi2 top-K.
+F4R_BLOCKS = ("domain", "rollup16", "enc3")
+F4R_ENC3_TOPK = 500
+F4R_EXPECTED_FEATURES = 539 + 16 + F4R_ENC3_TOPK  # 1,055
 
 #: spec §4(RF-A)/§6.1(RF-C) 고정값. `--config` JSON 이 있으면 이 위에 덮어쓴다.
 DEFAULT_PARAMS: dict[str, dict] = {
@@ -102,9 +124,17 @@ def validate_data_dir(data_dir: Path) -> dict[str, str]:
     return {name: _sha256(data_dir / name) for name in REQUIRED_DATA_FILES}
 
 
-# ---------------------------------------------------------------- 피처(합성 경로)
+def peak_memory_bytes() -> int | None:
+    """프로세스 peak RSS. macOS(BSD) 는 byte, Linux 는 KB 단위라 여기서 통일한다."""
+    if resource is None:
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
+# ---------------------------------------------------------------- 피처(raw, Ticket 1a 합성 경로)
 def load_features(data_dir: Path):
-    """`ID`/`SUBCLASS` 를 뺀 나머지 열을 그대로 피처로 쓴다(f4r 조립은 범위 밖).
+    """`ID`/`SUBCLASS` 를 뺀 나머지 열을 그대로 피처로 쓴다 — 합성 데이터 CLI 스모크 전용.
 
     반환: (feature_columns, train_ids, test_ids, sample_submission_ids, y,
     X_train, X_test).
@@ -127,13 +157,126 @@ def load_features(data_dir: Path):
     return feature_columns, train_ids, test_ids, sample_ids, y, X_train, X_test
 
 
+def load_sample_submission_ids(data_dir: Path) -> list[str]:
+    sample_df = pd.read_csv(data_dir / "sample_submission.csv", dtype={"ID": str})
+    return sample_df["ID"].astype(str).tolist()
+
+
+# ---------------------------------------------------------------- 피처(f4r, Ticket 1b 실데이터 경로)
+def _import_train_gbdt():
+    """f4r 조립에 필요한 `Dataset`/`BURDEN_COLUMNS` 를 빌려 쓴다.
+
+    f4r 피처 조립과 fold-local chi2/burden fit 로직의 canonical 정의는
+    `scripts/train_gbdt.py` 하나다(spec §3.2, Ticket 1b — 재구현 금지). 이 함수는
+    그 모듈을 import 만 한다 — `Dataset` 생성자·`assemble()` 호출은 각각
+    `load_f4r_features`/`build_f4r_fold_matrices` 의 몫이다.
+    """
+    scripts_dir = str(PROJECT_ROOT / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import train_gbdt  # noqa: PLC0415
+
+    return train_gbdt
+
+
+def load_f4r_features(data_dir: Path, *, n_splits: int, class_order_path: Path | None):
+    """canonical f4r(도메인539+rollup16+enc3 fold-local top500=1,055열) 조립.
+
+    `train_gbdt.Dataset.assemble("f4r")` 가 fold 와 무관한 도메인(539)+rollup16(16)
+    =555열을 한 번만 만든다. enc3(500)와 rollup16 안의 burden 2열은 fold-local
+    이라 여기서 만들지 않는다 — `build_f4r_fold_matrices` 가 매 fold 안에서 채운다.
+    """
+    train_gbdt = _import_train_gbdt()
+    dataset = train_gbdt.Dataset(blocks=set(F4R_BLOCKS), n_splits=n_splits)
+
+    # f4r parquet 과 --data-dir 의 원본 csv 가 같은 데이터 스냅샷인지 교차 확인한다.
+    train_ids_csv = pd.read_csv(data_dir / "train.csv", usecols=["ID"], dtype=str)["ID"].to_numpy()
+    test_ids_csv = pd.read_csv(data_dir / "test.csv", usecols=["ID"], dtype=str)["ID"].to_numpy()
+    if not np.array_equal(dataset.train_ids, train_ids_csv):
+        raise ValueError(
+            "f4r 피처 parquet 의 train ID 가 --data-dir 의 train.csv 와 다르다 — "
+            "scripts/make_features.py 로 같은 데이터에서 다시 만든다."
+        )
+    if not np.array_equal(dataset.test_ids, test_ids_csv):
+        raise ValueError(
+            "f4r 피처 parquet 의 test ID 가 --data-dir 의 test.csv 와 다르다 — "
+            "scripts/make_features.py 로 같은 데이터에서 다시 만든다."
+        )
+
+    class_order_verified = False
+    if class_order_path is not None:
+        canonical = load_class_order(class_order_path)
+        observed = sorted(set(dataset.y.tolist()))
+        if list(canonical) != observed:
+            raise SystemExit(
+                f"{class_order_path.name} 의 class order 가 실제 train SUBCLASS 와 "
+                "다르다 — 수정하지 않고 중단한다.\n"
+                f"  canonical({len(canonical)}개): {canonical}\n"
+                f"  observed({len(observed)}개): {observed}"
+            )
+        classes = np.array(canonical)
+        class_order_verified = True
+    else:
+        classes = np.unique(dataset.y)
+
+    names, dense_train, dense_test = dataset.assemble("f4r")
+    burden_positions = [i for i, name in enumerate(names) if name in train_gbdt.BURDEN_COLUMNS]
+    gene_columns, gene_train, gene_test = dataset.gene["enc3"]
+
+    return {
+        "dataset": dataset,
+        "classes": classes,
+        "class_order_verified": class_order_verified,
+        "names": names,
+        "dense_train": dense_train,
+        "dense_test": dense_test,
+        "burden_positions": burden_positions,
+        "gene_columns": gene_columns,
+        "gene_train": gene_train,
+        "gene_test": gene_test,
+    }
+
+
+def build_f4r_fold_matrices(f4r: dict, train_index: np.ndarray):
+    """fold `train_index` 에서만 burden 경계·chi2 를 fit 한다(spec §3.2, 누수 방지).
+
+    validation/test 행은 그 fold 에서 fit 된 transformer로 transform 만 받는다 —
+    `BurdenBinner`/`Chi2TopKSelector` 둘 다 team canonical 구현을 그대로 쓴다.
+    """
+    dataset = f4r["dataset"]
+    names = f4r["names"]
+    burden_positions = f4r["burden_positions"]
+
+    x_train = f4r["dense_train"].copy()
+    x_test = f4r["dense_test"].copy()
+
+    if burden_positions:
+        binner = BurdenBinner().fit(dataset.rollup_train.iloc[train_index])
+        wanted = [names[i] for i in burden_positions]
+        x_train[:, burden_positions] = binner.transform(dataset.rollup_train)[wanted].to_numpy(
+            np.float32
+        )
+        x_test[:, burden_positions] = binner.transform(dataset.rollup_test)[wanted].to_numpy(
+            np.float32
+        )
+
+    selector = Chi2TopKSelector(k=F4R_ENC3_TOPK).fit(
+        f4r["gene_train"][train_index], dataset.y[train_index]
+    )
+    picked = selector.indices_
+    x_train = np.hstack([x_train, f4r["gene_train"][:, picked]])
+    x_test = np.hstack([x_test, f4r["gene_test"][:, picked]])
+    feature_columns = names + [f4r["gene_columns"][i] for i in picked]
+    return x_train, x_test, feature_columns
+
+
 # ---------------------------------------------------------------- fold(사전계산본만 읽음)
 def load_folds(path: Path, *, cv: str, n_splits: int, train_ids: np.ndarray):
     """미리 만든 fold 파일을 **읽기만** 한다 — 이 스크립트는 fold 를 만들지 않는다."""
     if not path.exists():
         raise SystemExit(
-            f"fold 파일이 없다: {path.name}. Ticket 1a 는 fold 를 생성하지 않는다 — "
-            "미리 만든 fold 파일을 --folds-path 로 전달한다."
+            f"fold 파일이 없다: {path.name}. scripts/make_folds.py 로 먼저 만든다 — "
+            "이 스크립트는 fold 를 생성하지 않는다."
         )
     folds = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path, dtype={"ID": str})
 
@@ -172,6 +315,7 @@ def output_paths(out_dir: Path, stem: str) -> dict[str, Path]:
         "test": out_dir / "test_predictions" / f"test_{stem}.csv",
         "submission": out_dir / "submissions" / f"submission_{stem}.csv",
         "log": out_dir / "logs" / f"{stem}.json",
+        "confusion_matrix": out_dir / "metrics" / f"confusion_matrix_{stem}.json",
     }
 
 
@@ -240,6 +384,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cv", default="sgkf", choices=sorted(CV_SLUG))
     parser.add_argument("--n-splits", type=int, default=5)
+    parser.add_argument(
+        "--feature-set",
+        choices=["raw", "f4r"],
+        default="raw",
+        help="raw=합성 CLI 스모크용 원본 열 그대로(Ticket 1a). f4r=canonical 도메인"
+        "+rollup16+enc3 top500(Ticket 1b, spec §3.1).",
+    )
+    parser.add_argument(
+        "--class-order-path",
+        type=Path,
+        default=None,
+        help="canonical class order json(f4r 전용). 주면 실제 train SUBCLASS 와 대조하고 "
+        "다르면 중단한다(spec §2.3).",
+    )
     parser.add_argument("--tag", default="v1", help="파일명에 들어가는 실험 이름")
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--n-jobs", type=int, default=None)
@@ -262,8 +420,24 @@ def main(argv: list[str] | None = None) -> dict:
     paths = output_paths(out_dir, stem)
     check_overwrite(paths, overwrite=args.overwrite)
 
-    feature_columns, train_ids, test_ids, sample_ids, y, X_train, X_test = load_features(data_dir)
-    classes = np.unique(y)
+    f4r = None
+    class_order_verified = False
+    if args.feature_set == "f4r":
+        f4r = load_f4r_features(
+            data_dir, n_splits=args.n_splits, class_order_path=args.class_order_path
+        )
+        classes = f4r["classes"]
+        class_order_verified = f4r["class_order_verified"]
+        train_ids = f4r["dataset"].train_ids
+        test_ids = f4r["dataset"].test_ids
+        sample_ids = load_sample_submission_ids(data_dir)
+        y = f4r["dataset"].y
+        n_features_for_log = F4R_EXPECTED_FEATURES
+    else:
+        feature_columns, train_ids, test_ids, sample_ids, y, X_train, X_test = load_features(data_dir)
+        classes = np.unique(y)
+        n_features_for_log = len(feature_columns)
+
     fold_ids, fold_col = load_folds(
         args.folds_path, cv=args.cv, n_splits=args.n_splits, train_ids=train_ids
     )
@@ -279,6 +453,9 @@ def main(argv: list[str] | None = None) -> dict:
     oof = np.zeros((len(y), len(classes)), dtype=np.float64)
     test_proba = np.zeros((len(test_ids), len(classes)), dtype=np.float64)
     fold_scores: list[float] = []
+    fold_elapsed_seconds: list[float] = []
+    fold_feature_counts: list[int] = []
+    fold_diagnostics: list[dict] = []
 
     started = time.perf_counter()
     for fold in range(args.n_splits):
@@ -287,18 +464,36 @@ def main(argv: list[str] | None = None) -> dict:
         train_index = np.where(fold_ids != fold)[0]
         check_all_classes_present(y, train_index, classes)
 
+        missing_in_valid = sorted(set(classes.tolist()) - set(np.unique(y[valid_index]).tolist()))
+        fold_diagnostics.append({"fold": fold, "missing_classes_in_validation": missing_in_valid})
+
+        if f4r is not None:
+            x_train, x_test, feature_columns_fold = build_f4r_fold_matrices(f4r, train_index)
+            if len(feature_columns_fold) != F4R_EXPECTED_FEATURES:
+                raise SystemExit(
+                    f"f4r fold {fold} 피처 열 수가 {len(feature_columns_fold)}개다 — "
+                    f"기대값 {F4R_EXPECTED_FEATURES}개(도메인539+rollup16+enc3 top"
+                    f"{F4R_ENC3_TOPK})와 다르다. 중단한다."
+                )
+            fold_feature_counts.append(len(feature_columns_fold))
+        else:
+            x_train, x_test = X_train, X_test
+            fold_feature_counts.append(x_train.shape[1])
+
         model = create_model(
             args.model, class_order=class_order, random_state=args.seed, n_jobs=n_jobs, **params
         )
-        model.fit(X_train[train_index], y[train_index])
+        model.fit(x_train[train_index], y[train_index])
 
-        oof[valid_index] = model.predict_proba(X_train[valid_index])
-        test_proba += model.predict_proba(X_test) / args.n_splits
+        oof[valid_index] = model.predict_proba(x_train[valid_index])
+        test_proba += model.predict_proba(x_test) / args.n_splits
 
         fold_pred = classes[oof[valid_index].argmax(axis=1)]
         score = macro_f1_with_labels(y[valid_index], fold_pred, classes)
         fold_scores.append(score)
-        log(f"[{stem}] fold {fold + 1}/{args.n_splits}  Macro F1={score:.4f}  ({time.perf_counter() - t0:.1f}s)")
+        fold_time = time.perf_counter() - t0
+        fold_elapsed_seconds.append(fold_time)
+        log(f"[{stem}] fold {fold + 1}/{args.n_splits}  Macro F1={score:.4f}  ({fold_time:.1f}s)")
 
     elapsed = time.perf_counter() - started
 
@@ -316,6 +511,7 @@ def main(argv: list[str] | None = None) -> dict:
     oof_frame.insert(3, "y_pred", oof_pred)
     oof_frame = oof_frame[["ID", "fold", "y_true", "y_pred", *proba_cols]]
     oof_macro_f1 = macro_f1_with_labels(oof_frame["y_true"], oof_frame["y_pred"], classes)
+    oof_per_class_f1 = per_class_f1(oof_frame["y_true"], oof_frame["y_pred"], labels=classes)
 
     # test 확률: spec §8.2 대로 `ID` + `p_{class}` 만 저장한다(`y_pred` 없음).
     # 마찬가지로 저장될 값으로 정규화해 둔다 — submission 을 여기서 뽑아낼 때
@@ -358,6 +554,41 @@ def main(argv: list[str] | None = None) -> dict:
         test_proba_frame=test_frame,
     )
 
+    # confusion matrix — OOF y_true/y_pred 기준(가능하면 생성, 번들 정리는 Ticket 5 범위).
+    cm_raw = confusion_matrix(oof_frame["y_true"], oof_frame["y_pred"], labels=classes)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        cm_normalized = np.divide(
+            cm_raw, cm_raw.sum(axis=1, keepdims=True), where=cm_raw.sum(axis=1, keepdims=True) > 0
+        )
+    confusion_payload = {
+        "class_order": class_order,
+        "raw": cm_raw.tolist(),
+        "normalized_by_true_row": np.nan_to_num(cm_normalized).tolist(),
+    }
+    paths["confusion_matrix"].parent.mkdir(parents=True, exist_ok=True)
+    with open(paths["confusion_matrix"], "w", encoding="utf-8") as handle:
+        json.dump(confusion_payload, handle, ensure_ascii=False, indent=2)
+
+    oof_pred_distribution = oof_frame["y_pred"].value_counts().to_dict()
+    test_pred_distribution = pd.Series(
+        classes[test_frame[proba_cols].to_numpy(dtype=np.float64).argmax(axis=1)]
+    ).value_counts().to_dict()
+
+    folds_file_info: dict[str, object] = {"name": args.folds_path.name, "fold_column": fold_col}
+    if args.folds_path.exists():
+        folds_file_info["sha256"] = _sha256(args.folds_path)
+    folds_meta_path = args.folds_path.with_suffix(".json")
+    if folds_meta_path.exists():
+        with open(folds_meta_path, encoding="utf-8") as handle:
+            folds_file_info["generation_provenance"] = json.load(handle)
+
+    artifact_sha256 = {
+        "oof": _sha256(paths["oof"]),
+        "test": _sha256(paths["test"]),
+        "submission": _sha256(paths["submission"]),
+        "confusion_matrix": _sha256(paths["confusion_matrix"]),
+    }
+
     provenance = {
         "stem": stem,
         "model": args.model,
@@ -367,22 +598,43 @@ def main(argv: list[str] | None = None) -> dict:
         "n_splits": args.n_splits,
         "seed": args.seed,
         "n_jobs": n_jobs,
-        "n_features": len(feature_columns),
+        "feature_set": args.feature_set,
+        "n_features": n_features_for_log,
         "n_train_rows": int(len(y)),
         "n_test_rows": int(len(test_ids)),
         "class_order": class_order,
+        "class_order_verified_against_train": class_order_verified,
         "fold_macro_f1": fold_scores,
+        "fold_macro_f1_mean": float(np.mean(fold_scores)),
+        "fold_macro_f1_std": float(np.std(fold_scores)),
+        "fold_elapsed_seconds": fold_elapsed_seconds,
+        "fold_feature_counts": fold_feature_counts,
+        "fold_diagnostics": fold_diagnostics,
         "oof_macro_f1": oof_macro_f1,
+        "oof_per_class_f1": oof_per_class_f1,
+        "oof_pred_class_distribution": oof_pred_distribution,
+        "test_pred_class_distribution": test_pred_distribution,
         "elapsed_seconds": elapsed,
+        "peak_memory_bytes": peak_memory_bytes(),
+        "peak_memory_method": "resource.getrusage(RUSAGE_SELF).ru_maxrss, normalized to bytes",
         # 파일명 + SHA-256 만 — 절대경로는 기록하지 않는다.
         "data_files": {name: {"sha256": digest} for name, digest in data_hashes.items()},
-        "folds_file": {"name": args.folds_path.name, "fold_column": fold_col},
+        "folds_file": folds_file_info,
+        "artifact_sha256": artifact_sha256,
         # `write_submission` 이 돌려주는 `output_path` 는 절대경로다 — 파일명만 남긴다.
         "submission": {**submission_info, "output_path": paths["submission"].name},
         "git_commit": _git_commit_sha(),
         "python_version": sys.version.split()[0],
         "sklearn_version": sklearn.__version__,
+        "pandas_version": pd.__version__,
+        "numpy_version": np.__version__,
     }
+    if args.feature_set == "f4r":
+        provenance["feature_block_sizes"] = {
+            "domain": 539,
+            "rollup16": 16,
+            "enc3_topk": F4R_ENC3_TOPK,
+        }
     paths["log"].parent.mkdir(parents=True, exist_ok=True)
     with open(paths["log"], "w", encoding="utf-8") as handle:
         json.dump(provenance, handle, ensure_ascii=False, indent=2)
