@@ -460,6 +460,21 @@ CONFIGS: dict[str, dict] = {
         "weight": "balanced",
         "desc": "구현된 피처 16블록 전부 — 팀원 repo_allfeat 재현",
     },
+    # `f16` 에서 rollup 46 -> rollup16 만 바꾼다. 나머지 15블록은 그대로다.
+    # f16 은 LB 0.3896 을 낸 앙상블의 입력인데 rollup 46열을 쓰고 있어서,
+    # `duplicate_signature_count`(train 1.30 / test 52.8) 같은 시프트 노출 30열이
+    # 그대로 들어가 있다. 같은 교체를 f4 -> f4r 로 재 봤을 때 CV 는 +0.0002 로
+    # 측정이 안 됐지만 LB 는 +0.0109 였다(`research/07_codex_verification_and_pair_rule.md` §1).
+    # 그 델타가 넓은 입력에서도 남는지 보는 config 다.
+    "f16r": {
+        "blocks": (
+            "domain", "rollup16", "enc3", "gec", "gtype", "parsed19", "burden8",
+            "aa9", "sigtok", "exacttok", "ptok", "comut", "lsvd", "lnmf",
+            "gmod", "csig",
+        ),
+        "weight": "balanced",
+        "desc": "f16 에서 rollup 46 을 시프트내성 rollup16 으로 바꾼 것",
+    },
 }
 
 #: 모델별 기본 하이퍼파라미터.
