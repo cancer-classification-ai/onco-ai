@@ -403,7 +403,7 @@ class TestBuildParsedTokenDocuments:
 # ---------------------------------------------------------------------------
 
 class TestParsedTokenHasher:
-    """출력 형태·stateless 속성·파라미터 효과."""
+    """출력 형태·fit→transform 순서·파라미터 효과."""
 
     def _docs(self) -> pd.Series:
         return pd.Series([
@@ -413,22 +413,24 @@ class TestParsedTokenHasher:
         ])
 
     def test_output_is_csr_matrix(self):
-        mat = ParsedTokenHasher().transform(self._docs())
+        mat = ParsedTokenHasher().fit_transform(self._docs())
         assert sp.issparse(mat)
 
     def test_output_row_count_matches_input(self):
         docs = self._docs()
-        mat = ParsedTokenHasher().transform(docs)
+        mat = ParsedTokenHasher().fit_transform(docs)
         assert mat.shape[0] == len(docs)
 
-    def test_output_col_count_matches_n_features(self):
-        n = 2 ** 10
-        mat = ParsedTokenHasher(n_features=n).transform(self._docs())
-        assert mat.shape[1] == n
+    def test_output_col_count_matches_vocabulary(self):
+        docs = self._docs()
+        hasher = ParsedTokenHasher()
+        mat = hasher.fit_transform(docs)
+        assert mat.shape[1] == len(hasher.get_feature_names_out())
 
-    def test_default_n_features_is_2_pow_18(self):
-        mat = ParsedTokenHasher().transform(self._docs())
-        assert mat.shape[1] == 2 ** 18
+    def test_fit_builds_nonempty_vocabulary(self):
+        hasher = ParsedTokenHasher()
+        hasher.fit(self._docs())
+        assert len(hasher.get_feature_names_out()) > 0
 
     def test_fit_returns_self(self):
         hasher = ParsedTokenHasher()
@@ -438,14 +440,14 @@ class TestParsedTokenHasher:
     def test_fit_transform_equals_transform(self):
         hasher = ParsedTokenHasher()
         docs = self._docs()
-        mat_t = hasher.transform(docs)
         mat_ft = hasher.fit_transform(docs)
-        assert (mat_t - mat_ft).nnz == 0
+        mat_t = hasher.transform(docs)
+        assert (mat_ft - mat_t).nnz == 0
 
     def test_same_document_same_row(self):
         doc = "GENE__BRAF TYPE__MISSENSE"
         docs = pd.Series([doc, doc])
-        mat = ParsedTokenHasher().transform(docs)
+        mat = ParsedTokenHasher().fit_transform(docs)
         diff = mat[0] - mat[1]
         assert diff.nnz == 0
 
@@ -454,25 +456,25 @@ class TestParsedTokenHasher:
             "GENE__BRAF TYPE__MISSENSE",
             "GENE__TP53 TYPE__NONSENSE",
         ])
-        mat = ParsedTokenHasher().transform(docs)
+        mat = ParsedTokenHasher().fit_transform(docs)
         diff = mat[0] - mat[1]
         assert diff.nnz > 0
 
     def test_sentinel_row_has_nonzero_entries(self):
         docs = pd.Series([_NO_PARSED_TOKEN_SENTINEL])
-        mat = ParsedTokenHasher().transform(docs)
+        mat = ParsedTokenHasher().fit_transform(docs)
         assert mat.nnz > 0
 
     def test_all_values_nonnegative(self):
-        mat = ParsedTokenHasher().transform(self._docs())
+        mat = ParsedTokenHasher().fit_transform(self._docs())
         assert mat.data.min() >= 0
 
-    def test_stateless_train_test_consistency(self):
-        """동일 객체로 train/test 변환 시 컬럼 의미가 일치한다."""
-        hasher = ParsedTokenHasher(n_features=2 ** 10)
+    def test_train_test_transform_consistency(self):
+        """fit(train) → transform(test): 같은 토큰은 같은 컬럼에 매핑된다."""
         train_docs = pd.Series(["GENE__BRAF TYPE__MISSENSE"])
         test_docs  = pd.Series(["GENE__BRAF TYPE__MISSENSE"])
-        mat_train = hasher.transform(train_docs)
+        hasher = ParsedTokenHasher()
+        mat_train = hasher.fit_transform(train_docs)
         mat_test  = hasher.transform(test_docs)
         diff = mat_train - mat_test
         assert diff.nnz == 0
@@ -488,13 +490,15 @@ class TestEndToEndPipeline:
     def test_pipeline_output_shape(self, toy_frame):
         gene_cols = [c for c in toy_frame.columns if c not in {"ID", "SUBCLASS"}]
         docs = build_parsed_token_documents(toy_frame, gene_cols)
-        mat = ParsedTokenHasher(n_features=2 ** 10).fit_transform(docs)
-        assert mat.shape == (len(toy_frame), 2 ** 10)
+        hasher = ParsedTokenHasher()
+        mat = hasher.fit_transform(docs)
+        assert mat.shape[0] == len(toy_frame)
+        assert mat.shape[1] == len(hasher.get_feature_names_out())
 
     def test_wt_row_sparse_differs_from_mutated_row(self, toy_frame):
         gene_cols = [c for c in toy_frame.columns if c not in {"ID", "SUBCLASS"}]
         docs = build_parsed_token_documents(toy_frame, gene_cols)
-        mat = ParsedTokenHasher(n_features=2 ** 10).transform(docs)
+        mat = ParsedTokenHasher().fit_transform(docs)
         # s4(전부WT) 와 s1(변이 다수) 는 달라야 한다
         diff = mat[0] - mat[3]
         assert diff.nnz > 0
