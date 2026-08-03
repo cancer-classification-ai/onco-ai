@@ -1,477 +1,145 @@
-"""Train-fold 통계로 만드는 빈도·희귀도 피처.
+"""변이 문서 -> 희소 TF-IDF 블록. **fold 의 train 문서에서만 fit 한다.**
 
-이 모듈의 피처는 행마다 독립적으로 계산할 수 없다. 반드시 CV의 train fold에서
-``fit``하고, 같은 객체로 train/validation/test를 ``transform``해야 한다.
-``SUBCLASS``는 어떤 계산에도 사용하지 않는다.
+IDF 는 문서 집합 통계다. train 과 test 를 합쳐 어휘를 만들면 평가 데이터가 학습에
+들어간 것이고 대회 규정상 실격이다. 그래서 `validation.Chi2TopKSelector`,
+`features_basic.BurdenBinner` 와 같은 계약을 쓴다 — `fit` 과 `transform` 을 갈라 놔서
+전체 데이터로 fit 하려면 일부러 해야 한다.
 
-Mutation token은 기존 exact-token 문서와 동일하게
-``MUT__{gene}__{mutation}``으로 정의한다. Frequency는 한 샘플 안의 중복을 제거한
-document frequency이고, token rarity는 smoothed IDF다.
+## 왜 서명 문서인가
+
+`features_basic.row_to_unique_mutation_document` 가 내는 `SIG__{gene}__{signature}`
+어휘에 train 을 fit 하고 test 를 transform 했을 때(실측):
+
+    min_df   |V|      train 비영 행   test 비영 행   test 평균 nnz
+      2      48,000      98.4%          97.4%          25.0
+      3      20,913      96.0%          95.5%          16.5
+      5       6,358      89.2%          90.3%           8.4
+
+`min_df=3` 이 기본이다. train 과 test 의 비영 비율 차이가 0.5%p 로 가장 작으면서
+(min_df=2 는 1.0%p, 5 는 1.1%p) 어휘가 2만 대로 떨어져 chi2 가 감당할 만하다.
+
+같은 표를 `MUT__{gene}__{token}`(원문 문자열)로 만들면 이렇다.
+
+    min_df   |V|      train 비영 행   test 비영 행   test 평균 nnz
+      2      15,961      83.7%          72.3%           2.1
+      3       2,255      66.5%          60.5%           1.1
+      5         430      50.4%          49.2%           0.7
+
+행당 비영 항이 1 근처면 사실상 0 행렬이다. test 가 같은 변이를 전사체마다 다른
+좌표로 적기 때문에 train 어휘가 test 를 못 덮는다. 그래서 이 모듈의 1급 입력은
+서명 문서이고 원문 문서는 대조군으로만 둔다.
+
+## TF 가 항상 1 이다
+
+`row_to_unique_mutation_document` 가 셀 안에서 서명을 접으므로 한 문서에 같은 토큰이
+두 번 못 나온다. 그래서 `sublinear_tf` 나 `binary` 옵션이 결과를 못 바꾼다. 문서 길이
+격차(train 행당 41.2 항 / test 132.6 항)는 서명 단계에서 39.9 / 79.8 로 줄고, 남은
+2배는 L2 정규화가 흡수한다.
 """
 
 from __future__ import annotations
 
-import re
-from collections import Counter
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 
 import numpy as np
-import pandas as pd
+from scipy import sparse
 
-from .parser import split_tokens
-
-TOKEN_PREFIX = "MUT__"
-AA_CHANGE_PREFIX = "AA__"
-EXACT_MUTATION_PREFIX = "EXACT__"
-POSITION_PREFIX = "POS__"
-_META_COLUMNS = frozenset({"ID", "SUBCLASS", "fold"})
-_POSITION_RE = re.compile(r"\d+")
-
-FREQUENCY_RARITY_FEATURE_COLUMNS: tuple[str, ...] = (
-    "rare_mutation_token_count",
-    "mean_token_frequency",
-    "min_token_frequency",
-    "mean_token_rarity",
-    "max_token_rarity",
-    "mean_mutated_gene_frequency",
-    "min_mutated_gene_frequency",
-    "mean_gene_rarity",
-    "max_gene_rarity",
-    "unseen_token_count",
-    "unseen_mutated_gene_count",
-    "mean_exact_mutation_frequency",
-    "min_exact_mutation_frequency",
-    "max_exact_mutation_frequency",
-    "mean_aa_change_frequency",
-    "min_aa_change_frequency",
-    "max_aa_change_frequency",
-    "max_gene_aa_change_frequency",
-    "mean_position_frequency",
-    "min_position_frequency",
-    "max_position_frequency",
-)
+#: 기본 TF-IDF 설정. 근거는 모듈 docstring 의 어휘 진단표.
+MUTATION_TFIDF_DEFAULTS: dict[str, object] = {
+    "min_df": 3,
+    # min_df=3 에서는 안 걸린다. min_df 를 낮췄을 때를 위한 안전판이다.
+    "max_features": 50_000,
+    "use_idf": True,
+    "smooth_idf": True,
+    "norm": "l2",
+}
 
 
-def _resolve_gene_columns(
-    frame: pd.DataFrame,
-    gene_columns: Sequence[str] | None,
-) -> list[str]:
-    genes = (
-        [column for column in frame.columns if column not in _META_COLUMNS]
-        if gene_columns is None
-        else list(gene_columns)
-    )
-    if not genes:
-        raise ValueError("No gene columns found")
-    if len(genes) != len(set(genes)):
-        raise ValueError("gene_columns contains duplicates")
-    missing = sorted(set(genes).difference(frame.columns))
-    if missing:
-        raise ValueError(f"Missing gene columns: {missing[:10]}")
-    return genes
+class MutationTfidfBlock:
+    """변이 문서 -> `csr_matrix`. **fold 의 train 문서에서만 fit 한다.**
 
+    토크나이저는 `str.split` 이다. sklearn 기본 `token_pattern` 인 `\\b\\w\\w+\\b` 는
+    `SIG__TP53__missense|V>E` 를 `SIG`, `TP`, `missense`, `V`, `E` 로 찢어 버린다.
+    `str.split` 은 lambda 와 달리 picklable 이라 모델 저장에도 안전하다.
 
-def _exact_token(gene: str, mutation: str) -> str:
-    return f"{TOKEN_PREFIX}{gene}__{mutation}"
-
-
-def _aa_change_token(mutation: str) -> str:
-    return f"{AA_CHANGE_PREFIX}{mutation}"
-
-
-def _exact_cell_mutation(gene: str, mutations: Sequence[str]) -> str:
-    """셀 안 token 순서만 정규화하고 중복 개수는 보존한 exact signature."""
-    return f"{EXACT_MUTATION_PREFIX}{gene}__{'|'.join(sorted(mutations))}"
-
-
-def _position_token(mutation: str) -> str | None:
-    """AA change의 숫자 position signature. 범위는 펼치지 않고 모두 보존한다."""
-    positions = _POSITION_RE.findall(mutation)
-    if not positions:
-        return None
-    return f"{POSITION_PREFIX}{'_'.join(positions)}"
-
-
-def _iter_sample_entities(
-    frame: pd.DataFrame,
-    gene_columns: Sequence[str],
-) -> Iterator[
-    tuple[list[str], set[str], set[str], set[str], set[str]]
-]:
-    """샘플별 gene/exact-cell/AA/gene-AA/position key를 반환한다."""
-    values = frame[list(gene_columns)].to_numpy(dtype=object)
-    for row in values:
-        mutated_genes: list[str] = []
-        exact_mutations: set[str] = set()
-        aa_changes: set[str] = set()
-        gene_aa_changes: set[str] = set()
-        positions: set[str] = set()
-        for gene, value in zip(gene_columns, row):
-            mutations = split_tokens(value)
-            if not mutations:
-                continue
-            mutated_genes.append(gene)
-            exact_mutations.add(_exact_cell_mutation(gene, mutations))
-            for mutation in mutations:
-                aa_changes.add(_aa_change_token(mutation))
-                gene_aa_changes.add(_exact_token(gene, mutation))
-                position = _position_token(mutation)
-                if position is not None:
-                    positions.add(position)
-        yield (
-            mutated_genes,
-            exact_mutations,
-            aa_changes,
-            gene_aa_changes,
-            positions,
-        )
-
-
-class TrainFrequencyFeatures:
-    """Train-fold 전용 frequency/IDF/rarity transformer.
-
-    저장하는 train 통계
-
-    - ``gene_frequency_``: 유전자별 변이 sample frequency
-    - ``exact_mutation_frequency_``: gene + 셀 전체 mutation 조합 frequency
-    - ``aa_change_frequency_``: gene 비의존 AA change frequency
-    - ``gene_aa_change_frequency_``: gene + AA change frequency
-    - ``position_frequency_``: gene 비의존 position signature frequency
-    - ``token_frequency_``: ``gene_aa_change_frequency_``의 호환 alias
-    - ``token_idf_``: ``log((N + 1) / (df + 1)) + 1``
-    - ``gene_rarity_``: 클래스 비의존적 ``-log((count + 1) / (N + 1))``
-
-    ``transform``은 위 lookup을 샘플별 고정 길이 피처로 집계한다. Validation과
-    test 자체의 분포는 절대 집계하지 않는다.
+    >>> block = MutationTfidfBlock(min_df=1).fit(
+    ...     ["SIG__A__missense|V>E", "SIG__A__missense|V>E SIG__B__nonsense|Q"]
+    ... )
+    >>> list(block.feature_names_)
+    ['SIG__A__missense|V>E', 'SIG__B__nonsense|Q']
+    >>> block.transform(["SIG__Z__missense|X>Y"]).nnz    # 미지 항은 0 행이 된다
+    0
     """
 
-    def __init__(self, *, rare_df_threshold: int = 2) -> None:
-        if rare_df_threshold < 0:
-            raise ValueError("rare_df_threshold must be >= 0")
-        self.rare_df_threshold = int(rare_df_threshold)
+    def __init__(self, **params) -> None:
+        self.params = {**MUTATION_TFIDF_DEFAULTS, **params}
+        self.vectorizer_ = None
+        self.feature_names_: np.ndarray | None = None
 
-        self.n_train_samples_: int | None = None
-        self.gene_columns_: tuple[str, ...] | None = None
-        self.gene_mutation_count_: dict[str, int] | None = None
-        self.exact_mutation_document_count_: dict[str, int] | None = None
-        self.aa_change_document_count_: dict[str, int] | None = None
-        self.gene_aa_change_document_count_: dict[str, int] | None = None
-        self.position_document_count_: dict[str, int] | None = None
-        self.token_document_count_: dict[str, int] | None = None
-        self.gene_frequency_: dict[str, float] | None = None
-        self.exact_mutation_frequency_: dict[str, float] | None = None
-        self.aa_change_frequency_: dict[str, float] | None = None
-        self.gene_aa_change_frequency_: dict[str, float] | None = None
-        self.position_frequency_: dict[str, float] | None = None
-        self.token_frequency_: dict[str, float] | None = None
-        self.token_idf_: dict[str, float] | None = None
-        self.gene_rarity_: dict[str, float] | None = None
-        self.unseen_token_rarity_: float | None = None
+    def fit(self, documents: Sequence[str]) -> "MutationTfidfBlock":
+        # sklearn import 를 함수 안에서 한다 — `models_gbdt` 와 같은 관행이다.
+        from sklearn.feature_extraction.text import TfidfVectorizer
 
-    def fit(
-        self,
-        train_frame: pd.DataFrame,
-        *,
-        gene_columns: Sequence[str] | None = None,
-    ) -> "TrainFrequencyFeatures":
-        """Train 또는 train fold만 받아 lookup 통계를 학습한다."""
-        if train_frame.empty:
-            raise ValueError("Cannot fit frequency features on an empty frame")
-        genes = _resolve_gene_columns(train_frame, gene_columns)
-        n_samples = len(train_frame)
-
-        gene_counts: Counter[str] = Counter()
-        exact_mutation_counts: Counter[str] = Counter()
-        aa_change_counts: Counter[str] = Counter()
-        gene_aa_change_counts: Counter[str] = Counter()
-        position_counts: Counter[str] = Counter()
-        for (
-            mutated_genes,
-            exact_mutations,
-            aa_changes,
-            gene_aa_changes,
-            positions,
-        ) in _iter_sample_entities(train_frame, genes):
-            gene_counts.update(mutated_genes)
-            exact_mutation_counts.update(exact_mutations)
-            aa_change_counts.update(aa_changes)
-            gene_aa_change_counts.update(gene_aa_changes)
-            position_counts.update(positions)
-
-        self.n_train_samples_ = n_samples
-        self.gene_columns_ = tuple(genes)
-        self.gene_mutation_count_ = {
-            gene: int(gene_counts.get(gene, 0)) for gene in genes
-        }
-        self.exact_mutation_document_count_ = {
-            key: int(count) for key, count in exact_mutation_counts.items()
-        }
-        self.aa_change_document_count_ = {
-            key: int(count) for key, count in aa_change_counts.items()
-        }
-        self.gene_aa_change_document_count_ = {
-            key: int(count) for key, count in gene_aa_change_counts.items()
-        }
-        self.position_document_count_ = {
-            key: int(count) for key, count in position_counts.items()
-        }
-        # 기존 공개 API는 gene + AA change 의미였으므로 같은 객체를 alias한다.
-        self.token_document_count_ = self.gene_aa_change_document_count_
-        self.gene_frequency_ = {
-            gene: count / n_samples
-            for gene, count in self.gene_mutation_count_.items()
-        }
-        self.exact_mutation_frequency_ = {
-            key: count / n_samples
-            for key, count in self.exact_mutation_document_count_.items()
-        }
-        self.aa_change_frequency_ = {
-            key: count / n_samples
-            for key, count in self.aa_change_document_count_.items()
-        }
-        self.gene_aa_change_frequency_ = {
-            key: count / n_samples
-            for key, count in self.gene_aa_change_document_count_.items()
-        }
-        self.position_frequency_ = {
-            key: count / n_samples
-            for key, count in self.position_document_count_.items()
-        }
-        self.token_frequency_ = self.gene_aa_change_frequency_
-        self.token_idf_ = {
-            token: float(np.log((n_samples + 1) / (count + 1)) + 1.0)
-            for token, count in self.token_document_count_.items()
-        }
-        self.gene_rarity_ = {
-            gene: float(-np.log((count + 1) / (n_samples + 1)))
-            for gene, count in self.gene_mutation_count_.items()
-        }
-        # Validation/test에만 나온 token은 train df=0으로 취급한다.
-        self.unseen_token_rarity_ = float(np.log(n_samples + 1) + 1.0)
+        self.vectorizer_ = TfidfVectorizer(
+            analyzer=str.split,
+            lowercase=False,
+            dtype=np.float32,
+            **self.params,
+        )
+        self.vectorizer_.fit(list(documents))
+        self.feature_names_ = self.vectorizer_.get_feature_names_out()
         return self
 
-    def transform(
-        self,
-        frame: pd.DataFrame,
-        *,
-        gene_columns: Sequence[str] | None = None,
-    ) -> pd.DataFrame:
-        """학습해 둔 train-fold 통계만 lookup해 샘플 피처를 만든다."""
-        self._check_fitted()
-        genes = self._validate_transform_columns(frame, gene_columns)
-        n_rows = len(frame)
+    def transform(self, documents: Sequence[str]) -> sparse.csr_matrix:
+        if self.vectorizer_ is None:
+            raise RuntimeError("fit() 을 먼저 부른다")
+        return self.vectorizer_.transform(list(documents))
 
-        rare_counts = np.zeros(n_rows, dtype=np.int32)
-        mean_token_frequency = np.zeros(n_rows, dtype=np.float32)
-        min_token_frequency = np.zeros(n_rows, dtype=np.float32)
-        mean_token_rarity = np.zeros(n_rows, dtype=np.float32)
-        max_token_rarity = np.zeros(n_rows, dtype=np.float32)
-        mean_gene_frequency = np.zeros(n_rows, dtype=np.float32)
-        min_gene_frequency = np.zeros(n_rows, dtype=np.float32)
-        mean_gene_rarity = np.zeros(n_rows, dtype=np.float32)
-        max_gene_rarity = np.zeros(n_rows, dtype=np.float32)
-        unseen_token_counts = np.zeros(n_rows, dtype=np.int32)
-        unseen_gene_counts = np.zeros(n_rows, dtype=np.int32)
-        frequency_aggregates = np.zeros((n_rows, 10), dtype=np.float32)
+    @property
+    def idf_(self) -> np.ndarray:
+        if self.vectorizer_ is None:
+            raise RuntimeError("fit() 을 먼저 부른다")
+        return self.vectorizer_.idf_
 
-        for row_idx, (
-            mutated_genes,
-            exact_mutations,
-            aa_changes,
-            gene_aa_changes,
-            positions,
-        ) in enumerate(_iter_sample_entities(frame, genes)):
-            if gene_aa_changes:
-                document_counts = np.fromiter(
-                    (
-                        self.token_document_count_.get(token, 0)
-                        for token in gene_aa_changes
-                    ),
-                    dtype=np.int64,
-                )
-                frequencies = document_counts.astype(np.float64) / self.n_train_samples_
-                rarities = np.fromiter(
-                    (
-                        self.token_idf_.get(token, self.unseen_token_rarity_)
-                        for token in gene_aa_changes
-                    ),
-                    dtype=np.float64,
-                )
-                rare_counts[row_idx] = int(
-                    (document_counts <= self.rare_df_threshold).sum()
-                )
-                unseen_token_counts[row_idx] = int((document_counts == 0).sum())
-                mean_token_frequency[row_idx] = frequencies.mean()
-                min_token_frequency[row_idx] = frequencies.min()
-                mean_token_rarity[row_idx] = rarities.mean()
-                max_token_rarity[row_idx] = rarities.max()
-                frequency_aggregates[row_idx, 6] = frequencies.max()
+    def __repr__(self) -> str:
+        width = "unfitted" if self.feature_names_ is None else len(self.feature_names_)
+        return f"MutationTfidfBlock(|V|={width}, min_df={self.params['min_df']})"
 
-            for offset, keys, lookup in (
-                (0, exact_mutations, self.exact_mutation_frequency_),
-                (3, aa_changes, self.aa_change_frequency_),
-                (7, positions, self.position_frequency_),
-            ):
-                if not keys:
-                    continue
-                values = np.fromiter(
-                    (lookup.get(key, 0.0) for key in keys),
-                    dtype=np.float64,
-                )
-                frequency_aggregates[row_idx, offset] = values.mean()
-                frequency_aggregates[row_idx, offset + 1] = values.min()
-                frequency_aggregates[row_idx, offset + 2] = values.max()
 
-            if mutated_genes:
-                gene_frequencies = np.fromiter(
-                    (self.gene_frequency_[gene] for gene in mutated_genes),
-                    dtype=np.float64,
-                )
-                gene_rarities = np.fromiter(
-                    (self.gene_rarity_[gene] for gene in mutated_genes),
-                    dtype=np.float64,
-                )
-                gene_counts = np.fromiter(
-                    (self.gene_mutation_count_[gene] for gene in mutated_genes),
-                    dtype=np.int64,
-                )
-                mean_gene_frequency[row_idx] = gene_frequencies.mean()
-                min_gene_frequency[row_idx] = gene_frequencies.min()
-                mean_gene_rarity[row_idx] = gene_rarities.mean()
-                max_gene_rarity[row_idx] = gene_rarities.max()
-                unseen_gene_counts[row_idx] = int((gene_counts == 0).sum())
+def build_fold_tfidf_block(
+    train_documents: Sequence[str],
+    test_documents: Sequence[str],
+    train_index: np.ndarray,
+    y_train_fold: Sequence,
+    *,
+    prefix: str,
+    topk: int | None = 1000,
+    **tfidf_params,
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """한 fold 분의 TF-IDF 블록 -> (열 이름, train dense, test dense).
 
-        return pd.DataFrame(
-            {
-                "rare_mutation_token_count": rare_counts,
-                "mean_token_frequency": mean_token_frequency,
-                "min_token_frequency": min_token_frequency,
-                "mean_token_rarity": mean_token_rarity,
-                "max_token_rarity": max_token_rarity,
-                "mean_mutated_gene_frequency": mean_gene_frequency,
-                "min_mutated_gene_frequency": min_gene_frequency,
-                "mean_gene_rarity": mean_gene_rarity,
-                "max_gene_rarity": max_gene_rarity,
-                "unseen_token_count": unseen_token_counts,
-                "unseen_mutated_gene_count": unseen_gene_counts,
-                "mean_exact_mutation_frequency": frequency_aggregates[:, 0],
-                "min_exact_mutation_frequency": frequency_aggregates[:, 1],
-                "max_exact_mutation_frequency": frequency_aggregates[:, 2],
-                "mean_aa_change_frequency": frequency_aggregates[:, 3],
-                "min_aa_change_frequency": frequency_aggregates[:, 4],
-                "max_aa_change_frequency": frequency_aggregates[:, 5],
-                "max_gene_aa_change_frequency": frequency_aggregates[:, 6],
-                "mean_position_frequency": frequency_aggregates[:, 7],
-                "min_position_frequency": frequency_aggregates[:, 8],
-                "max_position_frequency": frequency_aggregates[:, 9],
-            },
-            columns=list(FREQUENCY_RARITY_FEATURE_COLUMNS),
-            index=frame.index,
-        )
+    어휘·IDF·chi2 를 **전부 `train_documents[train_index]` 에만** fit 한다.
+    반환하는 train 행렬은 valid 행을 포함한 **전체 train 행**이다 — valid 도
+    transform 은 받아야 OOF 예측이 나온다. fit 에 안 들어갔을 뿐이다.
 
-    def fit_transform(
-        self,
-        train_frame: pd.DataFrame,
-        *,
-        gene_columns: Sequence[str] | None = None,
-    ) -> pd.DataFrame:
-        """``fit(train_frame).transform(train_frame)`` 편의 메서드."""
-        return self.fit(
-            train_frame, gene_columns=gene_columns
-        ).transform(
-            train_frame, gene_columns=gene_columns
-        )
+    dense 로 돌려주는 이유는 `train_gbdt.run_config` 의 fold 루프가
+    `x_train[valid_index]` 같은 팬시 인덱싱과 열 단위 대입을 쓰기 때문이다. top-K 가
+    폭을 1,000 열로 묶으므로 6,201 x 1,000 float32 = 25MB 다. 희소로 들고 다닐
+    이유가 없다.
+    """
+    from .validation import Chi2TopKSelector
 
-    def get_gene_statistics(self) -> pd.DataFrame:
-        """팀 실험 기록용 유전자별 frequency/rarity 표."""
-        self._check_fitted()
-        return pd.DataFrame(
-            {
-                "gene": self.gene_columns_,
-                "mutation_sample_count": [
-                    self.gene_mutation_count_[gene] for gene in self.gene_columns_
-                ],
-                "mutation_frequency": [
-                    self.gene_frequency_[gene] for gene in self.gene_columns_
-                ],
-                "gene_rarity": [
-                    self.gene_rarity_[gene] for gene in self.gene_columns_
-                ],
-            }
-        )
+    train_documents = np.asarray(train_documents, dtype=object)
+    test_documents = np.asarray(test_documents, dtype=object)
 
-    def get_token_statistics(self) -> pd.DataFrame:
-        """팀 실험 기록용 mutation token별 frequency/IDF 표."""
-        self._check_fitted()
-        tokens = sorted(self.token_document_count_)
-        return pd.DataFrame(
-            {
-                "mutation_token": tokens,
-                "document_count": [
-                    self.token_document_count_[token] for token in tokens
-                ],
-                "frequency": [self.token_frequency_[token] for token in tokens],
-                "idf": [self.token_idf_[token] for token in tokens],
-            }
-        )
+    block = MutationTfidfBlock(**tfidf_params).fit(train_documents[train_index])
+    sparse_train = block.transform(train_documents)
+    sparse_test = block.transform(test_documents)
 
-    def get_frequency_statistics(self) -> pd.DataFrame:
-        """새 frequency family 네 종류를 long 형식으로 반환한다."""
-        self._check_fitted()
-        frames: list[pd.DataFrame] = []
-        for family, counts, frequencies in (
-            (
-                "exact_mutation",
-                self.exact_mutation_document_count_,
-                self.exact_mutation_frequency_,
-            ),
-            ("aa_change", self.aa_change_document_count_, self.aa_change_frequency_),
-            (
-                "gene_aa_change",
-                self.gene_aa_change_document_count_,
-                self.gene_aa_change_frequency_,
-            ),
-            ("position", self.position_document_count_, self.position_frequency_),
-        ):
-            keys = sorted(counts)
-            frames.append(
-                pd.DataFrame(
-                    {
-                        "family": family,
-                        "key": keys,
-                        "document_count": [counts[key] for key in keys],
-                        "frequency": [frequencies[key] for key in keys],
-                    }
-                )
-            )
-        return pd.concat(frames, ignore_index=True)
-
-    def get_feature_names_out(self) -> np.ndarray:
-        """scikit-learn 스타일의 고정 출력 컬럼 목록."""
-        return np.asarray(FREQUENCY_RARITY_FEATURE_COLUMNS, dtype=object)
-
-    def _validate_transform_columns(
-        self,
-        frame: pd.DataFrame,
-        gene_columns: Sequence[str] | None,
-    ) -> list[str]:
-        genes = (
-            list(self.gene_columns_)
-            if gene_columns is None
-            else _resolve_gene_columns(frame, gene_columns)
-        )
-        missing = sorted(set(genes).difference(frame.columns))
-        if missing:
-            raise ValueError(f"Missing gene columns: {missing[:10]}")
-        if tuple(genes) != self.gene_columns_:
-            raise ValueError(
-                "gene_columns must match fit() columns and order exactly"
-            )
-        return genes
-
-    def _check_fitted(self) -> None:
-        if self.n_train_samples_ is None:
-            raise RuntimeError(
-                "TrainFrequencyFeatures.fit()을 train 또는 train fold에서 먼저 "
-                "호출해야 합니다."
-            )
+    selector = Chi2TopKSelector(k=topk).fit(sparse_train[train_index], y_train_fold)
+    names = [f"{prefix}{name}" for name in block.feature_names_[selector.indices_]]
+    return (
+        names,
+        selector.transform(sparse_train).toarray().astype(np.float32),
+        selector.transform(sparse_test).toarray().astype(np.float32),
+    )

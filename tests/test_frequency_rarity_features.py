@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from cancer_hack.features_sparse import (
+from cancer_hack.features_frequency import (
     FREQUENCY_RARITY_FEATURE_COLUMNS,
     TrainFrequencyFeatures,
 )
