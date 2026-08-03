@@ -5,8 +5,13 @@ from cancer_hack.features_sparse import build_fold_parsed_token_block
 
 
 def test_encode_mutation_treats_empty_cell_as_wt():
-    assert encode_mutation("") == 0
-    assert encode_mutation("   ") == 0
+    for value in ("", "   ", "WT", "NA", "NAN", "NONE", ".", "0", None, np.nan):
+        assert encode_mutation(value) == 0
+
+
+def test_encode_mutation_treats_stop_to_stop_as_synonymous():
+    assert encode_mutation("*261*") == 1
+    assert encode_mutation("X541X") == 1
 
 
 def test_parsed_token_fold_builder_does_not_fit_valid_or_test_vocabulary():

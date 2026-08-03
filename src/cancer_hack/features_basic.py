@@ -34,7 +34,7 @@ from .parser import (
 )
 
 # Synonymous mutation 패턴 확인용 정규식
-_SYNONYMOUS_RE = re.compile(r"^([A-Z])\d+\1$")
+_SYNONYMOUS_RE = re.compile(r"^([A-Z*])\d+\1$")
 
 # Mutation encoding 대상에서 제외할 메타 정보 컬럼
 _GENE_EXCLUDE = {"ID", "SUBCLASS"}
@@ -51,21 +51,17 @@ SIGNATURE_MUTATION_PREFIX = "SIG__"
 
 # 단일 mutation token을 WT / Synonymous / Functional 3단계 값으로 변환
 def _encode_single(token: str) -> int:
-    if token == "WT":
+    if token.upper() in _MUTATION_EMPTY:
         return 0
-    if _SYNONYMOUS_RE.match(token):
+    if _SYNONYMOUS_RE.fullmatch(token):
         return 1
     return 2
 
 
 # 하나의 mutation cell 값을 분석하여 가장 높은 변이 영향도로 인코딩
-def encode_mutation(value: str) -> int:
-    tokens = str(value).split()
-    if not tokens:
-        return 0
-    if len(tokens) == 1:
-        return _encode_single(tokens[0])
-    return max(_encode_single(t) for t in tokens)
+def encode_mutation(value: object) -> int:
+    tokens = split_tokens(value)
+    return max((_encode_single(token) for token in tokens), default=0)
 
 
 # 전체 gene column에 mutation encoding을 적용하여 전처리된 데이터셋 생성
