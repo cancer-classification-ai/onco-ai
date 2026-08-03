@@ -933,6 +933,54 @@ def test_latent_slug_distinguishes_all_params():
         seen.add(slug)
 
 
+def test_latent_method_is_resolved_per_block():
+    """`lnmf` 는 자기 이름으로 방식을 정하고 나머지는 `--latent-method` 를 따른다.
+
+    config 전체에 방식 하나만 정하면 `lsvd`·`lnmf`가 같은 config 에 있을 때 둘 다
+    nmf 로 돌아간다 — 실제로 있었던 버그다.
+    """
+    assert train_gbdt._resolve_latent_methods(["lsvd"], "svd") == ["svd"]
+    assert train_gbdt._resolve_latent_methods(["lnmf"], "svd") == ["nmf"]
+    assert train_gbdt._resolve_latent_methods(["lsvd", "lnmf"], "svd") == ["svd", "nmf"]
+    assert train_gbdt._resolve_latent_methods(["lnmf", "lsvd"], "svd") == ["nmf", "svd"]
+
+
+def test_latent_slug_is_byte_identical_for_single_block():
+    """단일 블록 슬러그가 디스크의 기존 로그 파일명과 문자 그대로 같아야 한다.
+
+    `xgb_lat_f4rl_..._lt64svdl25beb91_...json` · `xgb_lat_f4rn_..._lt64nmfl2bb3575_...json`
+    이 이미 쌓여 있다. 잠재 방식을 블록별로 다시 푸는 리팩터 뒤에도 이 문자열이
+    그대로 나와야 비교표가 안 끊긴다.
+    """
+    base = dict(
+        n_components=64, row_norm="l2", value="proj", mode="mutated",
+        gene_weight="none", min_gene_support=5, random_state=0,
+    )
+    svd_kwargs = {**base, "method": "".join(dict.fromkeys(
+        train_gbdt._resolve_latent_methods(["lsvd"], "svd")
+    ))}
+    nmf_kwargs = {**base, "method": "".join(dict.fromkeys(
+        train_gbdt._resolve_latent_methods(["lnmf"], "svd")
+    ))}
+    assert train_gbdt._latent_slug(svd_kwargs) == "_lt64svdl25beb91"
+    assert train_gbdt._latent_slug(nmf_kwargs) == "_lt64nmfl2bb3575"
+
+
+def test_latent_slug_distinguishes_combined_methods():
+    """svd·nmf·svdnmf 세 슬러그가 서로 달라야 한다 — 조합 config 가 단일 config 를 안 덮는다."""
+    base = dict(
+        n_components=64, row_norm="l2", value="proj", mode="mutated",
+        gene_weight="none", min_gene_support=5, random_state=0,
+    )
+    slugs = set()
+    for blocks in (["lsvd"], ["lnmf"], ["lsvd", "lnmf"]):
+        methods = train_gbdt._resolve_latent_methods(blocks, "svd")
+        kwargs = {**base, "method": "".join(dict.fromkeys(methods))}
+        slug = train_gbdt._latent_slug(kwargs)
+        assert slug not in slugs, f"충돌: {blocks} -> {slug}"
+        slugs.add(slug)
+
+
 def test_module_slug_distinguishes_all_params():
     base = dict(
         value="share",

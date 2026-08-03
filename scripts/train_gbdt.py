@@ -852,14 +852,12 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     comut_slug = _comut_slug(comut_kwargs, manual=args.comut_manual)
     # 잠재·모듈 축도 같은 이유로 slug 가 필요하다. 셋 다 빈 dict 면 `""` 를 내므로
     # 기존 로그 129개의 파일명이 바이트 단위로 그대로 유지된다.
-    # `lnmf` 는 이름 자체가 방식을 정하므로 `--latent-method` 를 덮는다. 그 해석을
-    # **여기서** 끝내야 slug 와 로그의 `latent.params.method` 가 실제 돌아간 방식과
-    # 일치한다 — fold 루프 안에서만 덮으면 파일명은 svd 라고 적혀 있는데 nmf 가
-    # 돌아간다(실제로 한 번 그렇게 나왔다).
-    latent_method = "nmf" if "lnmf" in latent_blocks else args.latent_method
+    latent_methods = _resolve_latent_methods(latent_blocks, args.latent_method)
     latent_kwargs = (
         dict(
-            method=latent_method,
+            # 단일 블록이면 기존 문자열 그대로("svd"/"nmf") 나와 슬러그가 바이트
+            # 단위로 보존된다. 조합일 때만 이어붙인 문자열("svdnmf")이 된다.
+            method="".join(dict.fromkeys(latent_methods)),
             n_components=args.latent_components,
             row_norm=args.latent_row_norm,
             value=args.latent_value,
@@ -1044,7 +1042,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         # 잠재 기저 — SVD/NMF 를 fold 의 train 부분에서만 fit 한다. test 행렬은
         # transform 만 받는다 (features_latent.fit_latent_basis 는 test 도 y 도
         # 인자로 받지 않는다).
-        for block in latent_blocks:
+        for block, method in zip(latent_blocks, latent_methods):
             columns, latent_train, latent_test = data.pairs[block]
             lat_names, lat_tr, lat_te, lat_diag, basis = build_fold_latent_block(
                 latent_train,
@@ -1052,7 +1050,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
                 train_index,
                 data.y[train_index],
                 gene_names=columns,
-                **latent_kwargs,
+                **{**latent_kwargs, "method": method},
             )
             # `selected` 에 넣지 않는다 — 열 이름이 매 fold `lat__svd__c000` 으로
             # 같아서 Jaccard 가 항상 1.000 이 나온다. 안정성을 모르는 대상에 대해
@@ -1180,6 +1178,9 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             {
                 "blocks": latent_blocks,
                 "params": latent_kwargs,
+                # 블록마다 실제로 돌아간 방식. `params.method` 는 slug 용으로 이어붙인
+                # 문자열이라("svdnmf") 블록별 진실은 여기서 봐야 한다.
+                "methods": dict(zip(latent_blocks, latent_methods)),
                 # 열 이름이 고정이라 Jaccard 는 무의미하다. fold 쌍마다 주각 코사인
                 # 평균을 내서 "같은 부분공간을 보고 있나"를 잰다 — 1 이면 완전 일치.
                 "subspace_alignment": {
@@ -1321,6 +1322,18 @@ def _selection_overlap(selected: dict[str, list[str]]) -> float:
             union = a | b
             scores.append(len(a & b) / len(union) if union else 1.0)
     return float(np.mean(scores))
+
+
+def _resolve_latent_methods(latent_blocks: list[str], default_method: str) -> list[str]:
+    """블록마다 실제로 돌릴 잠재 방식을 정한다.
+
+    `lnmf` 는 이름 자체가 방식을 정하므로 `--latent-method` 를 덮는다. **블록마다**
+    풀어야 한다 — config 전체에 방식 하나만 정하면 `lsvd`·`lnmf`가 같은 config 에
+    있을 때 둘 다 nmf 로 돌아간다. 두 블록은 소스 parquet·시드·성분 수가 전부 같아서
+    결과가 바이트 단위로 같은 64열 두 벌이 되고, 열 이름도 `lat__nmf__c000` 으로
+    같아서 예외도 경고도 없이 SVD 가 사라진다.
+    """
+    return ["nmf" if block == "lnmf" else default_method for block in latent_blocks]
 
 
 def _comut_slug(comut_kwargs: dict, *, manual: bool) -> str:
