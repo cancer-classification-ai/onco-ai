@@ -1,7 +1,7 @@
 #!/usr/bin/env python
-"""Run the full-feature DL ladder on Kaggle: MLP baseline, then Hybrid.
+"""Run the DL ladder on Kaggle: MLP, Set Encoder, then Hybrid.
 
-The two models remain separate experiments and produce independent OOF, log,
+The three models remain separate experiments and produce independent OOF, log,
 test-probability, and submission files.
 
     python scripts/run_dl_ladder.py --device cuda --seed 42
@@ -28,6 +28,7 @@ MODEL_CONFIGS = {
     "set_encoder": PROJECT_ROOT / "configs/gene_set_encoder.yaml",
     "hybrid": PROJECT_ROOT / "configs/hybrid_set_mlp.yaml",
 }
+DEFAULT_MODELS = ("mlp", "set_encoder", "hybrid")
 FULL_FEATURE_FILES = (
     "train_domain_features.parquet",
     "test_domain_features.parquet",
@@ -51,8 +52,8 @@ def parse_args() -> argparse.Namespace:
         "--models",
         nargs="+",
         choices=list(MODEL_CONFIGS),
-        default=["mlp", "hybrid"],
-        help="execution order; default runs the baseline before Hybrid",
+        default=list(DEFAULT_MODELS),
+        help="execution order; default runs MLP, Set Encoder, then Hybrid",
     )
     parser.add_argument("--cv", choices=["skf", "sgkf"], default="skf")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")

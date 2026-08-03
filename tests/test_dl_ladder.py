@@ -16,6 +16,7 @@ def _load_ladder_module():
 
 def test_default_ladder_command_uses_model_specific_config_and_tag() -> None:
     ladder = _load_ladder_module()
+    assert ladder.DEFAULT_MODELS == ("mlp", "set_encoder", "hybrid")
     tag = ladder.experiment_tag("mlp", "full", 42)
     command = ladder.build_train_command(
         "mlp",
@@ -35,18 +36,27 @@ def test_default_ladder_command_uses_model_specific_config_and_tag() -> None:
     assert "--no-submission" not in command
 
 
-def test_ladder_artifacts_keep_mlp_and_hybrid_separate() -> None:
+def test_ladder_artifacts_keep_all_models_separate() -> None:
     ladder = _load_ladder_module()
     mlp = ladder.artifact_paths(
         "mlp", "mlp_full_s42", "skf", include_submission=True
+    )
+    set_encoder = ladder.artifact_paths(
+        "set_encoder", "set_encoder_full_s42", "skf", include_submission=True
     )
     hybrid = ladder.artifact_paths(
         "hybrid", "hybrid_full_s42", "skf", include_submission=True
     )
 
-    assert len(mlp) == len(hybrid) == 4
+    assert len(mlp) == len(set_encoder) == len(hybrid) == 4
+    assert not set(mlp).intersection(set_encoder)
     assert not set(mlp).intersection(hybrid)
+    assert not set(set_encoder).intersection(hybrid)
     assert any("oof_dl_mlp_mlp_full_s42_skf5.csv" in str(path) for path in mlp)
+    assert any(
+        "test_dl_set_encoder_set_encoder_full_s42_skf5.csv" in str(path)
+        for path in set_encoder
+    )
     assert any(
         "submission_dl_hybrid_hybrid_full_s42_skf5.csv" in str(path)
         for path in hybrid

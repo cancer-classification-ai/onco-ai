@@ -60,6 +60,27 @@ pip install -r requirements.txt
 
 ### 모델 학습
 
+Kaggle에서는 한 명령으로 세 단계 DL ladder를 실행한다.
+
+```bash
+python scripts/run_dl_ladder.py --device cuda --seed 42
+```
+
+기본 실행 순서는 다음과 같다.
+
+1. full dense feature를 사용하는 MLP baseline
+2. mutation token만 사용하는 Hierarchical Gene Set Encoder
+3. 두 표현을 결합하는 full-feature Hybrid
+
+세 모델은 동일한 `train_folds.parquet`을 사용하며 OOF, 로그, test 확률,
+submission을 `artifacts/{oof,logs,test_predictions,submissions}/`에 각각 저장한다.
+특정 모델만 실행하려면 `--models`를 사용한다.
+
+```bash
+python scripts/run_dl_ladder.py --models mlp --device cuda --seed 42
+python scripts/run_dl_ladder.py --models set_encoder --device cuda --seed 42
+python scripts/run_dl_ladder.py --models hybrid --device cuda --seed 42
+```
 
 ### 예측 생성
 
