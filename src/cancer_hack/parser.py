@@ -59,7 +59,8 @@ test 에 40토큰뿐이다. 즉 문자열 포함 정의로 가면 train 2.94% / 
 
 from __future__ import annotations
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+import math
 
 import pandas as pd
 import re
@@ -113,6 +114,12 @@ DELETION_KINDS: tuple[str, ...] = (DELETION, DELINS)
 # 가진 토큰이 데이터에 0개라서 배타 분류로도 손실이 없다).
 INDEL_KINDS: tuple[str, ...] = (DELETION, INSERTION, DELINS)
 
+# --- 토큰 분류 정규식 (여기가 유일한 정의다) --------------------------------
+#
+# 예전에는 같은 이름이 이 파일 안에서 두 번 정의돼 있었다. 파이썬은 나중 정의가
+# 이기므로 아래쪽 것이 위쪽을 조용히 덮어썼고, 그 결과 `classify_token` 이
+# `Q369*` 를 missense 로 분류했다(정지코돈 판정이 아예 안 걸렸다). 이름 하나당
+# 정의 하나만 둔다.
 _FRAMESHIFT_RE = re.compile(r"fs")
 _DELINS_RE = re.compile(r"delins")
 _DELETION_RE = re.compile(r"del")
@@ -123,27 +130,16 @@ _NONSENSE_RE = re.compile(r"^[A-Z]\d+[*X]$")
 _SUBSTITUTION_RE = re.compile(r"^([A-Z*])\d+([A-Z*])$")
 _COMPLEX_RE = re.compile(r"[_>]")
 
-
-# 변이가 없는 것으로 간주하는 값들
-_MUTATION_EMPTY: frozenset[str] = frozenset({"", "WT", "0", "NA", "NAN", "NONE", "."})
-
-# 동의 변이 (예: R895R)
+# --- 분류에 쓰지 않는 보조 정규식 -------------------------------------------
+# 유전자 3단계 인코딩(`features_basic.encode_mutation`)이 쓴다.
 _SYNONYMOUS_RE = re.compile(r"^([A-Z])\d+\1$")
-
-# 복합 변이 (del, ins, dup, splice, _, > 포함)
-_ROWCOUNT_COMPLEX_RE = re.compile(r"[_>]|del|ins|dup|splice", re.IGNORECASE)
-
-# 삽입/결실 변이 - del로 끝나는 토큰 (예: R649del, 490del, E746_A750del)
+# `del` 로 끝나는 토큰만 센다(`R649del`, `E746_A750del`). 명시적 결실 집계용이라
+# `_DELETION_RE`(부분일치)와 목적이 다르다.
 _INDEL_RE = re.compile(r"del$", re.IGNORECASE)
 
-# 프레임시프트 변이 (fs 포함)
-_ROWCOUNT_FRAMESHIFT_RE = re.compile(r"fs", re.IGNORECASE)
+#: `EMPTY_VALUES` 의 별칭. 값이 같은 집합을 두 벌 두면 한쪽만 고쳤을 때 어긋난다.
+_MUTATION_EMPTY: frozenset[str] = EMPTY_VALUES
 
-# 넌센스 변이 (종결 코돈, *로 끝남)
-_ROWCOUNT_NONSENSE_RE = re.compile(r"\*$")
-
-# 미스센스 변이 (예: R175H)
-_MISSENSE_RE = re.compile(r"^[A-Z]\d+[A-Z]$")
 
 
 def split_tokens(value: object) -> list[str]:
@@ -196,6 +192,77 @@ def classify_token(token: str) -> str:
     return OTHER
 
 
+# --- 서명(signature) — 잔기 번호를 지우고 유형과 잔기만 남긴다 ----------------
+#
+# test 는 같은 변이를 전사체마다 다른 좌표로 반복 기재한다(`M267I M206I`). 문자열
+# 정확 일치로는 그게 중복으로 안 잡힌다 — 실측 잉여 토큰이 문자열 기준 test 218 개인데
+# 서명 기준으로는 134,430 개다. 위치를 지우면 그 중복이 드러난다.
+_SIG_DIGITS = re.compile(r"\d+")
+_SIG_SUBSTITUTION = re.compile(r"^([A-Z*])\d+([A-Z*])$")
+_SIG_NONSENSE = re.compile(r"^([A-Z])\d+[*X]$")
+#: 첫 숫자 앞까지가 ref. `K16fs` -> `K`, `K437Rfs` -> `K`, `-287fs` -> `-`.
+_SIG_FRAMESHIFT = re.compile(r"^(.*?)\d+[A-Z*]*fs")
+_SIG_COMPLEX = re.compile(r"^\d+_\d+([A-Z*]+)>([A-Z*]+)$")
+
+
+def token_signature(token: str, kind: str | None = None) -> str:
+    """변이 토큰의 **위치 무시 서명**. 같은 사건이면 같은 문자열이 나온다.
+
+    형식은 `{유형}|{본문}` 이고 유형은 `classify_token` 이 정한 값을 그대로 쓴다 —
+    서명이 분류를 다시 하지 않는다. `kind` 를 넘기면 재분류를 건너뛴다.
+
+    ## frameshift 는 왜 alt 잔기를 버리는가
+
+    train 의 frameshift 9,911 토큰은 **전부** `K16fs` 형태로 alt 가 없고, test 는
+    25,832 중 22,221 이 `K437Rfs` 형태로 alt 를 달고 있다. alt 를 서명에 남기면
+    두 집합의 frameshift 어휘가 완전히 갈라져 이 축이 통째로 죽는다.
+
+    ## 정지코돈 `*` 와 `X`
+
+    nonsense 본문은 ref 만 남기므로 train `Q369*` 와 test `Q369X` 의 표기 차이가
+    자동으로 사라진다. `X` 를 전역 치환하지 않는 이유는 `X541delinsX` 처럼 미상
+    잔기로도 쓰이기 때문이다 — 전역 치환은 그쪽을 망가뜨린다.
+
+    >>> token_signature("V600E")
+    'missense|V>E'
+    >>> token_signature("M267I") == token_signature("M206I")
+    True
+    >>> token_signature("Q369*") == token_signature("Q369X")
+    True
+    >>> token_signature("K16fs") == token_signature("K437Rfs")
+    True
+    >>> token_signature("312_313QY>HH")
+    'complex|QY>HH'
+    >>> token_signature("A630_P649del")
+    'deletion|A_Pdel'
+    """
+    if kind is None:
+        kind = classify_token(token)
+
+    if kind == MISSENSE or kind == SYNONYMOUS:
+        matched = _SIG_SUBSTITUTION.match(token)
+        if matched:
+            ref, alt = matched.group(1), matched.group(2)
+            # 동의 변이는 ref == alt 라 alt 가 중복 정보다.
+            return f"{kind}|{ref}" if kind == SYNONYMOUS else f"{kind}|{ref}>{alt}"
+    elif kind == NONSENSE:
+        matched = _SIG_NONSENSE.match(token)
+        if matched:
+            return f"{kind}|{matched.group(1)}"
+    elif kind == FRAMESHIFT:
+        matched = _SIG_FRAMESHIFT.match(token)
+        if matched:
+            return f"{kind}|{matched.group(1)}"
+    elif kind == COMPLEX:
+        matched = _SIG_COMPLEX.match(token)
+        if matched:
+            return f"{kind}|{matched.group(1)}>{matched.group(2)}"
+
+    # deletion·insertion·delins·other, 그리고 위 정규식이 안 걸린 잔여. 숫자만
+    # 지운다 — 새 표기가 들어와도 서명이 없어서 터지는 일은 없다.
+    return f"{kind}|" + _SIG_DIGITS.sub("", token)
+
+
 @dataclass(slots=True)
 class CellMutation:
     """셀 하나에서 뽑은 복합 변이 피처.
@@ -203,7 +270,15 @@ class CellMutation:
     `*_count` 는 중복 토큰을 각각 세고, `unique_*_count` 는 셀 안에서 문자열이
     같은 토큰을 하나로 접은 뒤 센다. test 는 같은 변이를 여러 전사체 좌표로 적어
     두기 때문에 문자열 중복 제거만으로는 그 중복이 걸러지지 않는다 — 좌표가 다르면
-    다른 문자열이다. 그 처리는 여기 책임이 아니라 상위 피처 단계의 몫이다.
+    다른 문자열이다. 그래서 잉여 토큰 수를 두 기준으로 함께 센다.
+
+    `duplicate_token_count`      문자열이 같은 잉여 토큰. train 6,100 · test 218
+    `duplicate_signature_count`  `token_signature` 가 같은 잉여 토큰.
+                                 train 8,072 · test 134,430
+
+    test 쪽 두 숫자의 격차가 이소폼 중복 기재의 크기다. 서명 기준이 문자열 기준보다
+    거친 판정이므로 `duplicate_signature_count >= duplicate_token_count` 가 항상
+    성립한다.
     """
 
     has_missense: int = 0
@@ -223,6 +298,8 @@ class CellMutation:
     mutation_token_count: int = 0
     unique_mutation_token_count: int = 0
     has_duplicate_token: int = 0
+    duplicate_token_count: int = 0
+    duplicate_signature_count: int = 0
 
     missense_count: int = 0
     synonymous_count: int = 0
@@ -282,6 +359,10 @@ def parse_cell(value: object) -> CellMutation:
     1
     >>> parse_cell("312_313QY>HH").has_mnv
     1
+    >>> parse_cell("M267I M206I").duplicate_token_count      # 문자열은 서로 다르다
+    0
+    >>> parse_cell("M267I M206I").duplicate_signature_count  # 같은 사건의 이소폼
+    1
     """
     tokens = split_tokens(value)
     cell = CellMutation()
@@ -289,16 +370,24 @@ def parse_cell(value: object) -> CellMutation:
         return cell
 
     unique_tokens = set(tokens)
+    # 토큰마다 한 번만 분류한다. 아래 두 루프와 서명 계산이 이 사전을 공유한다.
+    kind_by_token = {token: classify_token(token) for token in unique_tokens}
+    signatures = {
+        token_signature(token, kind) for token, kind in kind_by_token.items()
+    }
+
     cell.mutation_token_count = len(tokens)
     cell.unique_mutation_token_count = len(unique_tokens)
     cell.has_duplicate_token = int(len(tokens) > len(unique_tokens))
+    cell.duplicate_token_count = len(tokens) - len(unique_tokens)
+    cell.duplicate_signature_count = len(tokens) - len(signatures)
 
     for token in tokens:
-        kind = classify_token(token)
+        kind = kind_by_token[token]
         setattr(cell, f"{kind}_count", getattr(cell, f"{kind}_count") + 1)
 
     for token in unique_tokens:
-        kind = classify_token(token)
+        kind = kind_by_token[token]
         if kind == OTHER:
             continue
         setattr(cell, f"unique_{kind}_count", getattr(cell, f"unique_{kind}_count") + 1)
@@ -319,30 +408,30 @@ def parse_cell(value: object) -> CellMutation:
 
     return cell
 
-# 하나의 셀에서 유효한 mutation token 목록을 추출
-def _parse_mutation_tokens(value: object) -> list[str]:
-    if pd.isna(value):
-        return []
-    raw = str(value).strip()
-    if not raw or raw.upper() in _MUTATION_EMPTY:
-        return []
-    return [t for t in raw.split() if t.upper() not in _MUTATION_EMPTY]
+#: 세분 유형(8종) -> `compute_*` 가 기대하는 이름(6종).
+#: deletion/insertion/delins 를 `indel` 하나로 접고, 미분류는 `complex` 로 보낸다.
+_COARSE_KIND: dict[str, str] = {
+    MISSENSE: "missense",
+    SYNONYMOUS: "synonymous",
+    NONSENSE: "nonsense",
+    FRAMESHIFT: "frameshift",
+    DELETION: "indel",
+    INSERTION: "indel",
+    DELINS: "indel",
+    COMPLEX: "complex",
+    OTHER: "complex",
+}
 
-# mutation token을 변이 유형으로 분류
-def _classify_token(token: str) -> str:
-    if _SYNONYMOUS_RE.match(token):
-        return "synonymous"
-    if _INDEL_RE.search(token):
-        return "indel"
-    if _ROWCOUNT_COMPLEX_RE.search(token):
-        return "complex"
-    if _ROWCOUNT_FRAMESHIFT_RE.search(token):
-        return "frameshift"
-    if _ROWCOUNT_NONSENSE_RE.search(token):
-        return "nonsense"
-    if _MISSENSE_RE.match(token):
-        return "missense"
-    return "complex"
+
+def _parse_mutation_tokens(value: object) -> list[str]:
+    """`split_tokens` 의 별칭. 셀 값에서 유효한 변이 토큰만 뽑는다.
+
+    예전에는 같은 일을 하는 함수가 둘이었다. 하나로 모으고 이름만 남긴다 —
+    `features_basic` 의 `compute_*` 들이 이 이름으로 부르고 있다.
+    """
+    return split_tokens(value)
+
+
 
 # 지정한 유전자 컬럼이 모두 존재하는지 확인
 def _check_columns(df: pd.DataFrame, gene_columns: list[str]) -> None:
@@ -355,5 +444,203 @@ def _row_token_class_counts(row: pd.Series, gene_columns: list[str]) -> Counter:
     counts: Counter = Counter()
     for gene in gene_columns:
         for token in _parse_mutation_tokens(row[gene]):
-            counts[_classify_token(token)] += 1
+            counts[_COARSE_KIND[classify_token(token)]] += 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# 변이 문자열 구조 피처 (정규표현식 전용 — 외부 어노테이션 없음)
+# ---------------------------------------------------------------------------
+# 토큰 시작의 아미노산 문자 (대문자 한 글자, 예: R132H → R)
+_STR_REF_AA_RE = re.compile(r"^([A-Z])")
+# 마지막 대문자 한 글자 또는 * (예: R132H → H, Q369* → *, Q369X → X)
+_STR_ALT_AA_RE = re.compile(r"([A-Z*X])$")
+# 연속된 숫자 구간 전부 (위치 추출 및 개수 계산에 사용)
+_STR_NUMS_RE = re.compile(r"\d+")
+# 정지코돈 표기: train *  / test X
+_STR_STOP_RE = re.compile(r"[*X]")
+# 프레임시프트
+_STR_FS_RE = re.compile(r"fs", re.IGNORECASE)
+# 결실·삽입 (delins 포함)
+_STR_DEL_INS_RE = re.compile(r"del|ins", re.IGNORECASE)
+
+
+@dataclass(slots=True)
+class TokenStringFeatures:
+    """단일 변이 토큰에서 정규표현식으로 추출한 문자열 구조 피처 9종.
+
+    ref_aa / alt_aa 가 빈 문자열인 경우는 패턴에서 알파벳을 추출하지 못한 것
+    (예: frameshift `R132fs` 의 alt_aa, 복합 범위 표기의 ref_aa 등).
+    position 이 -1 이면 토큰에 숫자가 없다는 의미다.
+    """
+
+    ref_aa: str          # 원래 아미노산 문자 (없으면 "")
+    alt_aa: str          # 변경 아미노산 또는 정지코돈 기호 (없으면 "")
+    position: int        # 첫 번째 숫자 구간 값 (-1 = 없음)
+    log_position: float  # log1p(position), position == -1 이면 0.0
+    has_stop: int        # * 또는 X 포함 여부 (0/1)
+    has_frameshift: int  # fs 포함 여부 (0/1)
+    has_deletion_insertion: int  # del 또는 ins 포함 여부 (0/1)
+    mutation_string_length: int  # 토큰 문자열 길이
+    numeric_token_count: int     # 토큰 내 숫자 연속 구간 수
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def extract_token_string_features(token: str) -> TokenStringFeatures:
+    """변이 토큰 하나에서 9개 문자열 구조 피처를 추출한다.
+
+    외부 어노테이션 없이 정규표현식만으로 분해한다.
+
+    >>> f = extract_token_string_features("R132H")
+    >>> f.ref_aa, f.position, f.alt_aa
+    ('R', 132, 'H')
+    >>> f.has_stop
+    0
+    >>> extract_token_string_features("Q369*").has_stop
+    1
+    >>> extract_token_string_features("Q369X").has_stop
+    1
+    >>> extract_token_string_features("R132fs").has_frameshift
+    1
+    >>> extract_token_string_features("E746_A750del").has_deletion_insertion
+    1
+    >>> extract_token_string_features("R132H").numeric_token_count
+    1
+    """
+    ref_m = _STR_REF_AA_RE.match(token)
+    ref_aa = ref_m.group(1) if ref_m else ""
+
+    alt_m = _STR_ALT_AA_RE.search(token)
+    alt_aa = alt_m.group(1) if alt_m else ""
+
+    numbers = _STR_NUMS_RE.findall(token)
+    position = int(numbers[0]) if numbers else -1
+    log_position = math.log1p(position) if position >= 0 else 0.0
+
+    return TokenStringFeatures(
+        ref_aa=ref_aa,
+        alt_aa=alt_aa,
+        position=position,
+        log_position=log_position,
+        has_stop=int(bool(_STR_STOP_RE.search(token))),
+        has_frameshift=int(bool(_STR_FS_RE.search(token))),
+        has_deletion_insertion=int(bool(_STR_DEL_INS_RE.search(token))),
+        mutation_string_length=len(token),
+        numeric_token_count=len(numbers),
+    )
+
+
+@dataclass(slots=True)
+class CellStringFeatures:
+    """셀 값(복수 토큰 가능)에서 추출한 변이 문자열 구조 피처 11종.
+
+    피처 1-4 (ref_aa, alt_aa, position, log_position) 는 셀의 **첫 번째** 토큰 기준.
+    WT·결측 셀은 모든 필드가 기본값(0 / "" / -1)으로 채워진다.
+    피처 11 (변이 형식별 count) 은 각 유형별 필드로 펼쳐 제공한다.
+    """
+
+    # 피처 1 — 시작 아미노산 문자
+    ref_aa: str
+    # 피처 2 — 종료 아미노산 문자
+    alt_aa: str
+    # 피처 3 — 변이 위치 (-1 = 없음)
+    position: int
+    # 피처 4 — 위치의 로그 변환값
+    log_position: float
+    # 피처 5 — 동일 위치 반복 여부 (셀 내 토큰들 사이에서)
+    has_repeated_position: int
+    # 피처 6 — stop(*, X) 표기 포함 여부
+    has_stop: int
+    # 피처 7 — frameshift(fs) 표기 포함 여부
+    has_frameshift: int
+    # 피처 8 — deletion·insertion(del, ins) 형식 여부
+    has_deletion_insertion: int
+    # 피처 9 — 변이 문자열 길이 (모든 토큰 길이 합)
+    mutation_string_length: int
+    # 피처 10 — 숫자 token 개수 (모든 토큰의 숫자 구간 수 합)
+    numeric_token_count: int
+    # 피처 11 — 변이 형식별 count (유형별로 펼침)
+    missense_count: int = 0
+    synonymous_count: int = 0
+    nonsense_count: int = 0
+    frameshift_count: int = 0
+    deletion_count: int = 0
+    insertion_count: int = 0
+    delins_count: int = 0
+    complex_count: int = 0
+    other_count: int = 0
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def extract_cell_string_features(value: object) -> CellStringFeatures:
+    """셀 값 하나에서 11종 변이 문자열 구조 피처를 추출한다.
+
+    정규표현식으로만 분해하며 외부 어노테이션을 사용하지 않는다.
+    WT·결측이면 모든 피처가 기본값으로 반환된다.
+
+    >>> f = extract_cell_string_features("R132H")
+    >>> f.ref_aa, f.position, f.alt_aa
+    ('R', 132, 'H')
+    >>> round(f.log_position, 4)
+    4.8903
+    >>> extract_cell_string_features("V600E V600K").has_repeated_position
+    1
+    >>> extract_cell_string_features("R132H G827R").has_repeated_position
+    0
+    >>> extract_cell_string_features("Q369* I368N").has_stop
+    1
+    >>> extract_cell_string_features("R132fs").has_frameshift
+    1
+    >>> extract_cell_string_features("WT").position
+    -1
+    >>> extract_cell_string_features("R132H").missense_count
+    1
+    >>> extract_cell_string_features("Q369* I368N").nonsense_count
+    1
+    """
+    tokens = split_tokens(value)
+
+    if not tokens:
+        return CellStringFeatures(
+            ref_aa="", alt_aa="", position=-1, log_position=0.0,
+            has_repeated_position=0, has_stop=0, has_frameshift=0,
+            has_deletion_insertion=0, mutation_string_length=0, numeric_token_count=0,
+        )
+
+    tok_feats = [extract_token_string_features(t) for t in tokens]
+    first = tok_feats[0]
+
+    # 피처 5: 셀 안 토큰들 중 동일한 위치 숫자가 2회 이상 등장하는지 확인
+    positions = [f.position for f in tok_feats if f.position >= 0]
+    has_repeated_position = int(len(positions) > len(set(positions)))
+
+    # 피처 11: 유형별 count — 기존 classify_token 활용
+    type_counts: dict[str, int] = {k: 0 for k in ALL_KINDS}
+    for token in tokens:
+        type_counts[classify_token(token)] += 1
+
+    return CellStringFeatures(
+        ref_aa=first.ref_aa,
+        alt_aa=first.alt_aa,
+        position=first.position,
+        log_position=first.log_position,
+        has_repeated_position=has_repeated_position,
+        has_stop=int(any(f.has_stop for f in tok_feats)),
+        has_frameshift=int(any(f.has_frameshift for f in tok_feats)),
+        has_deletion_insertion=int(any(f.has_deletion_insertion for f in tok_feats)),
+        mutation_string_length=sum(f.mutation_string_length for f in tok_feats),
+        numeric_token_count=sum(f.numeric_token_count for f in tok_feats),
+        missense_count=type_counts[MISSENSE],
+        synonymous_count=type_counts[SYNONYMOUS],
+        nonsense_count=type_counts[NONSENSE],
+        frameshift_count=type_counts[FRAMESHIFT],
+        deletion_count=type_counts[DELETION],
+        insertion_count=type_counts[INSERTION],
+        delins_count=type_counts[DELINS],
+        complex_count=type_counts[COMPLEX],
+        other_count=type_counts[OTHER],
+    )

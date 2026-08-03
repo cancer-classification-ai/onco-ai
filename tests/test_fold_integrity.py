@@ -1,18 +1,24 @@
 """Profile Hash 기반 Group CV 무결성 테스트."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
 from cancer_hack.validation import (
+    FOLD_META_COLUMNS,
     assign_fold_column,
+    build_fold_frame,
     fold_class_distribution,
+    fold_column,
     make_profile_group_kfold,
     make_profile_hash,
     make_stratified_kfold,
 )
 
 GENE_COLS = ["TP53", "KRAS", "EGFR"]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 # ---------------------------------------------------------------------------
@@ -178,3 +184,119 @@ def test_fold_class_distribution_ratio_sums_to_100() -> None:
     dist = fold_class_distribution(df_folds)
     per_fold = dist["ratio"].reset_index().groupby("fold")["ratio"].sum()
     assert (per_fold.round(6) == 100.0).all()
+
+
+# ---------------------------------------------------------------------------
+# fold_column · build_fold_frame — fold 파일의 계약
+#
+# `make_folds.py` 가 쓰고 `train_gbdt.py` 가 읽는다. 두 스크립트가 같은 열 이름을
+# 보게 하는 게 이 블록의 목적이다.
+# ---------------------------------------------------------------------------
+
+
+def test_fold_column_matches_existing_artifact_names() -> None:
+    """기본 5-fold 이름은 이미 쌓인 아티팩트 규약과 같아야 한다.
+
+    `artifacts/oof/` 의 예측이 전부 이 열 이름으로 만들어졌다. 바뀌면 과거 점수와
+    비교가 끊긴다.
+    """
+    assert fold_column("skf") == "fold_skf5"
+    assert fold_column("sgkf") == "fold_group5"
+
+
+def test_fold_column_follows_n_splits() -> None:
+    """분할 수가 이름에 반영돼야 10-fold 파일이 5-fold 인 척하지 않는다."""
+    assert fold_column("skf", 10) == "fold_skf10"
+    assert fold_column("sgkf", 3) == "fold_group3"
+
+
+def test_fold_column_rejects_unknown_kind() -> None:
+    with pytest.raises(ValueError):
+        fold_column("kfold")  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def raw_csv(tmp_path: Path) -> Path:
+    """`build_fold_frame` 이 읽을 최소 원본 csv."""
+    path = tmp_path / "train.csv"
+    _frame_with_duplicates().to_csv(path, index=False)
+    return path
+
+
+def test_build_fold_frame_columns(raw_csv: Path) -> None:
+    """열 구성과 순서가 계약이다 — train_gbdt 가 이 이름으로 찾는다."""
+    frame = build_fold_frame(raw_csv)
+    assert list(frame.columns) == [
+        *FOLD_META_COLUMNS,
+        fold_column("skf"),
+        fold_column("sgkf"),
+    ]
+
+
+def test_build_fold_frame_is_zero_based_and_covers_every_row(raw_csv: Path) -> None:
+    """0-based 여야 `train_gbdt` 의 `range(n_splits)` 루프가 맞물린다."""
+    n_splits = 5
+    frame = build_fold_frame(raw_csv, n_splits=n_splits)
+    for kind in ("skf", "sgkf"):
+        values = frame[fold_column(kind, n_splits)]
+        assert set(values) == set(range(n_splits)), f"{kind} 가 0..{n_splits - 1} 이 아니다"
+
+
+def test_build_fold_frame_preserves_csv_row_order(raw_csv: Path) -> None:
+    """피처 parquet 들이 원본 순서라 fold 도 같은 순서여야 한다."""
+    frame = build_fold_frame(raw_csv)
+    expected = pd.read_csv(raw_csv, usecols=["ID"], dtype=str)["ID"].tolist()
+    assert frame["ID"].tolist() == expected
+
+
+def test_build_fold_frame_group_fold_has_no_leakage(raw_csv: Path) -> None:
+    """같은 프로파일이 train 과 valid 로 갈리면 안 된다."""
+    frame = build_fold_frame(raw_csv)
+    column = fold_column("sgkf")
+    for fold in sorted(frame[column].unique()):
+        valid = set(frame.loc[frame[column] == fold, "group_key"])
+        train = set(frame.loc[frame[column] != fold, "group_key"])
+        assert not (valid & train), f"fold {fold} 에 걸친 그룹 {valid & train}"
+
+
+def test_build_fold_frame_is_deterministic(raw_csv: Path) -> None:
+    """같은 시드면 같은 분할. 재현이 안 되면 fold 파일을 정본으로 둘 이유가 없다."""
+    first = build_fold_frame(raw_csv, seed=42)
+    second = build_fold_frame(raw_csv, seed=42)
+    pd.testing.assert_frame_equal(first, second)
+
+
+def test_build_fold_frame_seed_changes_split(raw_csv: Path) -> None:
+    """시드가 실제로 먹는지 — 안 먹으면 위 결정성 테스트가 무의미하다."""
+    first = build_fold_frame(raw_csv, seed=42)
+    other = build_fold_frame(raw_csv, seed=7)
+    column = fold_column("skf")
+    assert not first[column].equals(other[column])
+
+
+def test_train_gbdt_does_not_create_folds() -> None:
+    """학습 스크립트는 fold 를 **읽기만** 해야 한다.
+
+    예전에는 파일이 없으면 제 손으로 만들어 저장했다. 그러면 같은 이름의 파일이 두
+    경로에서 나오고 `artifacts/oof/` 의 예측이 어느 분할에서 나왔는지 사후에
+    확인할 수 없다. 소스에서 생성 함수 호출을 직접 막는다.
+    """
+    source = (PROJECT_ROOT / "scripts/train_gbdt.py").read_text(encoding="utf-8")
+    for forbidden in ("fold_assignment", "build_fold_frame", "assign_fold_column"):
+        assert forbidden not in source, (
+            f"train_gbdt.py 가 {forbidden} 를 부른다 — fold 생성은 make_folds.py 담당이다"
+        )
+
+
+def test_train_gbdt_does_not_write_full_train_module_map() -> None:
+    """모듈맵은 **fold 별로만** 쓴다.
+
+    전체 train 으로 fit 한 모듈맵 자체는 규정 위반이 아니다(test 를 안 본다). 다만
+    fold 를 넘는 산출물이라 나중에 누가 무심코 test 예측에 재사용하기 쉽고, 그 순간
+    fold-fit-only 규율이 조용히 깨진다. fold 생성 금지와 같은 방식으로 소스에서 막고,
+    진단용 전체 맵이 필요하면 scripts/inspect_latent.py 가 따로 만든다.
+    """
+    source = (PROJECT_ROOT / "scripts/train_gbdt.py").read_text(encoding="utf-8")
+    assert "full_train_module_map" not in source, (
+        "train_gbdt.py 가 전체 train 모듈맵을 쓴다 — fold 별 맵만 남긴다"
+    )
