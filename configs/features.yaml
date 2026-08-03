@@ -1,0 +1,9 @@
+# Fold-dependent frequency/rarity features.
+# 이 설정으로 만든 통계는 CV의 train fold에서만 fit해야 한다.
+frequency_rarity:
+  enabled: true
+  token_identity: gene_and_mutation
+  frequency_basis: sample_document_frequency
+  token_rarity: smoothed_idf
+  rare_df_threshold: 2
+  unseen_token_frequency: 0.0
