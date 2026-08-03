@@ -8,6 +8,10 @@ TF-IDF 의 IDF, 이 둘이 그 위험이 있는 피처다. 나머지는 행마�
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -17,6 +21,22 @@ from cancer_hack.features_basic import (
     BurdenBinner,
     make_sample_mutation_features,
 )
+from cancer_hack.features_graph import (
+    build_fold_comutation_block,
+    select_comutation_pairs,
+    transform_comutation_pairs,
+)
+from cancer_hack.features_domain import DRIVERS
+from cancer_hack.features_latent import (
+    MODULE_VALUES,
+    build_fold_latent_block,
+    build_fold_module_block,
+    fit_gene_modules,
+    fit_latent_basis,
+    transform_gene_modules,
+    transform_latent_basis,
+)
+from cancer_hack.features_pathway import PATHWAYS, build_fold_pathway_block
 from cancer_hack.features_sparse import MutationTfidfBlock, build_fold_tfidf_block
 from cancer_hack.validation import Chi2TopKSelector
 
@@ -212,3 +232,578 @@ def test_chi2_selector_rejects_negative_sparse():
     negative = sparse.csr_matrix(np.array([[-1.0, 1.0], [0.0, 1.0]]))
     with pytest.raises(ValueError, match="음수"):
         Chi2TopKSelector(k=1).fit(negative, ["a", "b"])
+
+
+# --- 공변이 쌍 -----------------------------------------------------------
+# 유전자 6개(GA..GF), 12행. 행 0-7 이 train_index, 8-11 은 valid 전용이다.
+# GA&GB 는 train_index 안에서 클래스 X 를 가르는 진짜 신호(lift>0)다. GC&GD 는
+# valid 행에서만 완벽히 클래스 Z 를 가른다 — train_index 로는 절대 안 보여야 한다.
+# 행 8 은 GA/GB 도 같이 켜 둬서, valid 행이 transform 은 정상적으로 받는지도 같이 본다.
+_COMUT_GENES = ["GA", "GB", "GC", "GD", "GE", "GF"]
+_COMUT_MATRIX = np.array(
+    [
+        [1, 1, 0, 0, 0, 0],  # 0  X
+        [1, 1, 0, 0, 0, 0],  # 1  X
+        [1, 1, 0, 0, 0, 0],  # 2  X
+        [1, 0, 0, 0, 0, 0],  # 3  Y
+        [0, 1, 0, 0, 0, 0],  # 4  Y
+        [0, 0, 0, 0, 1, 0],  # 5  Y
+        [0, 0, 0, 0, 0, 1],  # 6  Y
+        [0, 0, 0, 0, 0, 0],  # 7  Y
+        [1, 1, 1, 1, 0, 0],  # 8  Z (valid) — GC&GD 누출 + GA&GB 도 켜짐
+        [0, 0, 1, 1, 0, 0],  # 9  Z (valid)
+        [0, 0, 1, 1, 0, 0],  # 10 Z (valid)
+        [0, 0, 1, 1, 0, 0],  # 11 Z (valid)
+    ],
+    dtype=np.float32,
+)
+_COMUT_Y = np.array(["X", "X", "X", "Y", "Y", "Y", "Y", "Y", "Z", "Z", "Z", "Z"])
+_COMUT_TRAIN_INDEX = np.arange(8)
+_COMUT_Y_FOLD = _COMUT_Y[_COMUT_TRAIN_INDEX]
+#: 리크 테스트에 쓰는 관대한 임계값 — 필터 자체가 아니라 fold 경계를 시험한다.
+_COMUT_KWARGS = dict(
+    gene_names=_COMUT_GENES,
+    pool="chi2",
+    pool_topk=10,
+    manual_pairs=(),
+    min_support=2,
+    min_class_support=1,
+    min_purity=0.5,
+    min_lift=0.2,
+    max_hyper_fraction=1.0,
+)
+
+
+def test_comutation_pair_only_in_valid_rows_is_not_selected():
+    """valid 행에만 있는 쌍이 선택되면 fold 누수다."""
+    pairs = select_comutation_pairs(
+        _COMUT_MATRIX, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    assert "GA__GB" in pairs.names
+    assert "GC__GD" not in pairs.names
+
+
+def test_comutation_returns_every_train_row():
+    """valid 행도 transform 은 받아야 OOF 예측이 나온다. fit 에만 안 들어간다."""
+    test_matrix = _COMUT_MATRIX[:3]
+    names, train_out, test_out, diagnostics = build_fold_comutation_block(
+        _COMUT_MATRIX, test_matrix, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    assert train_out.shape == (_COMUT_MATRIX.shape[0], len(names))
+    assert test_out.shape == (test_matrix.shape[0], len(names))
+    assert len(diagnostics) == len(names)
+    # 행 8 은 valid 전용인데 GA&GB 가 켜져 있다 — fit 밖 행도 값이 채워져야 한다.
+    ga_gb = names.index("comut__mut__GA__GB")
+    assert train_out[8, ga_gb] > 0
+
+
+def test_comutation_selection_unchanged_by_valid_row_content():
+    """valid 행(8-11)을 완전히 흔들어도 선택 결과가 그대로여야 한다."""
+    disturbed = _COMUT_MATRIX.copy()
+    disturbed[8:] = 1.0
+    base = select_comutation_pairs(
+        _COMUT_MATRIX, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    shaken = select_comutation_pairs(
+        disturbed, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    assert base.names == shaken.names
+    assert base.stats == shaken.stats
+    assert base.n_bar == shaken.n_bar
+    assert np.array_equal(base.burden_sorted, shaken.burden_sorted)
+
+
+def test_comutation_selection_responds_to_fit_data():
+    """3번이 공허하지 않다는 짝 — train 쪽 신호를 지우면 선택도 바뀌어야 한다."""
+    erased = _COMUT_MATRIX.copy()
+    ga, gb = _COMUT_GENES.index("GA"), _COMUT_GENES.index("GB")
+    erased[:8, [ga, gb]] = 0.0
+    base = select_comutation_pairs(
+        _COMUT_MATRIX, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    changed = select_comutation_pairs(
+        erased, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    assert "GA__GB" in base.names
+    assert "GA__GB" not in changed.names
+
+
+def test_select_comutation_pairs_takes_no_test_matrix():
+    """test 통계가 선택에 안 닿는다 — 주석이 아니라 시그니처로 보장한다."""
+    params = inspect.signature(select_comutation_pairs).parameters
+    assert not any("test" in name.lower() for name in params)
+
+
+def test_comutation_share_value_is_row_independent():
+    """행 하나만 넣어도 전체를 넣었을 때와 그 행의 값이 같아야 한다."""
+    pairs = select_comutation_pairs(
+        _COMUT_MATRIX, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    full = transform_comutation_pairs(_COMUT_MATRIX, pairs, value="share")
+    single = transform_comutation_pairs(_COMUT_MATRIX[[0]], pairs, value="share")
+    np.testing.assert_array_equal(full[[0]], single)
+
+
+def test_comutation_hyper_guard_drops_hypermutator_only_pair():
+    """동시 변이가 과변이 샘플에만 몰린 쌍은 가드가 걸러야 한다."""
+    genes = ["GA", "GB", "GH", "GI"]
+    matrix = np.array(
+        [
+            [1, 0, 0, 0],  # 0 A
+            [0, 1, 0, 0],  # 1 A
+            [1, 0, 0, 0],  # 2 B
+            [0, 1, 0, 0],  # 3 B
+            [1, 0, 0, 0],  # 4 A
+            [0, 1, 0, 0],  # 5 A
+            [1, 0, 0, 0],  # 6 B
+            [0, 1, 0, 0],  # 7 B
+            [0, 0, 0, 0],  # 8 A
+            [1, 1, 1, 1],  # 9 B — 과변이 행, GH&GI 는 여기서만 동시 변이
+        ],
+        dtype=np.float32,
+    )
+    y = np.array(["A", "A", "B", "B", "A", "A", "B", "B", "A", "B"])
+    train_index = np.arange(10)
+    kwargs = dict(
+        gene_names=genes,
+        pool="chi2",
+        pool_topk=10,
+        manual_pairs=(),
+        min_support=1,
+        min_class_support=1,
+        min_purity=0.0,
+        min_lift=0.0,
+    )
+    guarded = select_comutation_pairs(
+        matrix, train_index, y, max_hyper_fraction=0.5, **kwargs
+    )
+    unguarded = select_comutation_pairs(
+        matrix, train_index, y, max_hyper_fraction=1.0, **kwargs
+    )
+    assert "GH__GI" not in guarded.names
+    assert "GH__GI" in unguarded.names
+
+
+def test_comutation_names_are_lexicographically_ordered():
+    """A < B 로 고정해야 fold 마다 A&B/B&A 로 갈려 Jaccard 가 가짜로 안 낮아진다."""
+    pairs = select_comutation_pairs(
+        _COMUT_MATRIX, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    assert pairs.names
+    for name in pairs.names:
+        a, b = name.split("__")
+        assert a < b
+
+
+def test_comutation_width_never_exceeds_topk():
+    """차원 상한 — topk 는 자동 선별분의 진짜 상한이어야 한다."""
+    genes = ["GA", "GB", "GC", "GD"]
+    matrix = np.array(
+        [
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+        ],
+        dtype=np.float32,
+    )
+    y = np.array(["P", "Q", "P", "Q", "P", "Q"])
+    train_index = np.arange(6)
+    pairs = select_comutation_pairs(
+        matrix,
+        train_index,
+        y,
+        gene_names=genes,
+        pool="chi2",
+        pool_topk=10,
+        manual_pairs=(),
+        min_support=1,
+        min_class_support=1,
+        min_purity=0.0,
+        min_lift=0.0,
+        max_hyper_fraction=1.0,
+        topk=2,
+    )
+    assert len(pairs.names) <= 2
+
+
+# --- 유전자 모듈 (잠재 · 하드 · pathway) ------------------------------------
+# 유전자 8개, 12행. 행 0-7 이 train_index, 8-11 은 valid 전용이다. GG&GH 는 valid
+# 행에서만 함께 켜진다 — fold-train 만 보는 fit 은 그 축을 절대 못 배워야 한다.
+# 행 8 은 GA/GB 도 같이 켜 둔다(comut 픽스처와 같은 이유). 안 그러면 valid 행의 변이가
+# 전부 지지도 미달 유전자라 투영이 정확히 0 이 나오고, "valid 행도 transform 은 받는다"
+# 를 검사할 수가 없다.
+_MOD_GENES = ["GA", "GB", "GC", "GD", "GE", "GF", "GG", "GH"]
+_MOD_MATRIX = np.array(
+    [
+        [1, 1, 0, 0, 0, 0, 0, 0],  # 0  X
+        [1, 1, 0, 0, 0, 0, 0, 0],  # 1  X
+        [1, 1, 1, 0, 0, 0, 0, 0],  # 2  X
+        [0, 0, 1, 1, 0, 0, 0, 0],  # 3  Y
+        [0, 0, 1, 1, 0, 0, 0, 0],  # 4  Y
+        [0, 0, 0, 1, 1, 0, 0, 0],  # 5  Y
+        [0, 0, 0, 0, 1, 1, 0, 0],  # 6  Y
+        [0, 0, 0, 0, 1, 1, 0, 0],  # 7  Y
+        [1, 1, 0, 0, 0, 0, 1, 1],  # 8  Z (valid) — GG&GH 누출 + GA/GB 도 켜짐
+        [0, 0, 0, 0, 0, 0, 1, 1],  # 9  Z (valid)
+        [0, 0, 0, 0, 0, 0, 1, 1],  # 10 Z (valid)
+        [0, 0, 0, 0, 0, 0, 1, 1],  # 11 Z (valid)
+    ],
+    dtype=np.float32,
+)
+_MOD_Y = np.array(["X", "X", "X", "Y", "Y", "Y", "Y", "Y", "Z", "Z", "Z", "Z"])
+_MOD_TRAIN_INDEX = np.arange(8)
+_MOD_Y_FOLD = _MOD_Y[_MOD_TRAIN_INDEX]
+_LATENT_KWARGS = dict(gene_names=_MOD_GENES, n_components=3, min_gene_support=1)
+_MODULE_KWARGS = dict(
+    gene_names=_MOD_GENES, n_modules=3, svd_components=3, min_gene_support=1
+)
+
+
+def test_fit_functions_take_no_test_matrix():
+    """누출 없음을 주석이 아니라 시그니처로 보장한다 (comut 과 같은 계약)."""
+    for function in (fit_latent_basis, fit_gene_modules):
+        parameters = inspect.signature(function).parameters
+        assert not [p for p in parameters if "test" in p.lower()]
+
+
+def test_fit_functions_take_no_label_argument():
+    """L3·L4 는 비지도다. `y` 인자가 없으면 지도 사전 필터를 못 끼워 넣는다.
+
+    comut 에는 없는 계약이라 여기서 새로 못박는다 — `build_fold_*_block` 은 계약
+    통일성 때문에 `y_train_fold` 를 받지만 진단에만 쓴다.
+    """
+    for function in (fit_latent_basis, fit_gene_modules):
+        parameters = inspect.signature(function).parameters
+        assert not [p for p in parameters if p in ("y", "y_train_fold", "labels")]
+
+
+def test_latent_basis_unchanged_by_valid_row_content():
+    disturbed = _MOD_MATRIX.copy()
+    disturbed[8:] = 1.0  # valid 행을 전부 흔든다
+    a = fit_latent_basis(_MOD_MATRIX, _MOD_TRAIN_INDEX, **_LATENT_KWARGS)
+    b = fit_latent_basis(disturbed, _MOD_TRAIN_INDEX, **_LATENT_KWARGS)
+    assert np.array_equal(a.components, b.components)
+    assert np.array_equal(a.gene_index, b.gene_index)
+
+
+def test_latent_basis_responds_to_fit_data():
+    """위 테스트가 공허하지 않으려면 fit 데이터에는 실제로 반응해야 한다."""
+    erased = _MOD_MATRIX.copy()
+    erased[:8, :2] = 0.0
+    a = fit_latent_basis(_MOD_MATRIX, _MOD_TRAIN_INDEX, **_LATENT_KWARGS)
+    b = fit_latent_basis(erased, _MOD_TRAIN_INDEX, **_LATENT_KWARGS)
+    assert not np.array_equal(a.components, b.components)
+
+
+def test_latent_basis_unchanged_by_label_shuffle():
+    """라벨을 섞어도 기저가 같아야 비지도 계약이 지켜진 것이다."""
+    _, train_a, _, _, basis_a = build_fold_latent_block(
+        _MOD_MATRIX, _MOD_MATRIX[:4], _MOD_TRAIN_INDEX, _MOD_Y_FOLD, **_LATENT_KWARGS
+    )
+    _, train_b, _, _, basis_b = build_fold_latent_block(
+        _MOD_MATRIX, _MOD_MATRIX[:4], _MOD_TRAIN_INDEX, _MOD_Y_FOLD[::-1], **_LATENT_KWARGS
+    )
+    assert np.array_equal(basis_a.components, basis_b.components)
+    assert np.array_equal(train_a, train_b)
+
+
+@pytest.mark.parametrize("method", ["svd", "nmf"])
+def test_latent_transform_is_row_independent(method):
+    """행 하나만 넣은 값 == 전체를 넣었을 때 그 행.
+
+    NMF 가 이 파일에서 제일 안 자명한 지점이다 — `components` 를 고정하고 W 를 푸는
+    건 행마다 독립인 문제라서 다른 행이 값에 못 끼어든다. 주장으로 두지 않고 잰다.
+    """
+    basis = fit_latent_basis(
+        _MOD_MATRIX, _MOD_TRAIN_INDEX, method=method, **_LATENT_KWARGS
+    )
+    full = transform_latent_basis(_MOD_MATRIX, basis)
+    for row in (0, 5, 9):
+        single = transform_latent_basis(_MOD_MATRIX[[row]], basis)
+        assert np.allclose(single[0], full[row], atol=1e-5)
+
+
+def test_latent_returns_every_train_row():
+    """반환하는 train 행렬은 valid 행을 포함한 전체다 (fold 루프가 뒤에서 자른다)."""
+    names, train_out, test_out, diagnostics, _ = build_fold_latent_block(
+        _MOD_MATRIX, _MOD_MATRIX[:3], _MOD_TRAIN_INDEX, _MOD_Y_FOLD, **_LATENT_KWARGS
+    )
+    assert train_out.shape == (_MOD_MATRIX.shape[0], len(names))
+    assert test_out.shape == (3, len(names))
+    assert len(diagnostics) == len(names)
+    assert np.abs(train_out[8:]).sum() > 0, "valid 행도 transform 은 받아야 한다"
+
+
+def test_latent_width_is_exactly_n_components():
+    """폭이 fold 마다 고정이라야 f4r 과의 델타가 차원 변동에 안 오염된다."""
+    for n in (2, 3, 5):
+        names, train_out, _, _, _ = build_fold_latent_block(
+            _MOD_MATRIX,
+            _MOD_MATRIX[:3],
+            _MOD_TRAIN_INDEX,
+            _MOD_Y_FOLD,
+            gene_names=_MOD_GENES,
+            n_components=n,
+            min_gene_support=1,
+        )
+        assert len(names) == n == train_out.shape[1]
+
+
+def test_latent_unseen_gene_pattern_stays_finite():
+    """fold-train 에서 빠진 유전자만 켜진 test 행도 유한한 값이어야 한다."""
+    basis = fit_latent_basis(
+        _MOD_MATRIX,
+        _MOD_TRAIN_INDEX,
+        gene_names=_MOD_GENES,
+        n_components=3,
+        min_gene_support=3,
+    )
+    unseen = np.zeros((1, len(_MOD_GENES)), dtype=np.float32)
+    unseen[0, -1] = 1.0
+    out = transform_latent_basis(unseen, basis)
+    assert np.isfinite(out).all()
+
+
+def test_l2_row_norm_makes_values_dilation_invariant():
+    """**시프트 테스트.** test 의 2.21배 희석을 실행 가능한 단언으로 박는다.
+
+    같은 행에 유전자를 더 켠 '희석본' 을 만들고, `row_norm="l2"` 의 출력이 `"none"`
+    보다 덜 움직이는지 본다. 이게 소프트 잠재 쪽 시프트 논증의 전부다. 실측으로도
+    확인됐다 — 선두 성분의 |burden 상관| 이 l2 에서 0.458, none 에서 0.995 다
+    (`scripts/inspect_latent.py`).
+    """
+    row = np.zeros((1, len(_MOD_GENES)), dtype=np.float32)
+    row[0, :2] = 1.0
+    diluted = row.copy()
+    diluted[0, 2:6] = 1.0  # 변이 유전자 집합이 균일하게 커진 상황
+
+    moved = {}
+    for row_norm in ("l2", "none"):
+        basis = fit_latent_basis(
+            _MOD_MATRIX, _MOD_TRAIN_INDEX, row_norm=row_norm, **_LATENT_KWARGS
+        )
+        base = transform_latent_basis(row, basis)
+        after = transform_latent_basis(diluted, basis)
+        moved[row_norm] = float(np.linalg.norm(after - base))
+
+    assert moved["l2"] < moved["none"], moved
+
+
+def test_module_membership_covers_every_gene_exactly_once():
+    """하드 모듈은 배타적 분할이다 — 지지도를 통과한 유전자는 정확히 한 모듈에."""
+    modules = fit_gene_modules(_MOD_MATRIX, _MOD_TRAIN_INDEX, **_MODULE_KWARGS)
+    assert modules.labels.size == modules.gene_index.size
+    assert modules.module_sizes.sum() == modules.gene_index.size
+    assert len(set(modules.gene_index.tolist())) == modules.gene_index.size
+
+
+def test_module_assignment_unchanged_by_valid_row_content():
+    disturbed = _MOD_MATRIX.copy()
+    disturbed[8:] = 1.0
+    a = fit_gene_modules(_MOD_MATRIX, _MOD_TRAIN_INDEX, **_MODULE_KWARGS)
+    b = fit_gene_modules(disturbed, _MOD_TRAIN_INDEX, **_MODULE_KWARGS)
+    assert np.array_equal(a.labels, b.labels)
+    assert np.array_equal(a.gene_index, b.gene_index)
+
+
+def test_share_is_dilation_invariant_but_controls_are_not():
+    """대조군이 진짜 대조군인지 잰다 — 이 파일에서 제일 중요한 값 형태 테스트다.
+
+    한 행의 변이 유전자를 균일하게 늘려도 `share`/`enrich` 는 모듈별 몫이 유지돼야
+    하고, `fraction`/`any`/`logcount`/`wburden` 은 움직여야 한다. `fraction` 이 요점이다 —
+    비율처럼 생겼지만 분모가 모듈 크기라는 **상수**라서 분자만 부푼다.
+    """
+    modules = fit_gene_modules(_MOD_MATRIX, _MOD_TRAIN_INDEX, **_MODULE_KWARGS)
+    # 모듈 0 에 든 유전자와 그 밖 유전자를 같은 비율로 늘린다.
+    members = np.where(modules.labels == 0)[0]
+    others = np.where(modules.labels != 0)[0]
+    if members.size < 2 or others.size < 2:
+        pytest.skip("장난감 데이터의 모듈 크기가 이 검사에 부족하다")
+
+    base = np.zeros((1, len(_MOD_GENES)), dtype=np.float32)
+    base[0, modules.gene_index[members[:1]]] = 1.0
+    base[0, modules.gene_index[others[:1]]] = 1.0
+    diluted = base.copy()
+    diluted[0, modules.gene_index[members[1:2]]] = 1.0
+    diluted[0, modules.gene_index[others[1:2]]] = 1.0
+
+    for value in ("share", "enrich"):
+        a = transform_gene_modules(base, modules, value=value)
+        b = transform_gene_modules(diluted, modules, value=value)
+        assert np.allclose(a, b, atol=1e-6), f"{value} 가 희석에 흔들린다"
+
+    moved = [
+        not np.allclose(
+            transform_gene_modules(base, modules, value=value),
+            transform_gene_modules(diluted, modules, value=value),
+        )
+        for value in ("fraction", "logcount", "wburden")
+    ]
+    assert all(moved), "대조군이 희석에 안 움직이면 대조군이 아니다"
+
+
+def test_module_value_modes_emit_expected_names():
+    """7개 값 방식이 전부 동작하고 이름에 방식이 드러나야 한다."""
+    for value in MODULE_VALUES:
+        names, train_out, test_out, _, _ = build_fold_module_block(
+            _MOD_MATRIX,
+            _MOD_MATRIX[:3],
+            _MOD_TRAIN_INDEX,
+            _MOD_Y_FOLD,
+            value=value,
+            **_MODULE_KWARGS,
+        )
+        assert all(n.startswith(f"mod_{value}__") for n in names)
+        assert train_out.shape == (_MOD_MATRIX.shape[0], len(names))
+        assert test_out.shape == (3, len(names))
+        assert np.isfinite(train_out).all()
+
+
+def test_pathway_genes_all_live_inside_drivers():
+    """규정 근거가 'DRIVERS 안에서만 묶는다' 이므로 그 경계를 테스트로도 지킨다.
+
+    `features_pathway._validate_membership` 이 import 시점에 이미 막지만, 그 검사
+    자체가 지워지는 걸 막는 이중 방어다. compliance/PATHWAY_SOURCE.md 참고.
+    """
+    known = set(DRIVERS)
+    for name, genes in PATHWAYS.items():
+        assert set(genes) <= known, f"{name} 에 DRIVERS 밖 유전자: {set(genes) - known}"
+
+
+def test_pathway_block_is_row_independent():
+    genes = list(DRIVERS)
+    rng = np.random.default_rng(0)
+    matrix = (rng.random((12, len(genes))) < 0.2).astype(np.float32)
+    names, train_out, _, _ = build_fold_pathway_block(
+        matrix, matrix[:3], _MOD_TRAIN_INDEX, _MOD_Y_FOLD, gene_names=genes
+    )
+    single = build_fold_pathway_block(
+        matrix, matrix[[5]], _MOD_TRAIN_INDEX, _MOD_Y_FOLD, gene_names=genes
+    )[2]
+    assert np.allclose(single[0], train_out[5], atol=1e-6)
+    assert len(names) == len(PATHWAYS)
+
+
+# --- stem 슬러그 -----------------------------------------------------------
+def _load_train_gbdt():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "train_gbdt.py"
+    spec = importlib.util.spec_from_file_location("train_gbdt_for_tests", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+train_gbdt = _load_train_gbdt()
+
+
+def test_comut_slug_empty_without_pair_block():
+    """comut 블록이 없는 config 의 stem 이 디스크의 기존 로그와 바이트 동일해야 한다."""
+    assert train_gbdt._comut_slug({}, manual=True) == ""
+    assert train_gbdt._comut_slug({}, manual=False) == ""
+
+
+def test_comut_slug_distinguishes_all_params():
+    """11개 파라미터를 하나씩 바꾼 dict 가 전부 다른 슬러그를 내야 한다."""
+    base = dict(
+        pool="drivers",
+        pool_topk=300,
+        mode="mutated",
+        value="share",
+        topk=20,
+        min_support=20,
+        min_class_support=8,
+        min_purity=0.25,
+        min_lift=0.15,
+        max_hyper_fraction=0.50,
+        max_pairs_per_gene=3,
+    )
+    seen = {train_gbdt._comut_slug(base, manual=True)}
+    variants = [
+        {**base, "pool": "chi2"},
+        {**base, "pool_topk": 100},
+        {**base, "mode": "functional"},
+        {**base, "value": "and"},
+        {**base, "value": "gate"},
+        {**base, "topk": 10},
+        {**base, "min_support": 25},
+        {**base, "min_class_support": 5},
+        {**base, "min_purity": 0.3},
+        {**base, "min_lift": 0.2},
+        {**base, "max_hyper_fraction": 0.6},
+        {**base, "max_pairs_per_gene": 2},
+    ]
+    for variant in variants:
+        slug = train_gbdt._comut_slug(variant, manual=True)
+        assert slug not in seen, f"충돌: {variant}"
+        seen.add(slug)
+    manual_off = train_gbdt._comut_slug(base, manual=False)
+    assert manual_off not in seen
+
+
+def test_latent_and_module_slugs_empty_without_their_blocks():
+    """잠재·모듈 블록이 없는 config 의 stem 이 디스크의 기존 로그와 바이트 동일해야 한다.
+
+    이 파일에 이미 로그가 129개 쌓여 있어서, 슬러그가 빈 dict 에 `""` 를 안 내면
+    과거 실험과 이름이 어긋나 비교가 통째로 끊긴다.
+    """
+    assert train_gbdt._latent_slug({}) == ""
+    assert train_gbdt._module_slug({}, {}) == ""
+
+
+def test_latent_slug_distinguishes_all_params():
+    base = dict(
+        method="svd",
+        n_components=64,
+        row_norm="l2",
+        value="proj",
+        mode="mutated",
+        gene_weight="none",
+        min_gene_support=5,
+        random_state=0,
+    )
+    seen = {train_gbdt._latent_slug(base)}
+    variants = [
+        {**base, "method": "nmf"},
+        {**base, "n_components": 32},
+        {**base, "row_norm": "none"},
+        {**base, "value": "share"},
+        {**base, "mode": "functional"},
+        {**base, "gene_weight": "idf"},
+        {**base, "min_gene_support": 10},
+        {**base, "random_state": 1},
+    ]
+    for variant in variants:
+        slug = train_gbdt._latent_slug(variant)
+        assert slug not in seen, f"충돌: {variant}"
+        seen.add(slug)
+
+
+def test_module_slug_distinguishes_all_params_and_never_collides_with_pathway():
+    base = dict(
+        value="share",
+        n_modules=24,
+        svd_components=64,
+        mode="mutated",
+        min_gene_support=5,
+        random_state=0,
+    )
+    seen = {train_gbdt._module_slug(base, {})}
+    for variant in (
+        {**base, "value": "fraction"},
+        {**base, "n_modules": 12},
+        {**base, "svd_components": 32},
+        {**base, "mode": "functional"},
+        {**base, "min_gene_support": 10},
+        {**base, "random_state": 1},
+    ):
+        slug = train_gbdt._module_slug(variant, {})
+        assert slug not in seen, f"충돌: {variant}"
+        seen.add(slug)
+
+    # gmod 와 kpath 는 접두사로 갈린다 — 같은 value 여도 stem 이 안 겹쳐야 한다.
+    pathway = train_gbdt._module_slug({}, dict(value="share", mode="mutated"))
+    assert pathway not in seen
+    assert pathway.startswith("_kp")

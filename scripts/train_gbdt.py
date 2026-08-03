@@ -14,6 +14,14 @@
     gec     top-K  유전자 토큰 수, fold 안에서 chi2 선택
     sigtok  top-K  서명 문서 TF-IDF, fold 안에서 어휘·IDF·chi2 전부 fit
     exacttok top-K 원문 토큰 TF-IDF — sigtok 대조군
+    comut   ~10~20 공변이 유전자 쌍, fold 안에서 지지도·lift·과변이 가드로 선택
+            (`--comut-*` 플래그, `cancer_hack.features_graph` 참고)
+    lsvd       64  잠재 SVD 성분 — 행을 L2 정규화하고 fold 안에서 기저를 fit
+    lnmf       64  잠재 NMF 성분 — 같은 계약, 비음수 혼합
+    gmod       24  하드 유전자 모듈 — fold 안에서 KMeans 로 배타 배정
+    kpath      12  수기 pathway 그룹 (규정 회색지대 — compliance/PATHWAY_SOURCE.md)
+            (`--latent-*`/`--module-*`/`--pathway-*` 플래그,
+             `cancer_hack.features_latent`·`features_pathway` 참고)
 
 ## 왜 래더인가
 
@@ -52,11 +60,22 @@ stopping 을 걸면 반복수 선택이 자기 CV 로 새고, test 를 넣는 �
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
 import traceback
 from pathlib import Path
+
+# Windows 콘솔이 cp949 라 한글과 em dash 가 깨진다. argparse 는 `--help` 를 sys.stdout
+# 에 직접 쓰기 때문에 도움말 안의 `—` 하나로 UnicodeEncodeError 가 나서 `--help` 자체가
+# 죽는다. 스트림을 **제자리에서** UTF-8 로 바꾼다 — `io.TextIOWrapper` 로 갈아끼우면
+# 이 모듈을 import 하는 pytest 의 캡처 버퍼가 닫혀서 수집 단계가 통째로 죽는다.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):  # pytest 캡처 등 reconfigure 가 없는 스트림
+        pass
 
 import numpy as np
 import pandas as pd
@@ -72,6 +91,19 @@ from cancer_hack.features_domain import (  # noqa: E402
     DOMAIN_PREFIXES,
     align_domain_columns,
 )
+from cancer_hack.features_graph import (  # noqa: E402
+    MANUAL_PAIRS,
+    build_fold_comutation_block,
+)
+from cancer_hack.features_latent import (  # noqa: E402
+    MODULE_VALUES,
+    SHIFT_EXPOSED_VALUES,
+    build_fold_latent_block,
+    build_fold_module_block,
+    module_membership_frame,
+    subspace_alignment,
+)
+from cancer_hack.features_pathway import build_fold_pathway_block  # noqa: E402
 from cancer_hack.features_sparse import build_fold_tfidf_block  # noqa: E402
 from cancer_hack.io import save_csv, write_submission  # noqa: E402
 from cancer_hack.metrics import (  # noqa: E402
@@ -131,6 +163,24 @@ GENE_BLOCKS = ("enc3", "gec")
 #: 바뀌므로 `Dataset` 이 행렬을 미리 못 만든다. 들고 있는 건 문서 문자열이다.
 SPARSE_BLOCKS = ("sigtok", "exacttok")
 
+#: fold 안에서 쌍을 고르는 블록. 열의 정체와 **개수**가 fold 마다 바뀐다는 점은
+#: SPARSE_BLOCKS 와 같지만, 원본 유전자 행렬 자체는 고정이라 GENE_BLOCKS 처럼 미리
+#: 읽어 둘 수 있다 — 그래서 `Dataset.pairs` 는 문서 문자열이 아니라 gene 블록과 같은
+#: (열 이름, train 배열, test 배열) 모양이다.
+PAIR_BLOCKS = ("comut",)
+
+#: fold 안에서 잠재 기저를 fit 하는 블록. PAIR_BLOCKS 와 달리 **폭이 매 fold 고정**이라
+#: (열 이름도 `lat__svd__c000` 로 고정) f4r 과의 델타가 차원 변동에 오염되지 않는다.
+#: 대신 열 이름이 같아도 열의 *의미* 는 fold 마다 다르다 — 그래서 안정성을
+#: `_selection_overlap` 의 Jaccard 로 재면 항상 1.000 이라는 거짓말이 나온다.
+#: 이쪽 안정성은 `features_latent.subspace_alignment`(주각 코사인)로 따로 잰다.
+LATENT_BLOCKS = ("lsvd", "lnmf")
+
+#: 유전자를 그룹으로 묶어 집계하는 블록. `gmod` 는 fold 마다 지지도 필터가 다시 걸려
+#: 모듈에 든 유전자 집합이 실제로 바뀌므로 `selected` 등록이 의미가 있고, `kpath` 는
+#: 멤버십이 상수라 값 계산의 희귀도 가중만 fold 안에서 fit 한다.
+MODULE_BLOCKS = ("gmod", "kpath")
+
 #: sparse 블록 -> (parquet 파일명 템플릿, 문서 열 이름)
 SPARSE_SOURCES = {
     "sigtok": ("{split}_signature_mutation_tokens.parquet", "unique_mutation_document"),
@@ -144,7 +194,40 @@ BLOCK_SOURCES = {
     "rollup16": "{split}_sample_mutation_features_rollup.parquet",
     "enc3": "{split}_mutation_encoded.parquet",
     "gec": "{split}_gene_event_count_matrix.parquet",
+    # enc3 와 같은 파일이다 — Dataset 이 `block_cache_key` 기준으로 캐시해 두 번 안 읽는다.
+    "comut": "{split}_mutation_encoded.parquet",
+    # 잠재·모듈 블록도 같은 파일이고 `_select` 분기도 같은 유전자 갈래라
+    # `block_cache_key` 가 enc3/comut 와 같은 키를 낸다 — 배열 한 벌을 나눠 쓴다.
+    "lsvd": "{split}_mutation_encoded.parquet",
+    "lnmf": "{split}_mutation_encoded.parquet",
+    "gmod": "{split}_mutation_encoded.parquet",
+    "kpath": "{split}_mutation_encoded.parquet",
 }
+
+#: `_select` 가 이름을 보고 갈라지는 블록 -> 그 분기의 이름. 여기 없는 블록은 전부
+#: 마지막 유전자 분기로 떨어져서, 소스가 같으면 결과도 같다.
+#:
+#: 캐시 키를 파일 이름만으로 잡으면 `rollup` 과 `rollup16` 이 충돌한다. 둘은 같은
+#: parquet 을 읽지만 고르는 열이 46개 / 16개로 다르고, `sorted(blocks)` 에서 `rollup`
+#: 이 먼저라 rollup16 자리에 46열이 그대로 들어간다. 그러면 일부러 뺀
+#: `duplicate_signature_count`(train 1.30 / test 52.8, 40배 시프트) 가 시프트 내성
+#: 블록에 되살아나는데, 예외도 안 나고 fold 로직도 멀쩡히 돌아서 로그의 열 수를
+#: 안 보면 모른다. `--configs` 기본값이 `all` 이라 config 를 안 적기만 해도 걸린다.
+SELECT_KIND = {
+    "domain": "domain",
+    "fe25": "fe25",
+    "rollup": "rollup46",
+    "rollup16": "rollup16",
+}
+
+
+def block_cache_key(name: str) -> tuple[str, str]:
+    """`_select` 결과를 공유해도 되는 블록끼리만 같은 값을 낸다.
+
+    `enc3`/`comut` 처럼 소스와 분기가 둘 다 같은 블록은 계속 배열 한 벌을 나눠 쓴다.
+    """
+    return BLOCK_SOURCES.get(name, name), SELECT_KIND.get(name, "gene")
+
 
 BLOCK_DESC = {
     "domain": "도메인 539",
@@ -155,6 +238,11 @@ BLOCK_DESC = {
     "gec": "유전자 토큰수",
     "sigtok": "서명 TF-IDF",
     "exacttok": "원문토큰 TF-IDF (대조군)",
+    "comut": "공변이 쌍 (fold 안 선택)",
+    "lsvd": "잠재 SVD (fold 안 fit)",
+    "lnmf": "잠재 NMF (fold 안 fit)",
+    "gmod": "하드 유전자 모듈 (fold 안 KMeans)",
+    "kpath": "수기 pathway (규정 회색지대)",
 }
 
 #: 래더. 한 번에 한 축만 바꾼다.
@@ -215,6 +303,58 @@ CONFIGS: dict[str, dict] = {
         "blocks": ("domain", "rollup16", "enc3"),
         "weight": "balanced+group_sqrt",
         "desc": "f4r + 중복 프로파일 완만 감쇠",
+    },
+    # --- 공변이 쌍 --------------------------------------------------------
+    "f4rc": {
+        "blocks": ("domain", "rollup16", "enc3", "comut"),
+        "weight": "balanced",
+        "desc": "f4r + 공변이 쌍",
+    },
+    # 중복성 대조군. enc3 없이 공변이 쌍만 얹어서, 쌍이 단독 유전자 위에 정말
+    # 추가 정보를 얹는지 본다 — 선택된 쌍의 유전자가 PMS2 하나만 빼고 전부 enc3
+    # chi2 top-500 안에 이미 있어서, `value=and` 는 depth-6 트리에게 원리상 중복이다.
+    "f2c": {
+        "blocks": ("domain", "rollup16", "comut"),
+        "weight": "balanced",
+        "desc": "도메인 + 시프트내성 rollup + 공변이 쌍 (enc3 없음, 중복성 대조군)",
+    },
+    # --- 유전자 모듈 ------------------------------------------------------
+    # 소프트(잠재)와 하드(KMeans)를 같은 사다리에 둔다. 둘 다 같은 공변이 기하를
+    # 쓰지만 하드는 유전자를 모듈 하나에만 넣고 소프트는 여러 성분에 걸칠 수 있다.
+    "f4rl": {
+        "blocks": ("domain", "rollup16", "enc3", "lsvd"),
+        "weight": "balanced",
+        "desc": "f4r + 잠재 SVD",
+    },
+    "f4rn": {
+        "blocks": ("domain", "rollup16", "enc3", "lnmf"),
+        "weight": "balanced",
+        "desc": "f4r + 잠재 NMF",
+    },
+    "f4rm": {
+        "blocks": ("domain", "rollup16", "enc3", "gmod"),
+        "weight": "balanced",
+        "desc": "f4r + 하드 유전자 모듈",
+    },
+    # 규정 회색지대. compliance/PATHWAY_SOURCE.md 를 읽고 쓴다 — 주최측 확인 전까지
+    # 제출 후보가 아니다. 빼려면 이 항목 하나만 지우면 된다.
+    "f4rk": {
+        "blocks": ("domain", "rollup16", "enc3", "kpath"),
+        "weight": "balanced",
+        "desc": "f4r + 수기 pathway (규정 회색지대)",
+    },
+    # 중복성 대조군. f2c 와 같은 역할이다 — "enc3 위에 얹었을 때 이득이 있나"와
+    # "블록 자체가 유전자 신호를 담고 있나"는 다른 질문이고, 후자를 이걸로 잰다.
+    # f2c 가 -0.0168 을 찍은 게 "공변이 쌍은 사실상 정보가 없다"를 알려준 숫자였다.
+    "f2l": {
+        "blocks": ("domain", "rollup16", "lsvd"),
+        "weight": "balanced",
+        "desc": "도메인 + 시프트내성 rollup + 잠재 SVD (enc3 없음, 중복성 대조군)",
+    },
+    "f2m": {
+        "blocks": ("domain", "rollup16", "gmod"),
+        "weight": "balanced",
+        "desc": "도메인 + 시프트내성 rollup + 하드 모듈 (enc3 없음, 중복성 대조군)",
     },
 }
 
@@ -339,18 +479,41 @@ class Dataset:
 
         self.dense: dict[str, tuple[list[str], np.ndarray, np.ndarray]] = {}
         self.gene: dict[str, tuple[list[str], np.ndarray, np.ndarray]] = {}
+        self.pairs: dict[str, tuple[list[str], np.ndarray, np.ndarray]] = {}
         self.docs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.rollup_train: pd.DataFrame | None = None
         self.rollup_test: pd.DataFrame | None = None
+        # comut 과 enc3 는 같은 parquet(`{split}_mutation_encoded.parquet`)을 읽어
+        # 똑같은 (열 이름, train 배열, test 배열) 을 낸다. `block_cache_key` 로 캐시해
+        # 두 번 안 읽는다 — 안 그러면 6,201x4,384 + 2,546x4,384 float32 를 두 벌 들고
+        # 153MB 가 306MB 가 된다. fold 루프는 항상 `.copy()`/`hstack` 사본을 쓰므로
+        # 두 블록이 같은 배열을 참조해도 안전하다. 키가 파일 이름이 아니라
+        # (파일, `_select` 분기) 인 이유는 `SELECT_KIND` 주석 참고.
+        self._block_cache: dict[
+            tuple[str, str], tuple[list[str], np.ndarray, np.ndarray]
+        ] = {}
 
         for name in sorted(blocks):
             if name in SPARSE_BLOCKS:
                 self.docs[name] = self._load_documents(name)
                 log(f"[block] {name:9s} {'문서':>6s}  {BLOCK_DESC[name]}")
                 continue
-            train_frame, test_frame = self._load_pair(name, base, test_base)
-            columns, train_array, test_array = self._select(name, train_frame, test_frame)
-            target = self.gene if name in GENE_BLOCKS else self.dense
+            cache_key = block_cache_key(name)
+            if cache_key in self._block_cache:
+                columns, train_array, test_array = self._block_cache[cache_key]
+            else:
+                train_frame, test_frame = self._load_pair(name, base, test_base)
+                columns, train_array, test_array = self._select(name, train_frame, test_frame)
+                self._block_cache[cache_key] = (columns, train_array, test_array)
+            # 셋 다 "원본 유전자 행렬을 그대로 들고 있다가 fold 안에서 가공"이라
+            # 저장 형태가 같다. `_select` 도 유전자 분기로 그대로 흘러가므로
+            # `SELECT_KIND` 에 넣지 않는다 — 갈래를 새로 만들 필요가 없다.
+            if name in PAIR_BLOCKS or name in LATENT_BLOCKS or name in MODULE_BLOCKS:
+                target = self.pairs
+            elif name in GENE_BLOCKS:
+                target = self.gene
+            else:
+                target = self.dense
             target[name] = (columns, train_array, test_array)
             log(f"[block] {name:9s} {len(columns):>6,}열  {BLOCK_DESC[name]}")
 
@@ -516,7 +679,13 @@ class Dataset:
         train_parts: list[np.ndarray] = []
         test_parts: list[np.ndarray] = []
         for block in CONFIGS[config]["blocks"]:
-            if block in GENE_BLOCKS or block in SPARSE_BLOCKS:
+            if (
+                block in GENE_BLOCKS
+                or block in SPARSE_BLOCKS
+                or block in PAIR_BLOCKS
+                or block in LATENT_BLOCKS
+                or block in MODULE_BLOCKS
+            ):
                 continue
             columns, train_array, test_array = self.dense[block]
             names += columns
@@ -534,6 +703,9 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     spec = CONFIGS[config]
     gene_blocks = [b for b in spec["blocks"] if b in GENE_BLOCKS]
     sparse_blocks = [b for b in spec["blocks"] if b in SPARSE_BLOCKS]
+    pair_blocks = [b for b in spec["blocks"] if b in PAIR_BLOCKS]
+    latent_blocks = [b for b in spec["blocks"] if b in LATENT_BLOCKS]
+    module_blocks = [b for b in spec["blocks"] if b in MODULE_BLOCKS]
     topk = args.topk if gene_blocks else None
     k_slug = f"k{topk}" if topk else "kall"
     # sparse 축을 stem 에 안 넣으면 --sparse-topk 를 바꿔 두 번 돌릴 때 두 번째가
@@ -542,10 +714,95 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     sparse_slug = (
         f"_sp{args.sparse_topk}m{args.tfidf_min_df}" if sparse_blocks else ""
     )
+    # 공변이 축도 같은 이유로 slug 가 필요하다. 파라미터가 11개라 전부 펴면 파일명을
+    # 못 읽으니, 사다리로 실제로 바꾸는 4축(topk·pool·value·mode)만 노출하고 나머지는
+    # digest 하나로 접는다. 전체 dict 는 결과 JSON 의 comut.params 에 그대로 남아서
+    # digest 를 로그만으로 되짚을 수 있다.
+    comut_kwargs = (
+        dict(
+            pool=args.comut_pool,
+            pool_topk=args.comut_pool_topk,
+            mode=args.comut_mode,
+            value=args.comut_value,
+            topk=args.comut_topk,
+            min_support=args.comut_min_support,
+            min_class_support=args.comut_min_class_support,
+            min_purity=args.comut_min_purity,
+            min_lift=args.comut_min_lift,
+            max_hyper_fraction=args.comut_max_hyper,
+            max_pairs_per_gene=args.comut_max_per_gene,
+        )
+        if pair_blocks
+        else {}
+    )
+    comut_manual_pairs = list(MANUAL_PAIRS) if args.comut_manual else []
+    comut_slug = _comut_slug(comut_kwargs, manual=args.comut_manual)
+    # 잠재·모듈 축도 같은 이유로 slug 가 필요하다. 셋 다 빈 dict 면 `""` 를 내므로
+    # 기존 로그 129개의 파일명이 바이트 단위로 그대로 유지된다.
+    # `lnmf` 는 이름 자체가 방식을 정하므로 `--latent-method` 를 덮는다. 그 해석을
+    # **여기서** 끝내야 slug 와 로그의 `latent.params.method` 가 실제 돌아간 방식과
+    # 일치한다 — fold 루프 안에서만 덮으면 파일명은 svd 라고 적혀 있는데 nmf 가
+    # 돌아간다(실제로 한 번 그렇게 나왔다).
+    latent_method = "nmf" if "lnmf" in latent_blocks else args.latent_method
+    latent_kwargs = (
+        dict(
+            method=latent_method,
+            n_components=args.latent_components,
+            row_norm=args.latent_row_norm,
+            value=args.latent_value,
+            mode=args.latent_mode,
+            gene_weight=args.latent_gene_weight,
+            min_gene_support=args.latent_min_support,
+            random_state=args.latent_random_state,
+        )
+        if latent_blocks
+        else {}
+    )
+    module_kwargs = (
+        dict(
+            value=args.module_value,
+            n_modules=args.module_n,
+            svd_components=args.module_svd_components,
+            mode=args.module_mode,
+            min_gene_support=args.module_min_support,
+            random_state=args.module_random_state,
+        )
+        if "gmod" in module_blocks
+        else {}
+    )
+    pathway_kwargs = (
+        dict(value=args.pathway_value, mode=args.pathway_mode)
+        if "kpath" in module_blocks
+        else {}
+    )
+    latent_slug = _latent_slug(latent_kwargs)
+    module_slug = _module_slug(module_kwargs, pathway_kwargs)
     stem = (
         f"{args.model}_{args.tag}_{config}_{CV_SLUG[cv]}_{k_slug}"
-        f"{sparse_slug}_s{args.seed}"
+        f"{sparse_slug}{comut_slug}{latent_slug}{module_slug}_s{args.seed}"
     )
+
+    # 대조군 설정은 조용히 지나가면 안 된다 — 나중에 로그만 보고 "왜 이건 나빴지"를
+    # 되짚을 때 의도였는지 실수였는지가 구별돼야 한다.
+    for label, value in (
+        ("모듈", module_kwargs.get("value")),
+        ("pathway", pathway_kwargs.get("value")),
+    ):
+        if value in SHIFT_EXPOSED_VALUES:
+            log(
+                f"  [{stem}] 주의: {label} value={value} 는 의도적 시프트 노출 대조군이다. "
+                "test 는 변이 유전자가 2.21배라 이 형태는 그대로 부푼다"
+            )
+    if latent_kwargs.get("row_norm") == "none":
+        log(
+            f"  [{stem}] 주의: --latent-row-norm none 은 대조군이다. 선두 성분의 "
+            "|burden 상관| 이 실측 0.995 로, 변이 부담 축을 그대로 학습한다"
+        )
+    if latent_kwargs.get("n_components", 0) > 128:
+        log(
+            f"  [{stem}] 경고: 잠재 성분 {latent_kwargs['n_components']}개. 기준선이 "
+            "1,055열이라 이건 블록 추가가 아니라 차원 체제 변경이다"
+        )
 
     names, dense_train, dense_test = data.assemble(config)
     burden_positions = [i for i, n in enumerate(names) if n in BURDEN_COLUMNS]
@@ -556,8 +813,16 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     test_proba = np.zeros((len(data.test_ids), len(data.classes)), dtype=np.float64)
     fold_scores: list[float] = []
     fold_seconds: list[float] = []
+    fold_widths: list[int] = []
     devices: list[str] = []
     selected: dict[str, dict[str, list[str]]] = {}
+    comut_diagnostics: dict[str, dict[str, list[dict]]] = {}
+    comut_widths: list[int] = []
+    latent_diagnostics: dict[str, dict[str, list[dict]]] = {}
+    module_diagnostics: dict[str, dict[str, list[dict]]] = {}
+    # fold 별 기저·모듈맵. 안정성 진단(주각 코사인)과 모듈맵 CSV 에 쓴다.
+    latent_bases: dict[str, list] = {}
+    module_maps: dict[str, list] = {}
     params: dict = {}
     n_features = len(names)
 
@@ -610,7 +875,92 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             x_train = np.hstack([x_train, sparse_train])
             x_test = np.hstack([x_test, sparse_test])
 
+        # 공변이 쌍 — 후보 풀·지지도·클래스별 지지도·과변이 의존도·lift 를 전부 fold
+        # 의 train 부분에서만 계산한다. test 행렬은 transform 만 받는다
+        # (features_graph.select_comutation_pairs 는 test 인자를 아예 받지 않는다).
+        for block in pair_blocks:
+            columns, pair_train, pair_test = data.pairs[block]
+            comut_names, comut_tr, comut_te, comut_diag = build_fold_comutation_block(
+                pair_train,
+                pair_test,
+                train_index,
+                data.y[train_index],
+                gene_names=columns,
+                manual_pairs=comut_manual_pairs,
+                **comut_kwargs,
+            )
+            selected.setdefault(block, {})[str(fold)] = comut_names
+            # 강제 포함 5쌍은 fold 와 무관하게 항상 들어가서 Jaccard 를 인위적으로
+            # 올린다. 선택 알고리즘의 진짜 안정성은 자동 선별분만으로 따로 잰다.
+            selected.setdefault(f"{block}_auto", {})[str(fold)] = [
+                d["name"] for d in comut_diag if not d["manual"]
+            ]
+            comut_diagnostics.setdefault(block, {})[str(fold)] = comut_diag
+            comut_widths.append(len(comut_names))
+            if len(comut_names) > 30:
+                log(
+                    f"  [{block}] 경고: fold {fold} 에서 {len(comut_names)}쌍 선택. "
+                    "차원 상한(30) 초과, 이 단은 기각 대상이다"
+                )
+            x_train = np.hstack([x_train, comut_tr])
+            x_test = np.hstack([x_test, comut_te])
+
+        # 잠재 기저 — SVD/NMF 를 fold 의 train 부분에서만 fit 한다. test 행렬은
+        # transform 만 받는다 (features_latent.fit_latent_basis 는 test 도 y 도
+        # 인자로 받지 않는다).
+        for block in latent_blocks:
+            columns, latent_train, latent_test = data.pairs[block]
+            lat_names, lat_tr, lat_te, lat_diag, basis = build_fold_latent_block(
+                latent_train,
+                latent_test,
+                train_index,
+                data.y[train_index],
+                gene_names=columns,
+                **latent_kwargs,
+            )
+            # `selected` 에 넣지 않는다 — 열 이름이 매 fold `lat__svd__c000` 으로
+            # 같아서 Jaccard 가 항상 1.000 이 나온다. 안정성을 모르는 대상에 대해
+            # 거짓말하는 숫자다. 실제 안정성은 subspace_alignment 로 잰다.
+            latent_bases.setdefault(block, []).append(basis)
+            latent_diagnostics.setdefault(block, {})[str(fold)] = lat_diag
+            x_train = np.hstack([x_train, lat_tr])
+            x_test = np.hstack([x_test, lat_te])
+
+        # 유전자 모듈 — KMeans 배정(gmod)도 희귀도 가중(kpath)도 fold 의 train
+        # 부분에서만 fit 한다.
+        for block in module_blocks:
+            columns, module_train, module_test = data.pairs[block]
+            if block == "kpath":
+                mod_names, mod_tr, mod_te, mod_diag = build_fold_pathway_block(
+                    module_train,
+                    module_test,
+                    train_index,
+                    data.y[train_index],
+                    gene_names=columns,
+                    **pathway_kwargs,
+                )
+            else:
+                mod_names, mod_tr, mod_te, mod_diag, modules = build_fold_module_block(
+                    module_train,
+                    module_test,
+                    train_index,
+                    data.y[train_index],
+                    gene_names=columns,
+                    **module_kwargs,
+                )
+                frame = module_membership_frame(modules, columns)
+                module_maps.setdefault(block, []).append(frame)
+                # 모듈에 들어간 유전자 집합은 fold 마다 진짜 바뀐다(지지도 필터가
+                # fold-train 에서 다시 걸린다). 다만 모듈 *번호* 는 KMeans 초기화에
+                # 따라 뒤섞이니 여기서 재는 건 "어떤 유전자가 모듈 체계에 포함됐나"
+                # 까지다. 배정 자체의 안정성(seed 간 ARI)은 inspect_latent.py 가 잰다.
+                selected.setdefault(block, {})[str(fold)] = list(frame["gene"])
+            module_diagnostics.setdefault(block, {})[str(fold)] = mod_diag
+            x_train = np.hstack([x_train, mod_tr])
+            x_test = np.hstack([x_test, mod_te])
+
         n_features = x_train.shape[1]
+        fold_widths.append(n_features)
 
         # 가중치도 fold 의 train 부분만 보고 만든다. 그룹 크기를 fold 밖에서 세면
         # skf5 에서 fold 를 가로지르는 그룹 364개가 기여보다 과하게 깎인다.
@@ -665,7 +1015,45 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             if sparse_blocks
             else None
         ),
+        "comut": (
+            {
+                "blocks": pair_blocks,
+                "manual": args.comut_manual,
+                "params": comut_kwargs,
+                "n_pairs_per_fold": comut_widths,
+                # 쌍별 n_AB·purity·lift·hyper_fraction 과, 선택이 끝난 뒤에만 계산하는
+                # train_rate/test_rate/rate_ratio(감사 기록 — 어떤 필터도 안 읽는다).
+                "diagnostics": comut_diagnostics.get("comut", {}),
+            }
+            if pair_blocks
+            else None
+        ),
+        "latent": (
+            {
+                "blocks": latent_blocks,
+                "params": latent_kwargs,
+                # 열 이름이 고정이라 Jaccard 는 무의미하다. fold 쌍마다 주각 코사인
+                # 평균을 내서 "같은 부분공간을 보고 있나"를 잰다 — 1 이면 완전 일치.
+                "subspace_alignment": {
+                    block: _pairwise_alignment(bases)
+                    for block, bases in latent_bases.items()
+                },
+                "diagnostics": latent_diagnostics,
+            }
+            if latent_blocks
+            else None
+        ),
+        "module": (
+            {
+                "blocks": module_blocks,
+                "params": {**module_kwargs, **pathway_kwargs},
+                "diagnostics": module_diagnostics,
+            }
+            if module_blocks
+            else None
+        ),
         "n_features": int(n_features),
+        "n_features_per_fold": fold_widths,
         "n_samples": len(data.y),
         "n_splits": args.n_splits,
         "seed": args.seed,
@@ -704,6 +1092,14 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     result["selected_gene_overlap"] = {
         block: _selection_overlap(folds) for block, folds in selected.items()
     }
+    # 모듈맵은 **fold 별로만** 쓴다. 전체 train 으로 fit 한 맵은 그 자체로 규정 위반은
+    # 아니지만(test 를 안 본다) fold 를 넘는 산출물이라 나중에 무심코 재사용하기 쉽다.
+    # 필요하면 scripts/inspect_latent.py 가 진단용으로 따로 만든다.
+    for block, frames in module_maps.items():
+        directory = ARTIFACTS / "features" / "modules" / stem
+        for fold_id, frame in enumerate(frames):
+            save_csv(frame.assign(fold=fold_id), directory / f"{block}_fold_{fold_id}.csv")
+
     log_path = ARTIFACTS / "logs" / f"{stem}.json"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "w", encoding="utf-8") as handle:
@@ -768,6 +1164,87 @@ def _selection_overlap(selected: dict[str, list[str]]) -> float:
     return float(np.mean(scores))
 
 
+def _comut_slug(comut_kwargs: dict, *, manual: bool) -> str:
+    """공변이 파라미터 -> stem 슬러그. `comut_kwargs` 가 비어 있으면(블록 없음) `""`.
+
+    슬러그를 빠뜨리면 두 번째 실행이 첫 번째 로그를 조용히 덮는다 — 이 버그는
+    이미 한 번 나서 `sparse_slug` 가 생겼다. 파라미터가 11개라 전부 펴면 파일명을
+    못 읽으니, 사다리로 실제로 바꾸는 4축(topk·pool·value·mode)만 노출하고 나머지는
+    digest 하나로 접는다. 전체 dict 는 결과 JSON 의 `comut.params` 에 그대로 남아서
+    digest 를 로그만으로 되짚을 수 있다.
+    """
+    if not comut_kwargs:
+        return ""
+    digest = hashlib.blake2s(
+        json.dumps(comut_kwargs, sort_keys=True).encode("utf-8"), digest_size=3
+    ).hexdigest()
+    manual_flag = "m" if manual else "x"
+    return (
+        f"_cm{comut_kwargs['topk']}{comut_kwargs['pool'][:3]}{comut_kwargs['value'][:3]}"
+        f"{comut_kwargs['mode'][0]}{manual_flag}{digest}"
+    )
+
+
+def _digest(payload: dict) -> str:
+    """파라미터 dict -> 3바이트 blake2s. `_comut_slug` 와 같은 방식이다."""
+    return hashlib.blake2s(
+        json.dumps(payload, sort_keys=True).encode("utf-8"), digest_size=3
+    ).hexdigest()
+
+
+def _latent_slug(latent_kwargs: dict) -> str:
+    """잠재 파라미터 -> stem 슬러그. 비어 있으면(블록 없음) `""`.
+
+    `_comut_slug` 와 같은 이유로 필요하다 — 슬러그가 없으면 `--latent-components` 만
+    바꿔 두 번 돌릴 때 두 번째가 첫 번째 로그를 조용히 덮고, `write_matrix` 가
+    디스크를 재스캔하므로 비교표까지 반쪽이 된다.
+
+    사다리로 실제로 바꾸는 3축(성분 수·method·row_norm)만 펴고 나머지는 digest 로
+    접는다. 전체 dict 는 결과 JSON 의 `latent.params` 에 그대로 남는다.
+    """
+    if not latent_kwargs:
+        return ""
+    return (
+        f"_lt{latent_kwargs['n_components']}{latent_kwargs['method']}"
+        f"{latent_kwargs['row_norm']}{_digest(latent_kwargs)}"
+    )
+
+
+def _module_slug(module_kwargs: dict, pathway_kwargs: dict) -> str:
+    """모듈·pathway 파라미터 -> stem 슬러그. 둘 다 비어 있으면 `""`.
+
+    두 블록이 한 슬러그를 나눠 쓴다. 같은 config 에 둘이 같이 들어가는 일이 없고
+    (`f4rm` 은 gmod, `f4rk` 는 kpath) 접두사(`_gm`/`_kp`)로 갈리므로 충돌하지 않는다.
+    """
+    if module_kwargs:
+        return (
+            f"_gm{module_kwargs['n_modules']}{module_kwargs['value'][:3]}"
+            f"{_digest(module_kwargs)}"
+        )
+    if pathway_kwargs:
+        return f"_kp{pathway_kwargs['value'][:3]}{_digest(pathway_kwargs)}"
+    return ""
+
+
+def _pairwise_alignment(bases: list) -> float:
+    """fold 쌍마다 주각 코사인 평균을 내고 다시 평균. 1 에 가까우면 안정적이다.
+
+    `_selection_overlap` 의 잠재 블록 판이다. 열 이름이 fold 마다 같아서 Jaccard 는
+    항상 1.000 을 내므로 여기서는 부분공간이 실제로 겹치는지를 본다.
+    """
+    if len(bases) < 2:
+        return 1.0
+    return float(
+        np.mean(
+            [
+                subspace_alignment(bases[i], bases[j])
+                for i in range(len(bases))
+                for j in range(i + 1, len(bases))
+            ]
+        )
+    )
+
+
 # ---------------------------------------------------------------- CLI
 def _parse_override(items: list[str]) -> dict:
     """`--set key=value` 를 파이썬 값으로. int -> float -> 문자열 순으로 시도한다."""
@@ -824,6 +1301,117 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tag", default="v2", help="파일명에 들어가는 실험 이름")
     parser.add_argument("--submission", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true", help="파일을 쓰지 않는다")
+
+    # --- 공변이 쌍 블록 (comut) ------------------------------------------
+    parser.add_argument(
+        "--comut-pool",
+        choices=["drivers", "chi2"],
+        default="drivers",
+        help="쌍 후보 유전자 풀. drivers=features_domain.DRIVERS 92개(fold 무관). "
+        "chi2 는 대조군. BRAF x passenger 축퇴를 일부러 재현한다",
+    )
+    parser.add_argument(
+        "--comut-pool-topk", type=int, default=300, help="--comut-pool chi2 전용"
+    )
+    parser.add_argument(
+        "--comut-mode", choices=["mutated", "functional"], default="mutated"
+    )
+    parser.add_argument(
+        "--comut-value",
+        choices=["and", "share", "gate"],
+        default="share",
+        help="쌍 피처 값. share/gate 는 행의 변이 유전자 수로 정규화해 시프트 내성이 있다",
+    )
+    parser.add_argument(
+        "--comut-topk", type=int, default=20, help="자동 선별 쌍 상한 (필터가 먼저 물린다)"
+    )
+    parser.add_argument("--comut-min-support", type=int, default=20)
+    parser.add_argument("--comut-min-class-support", type=int, default=8)
+    parser.add_argument("--comut-min-purity", type=float, default=0.25)
+    parser.add_argument("--comut-min-lift", type=float, default=0.15)
+    parser.add_argument(
+        "--comut-max-hyper",
+        type=float,
+        default=0.50,
+        help="쌍이 과변이 샘플에 몰린 정도의 상한. 기저율 0.05",
+    )
+    parser.add_argument("--comut-max-per-gene", type=int, default=3)
+    parser.add_argument(
+        "--comut-manual",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="§9 강제 포함 5쌍(IDH1+ATRX 등)을 필터와 무관하게 항상 넣을지",
+    )
+
+    # --- 잠재 모듈 블록 (lsvd / lnmf) -------------------------------------
+    parser.add_argument(
+        "--latent-method",
+        choices=["svd", "nmf"],
+        default="svd",
+        help="분해 방식. config lnmf 는 이 값과 무관하게 nmf 로 고정된다",
+    )
+    parser.add_argument("--latent-components", type=int, default=64, help="잠재 성분 수")
+    parser.add_argument(
+        "--latent-row-norm",
+        choices=["l2", "none"],
+        default="l2",
+        help="분해 전 행 정규화. l2 는 조성만 남겨 test 의 2.21배 희석에 내성이 있다. "
+        "none 은 **의도적 시프트 노출 대조군** — 선두 성분의 |burden 상관| 이 실측 "
+        "0.995 로, 변이 부담 축을 그대로 학습한다 (l2 는 0.458)",
+    )
+    parser.add_argument(
+        "--latent-value",
+        choices=["proj", "share"],
+        default="proj",
+        help="proj=투영 그대로, share=행별 |값| 합으로 정규화(NMF 면 혼합 비율)",
+    )
+    parser.add_argument(
+        "--latent-mode", choices=["mutated", "functional"], default="mutated"
+    )
+    parser.add_argument(
+        "--latent-gene-weight",
+        choices=["none", "idf"],
+        default="none",
+        help="idf 면 fold-train 희귀도로 유전자를 가중한 뒤 분해한다",
+    )
+    parser.add_argument(
+        "--latent-min-support",
+        type=int,
+        default=5,
+        help="fold-train 에서 이 행수 미만 변이된 유전자는 분해 전에 뺀다",
+    )
+    parser.add_argument("--latent-random-state", type=int, default=0)
+
+    # --- 하드 유전자 모듈 블록 (gmod) --------------------------------------
+    parser.add_argument("--module-n", type=int, default=24, help="KMeans 모듈 수")
+    parser.add_argument(
+        "--module-svd-components", type=int, default=64, help="군집 전 SVD 축소 차원"
+    )
+    parser.add_argument(
+        "--module-value",
+        choices=list(MODULE_VALUES),
+        default="share",
+        help="모듈 집계 값. share/enrich/wshare 는 행의 변이 유전자 수로 나눠 시프트 "
+        f"내성이 있다. {'/'.join(SHIFT_EXPOSED_VALUES)} 는 **의도적 시프트 노출 대조군** "
+        "— test 에서 그대로 부푼다 (fraction 은 분모가 모듈 크기라는 상수라 비율처럼 "
+        "보여도 카운트다)",
+    )
+    parser.add_argument(
+        "--module-mode", choices=["mutated", "functional"], default="mutated"
+    )
+    parser.add_argument("--module-min-support", type=int, default=5)
+    parser.add_argument("--module-random-state", type=int, default=0)
+
+    # --- 수기 pathway 블록 (kpath) -----------------------------------------
+    parser.add_argument(
+        "--pathway-value",
+        choices=list(MODULE_VALUES),
+        default="share",
+        help="pathway 집계 값. --module-value 와 같은 규약이다",
+    )
+    parser.add_argument(
+        "--pathway-mode", choices=["mutated", "functional"], default="mutated"
+    )
     return parser
 
 
