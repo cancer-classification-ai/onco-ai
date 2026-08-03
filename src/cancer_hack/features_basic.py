@@ -173,6 +173,17 @@ SAMPLE_FEATURE_COLUMNS: tuple[str, ...] = (
     "loss_of_function_count",
 )
 
+ADDITIONAL_BURDEN_FEATURE_COLUMNS: tuple[str, ...] = (
+    "events_per_mutated_gene",
+    "loss_of_function_ratio",
+    "indel_ratio",
+    "complex_ratio",
+    "duplicate_event_count",
+    "duplicate_event_ratio",
+    "high_multihit_gene_count",
+    "max_gene_event_share",
+)
+
 
 def _resolve_gene_columns(
     df: pd.DataFrame,
@@ -196,6 +207,7 @@ def make_sample_mutation_features(
     *,
     gene_columns: list[str] | None = None,
     include_cell_rollup: bool = False,
+    include_additional_burden: bool = False,
 ) -> pd.DataFrame:
     """샘플(행) 하나를 유전자 전체에 걸친 복합 변이 요약 피처로 접는다.
 
@@ -221,6 +233,11 @@ def make_sample_mutation_features(
     `mnv_count`, `unique_*_count`, `has_duplicate_token`, `other_count`. 팀 목록에
     없는 이름이라 기본값은 False 다. 목록 계약을 깨지 않으면서 1차 표 정보도
     꺼내 쓸 수 있게 스위치로 뒀다.
+
+    `include_additional_burden=True` 를 주면 기존 burden count에서 유도한 비율과
+    중복·고차 multihit 요약 8개가 붙는다. 기본 스키마와 기존 Parquet 계약을
+    깨지 않도록 opt-in으로 둔다. 정확히 중복인 `singleton_gene_count`
+    (`mutated_gene_count - multihit_gene_count`)는 만들지 않는다.
 
     `mutation_event_count` 가 1차 표의 `mutation_token_count` 와 같은 값이고,
     `complex_event_count` 가 `mnv_count` 와 같은 값이다. 이름만 팀 목록을 따른다.
@@ -254,6 +271,9 @@ def make_sample_mutation_features(
     max_events_per_gene = np.zeros(n_rows, dtype=np.int32)
     explicit_deletion_event_count = np.zeros(n_rows, dtype=np.int32)
     explicit_deletion_gene_count = np.zeros(n_rows, dtype=np.int32)
+    indel_event_count = np.zeros(n_rows, dtype=np.int32)
+    unique_gene_token_count = np.zeros(n_rows, dtype=np.int32)
+    high_multihit_gene_count = np.zeros(n_rows, dtype=np.int32)
 
     rollup_sums = np.zeros((n_rows, len(_ROLLUP_SUM_COLUMNS)), dtype=np.int32)
     rollup_anys = np.zeros((n_rows, len(_ROLLUP_ANY_COLUMNS)), dtype=np.int8)
@@ -273,6 +293,12 @@ def make_sample_mutation_features(
             functional_event_count[i] += cell.functional_count
             if n_tokens >= 2:
                 multihit_gene_count[i] += 1
+            if include_additional_burden:
+                if n_tokens >= 3:
+                    high_multihit_gene_count[i] += 1
+                indel_event_count[i] += cell.indel_count
+                # 셀 하나가 유전자 하나이므로 셀별 unique 합은 unique (gene, token) 수다.
+                unique_gene_token_count[i] += cell.unique_mutation_token_count
             if n_tokens > max_events_per_gene[i]:
                 max_events_per_gene[i] = n_tokens
 
@@ -338,6 +364,31 @@ def make_sample_mutation_features(
     )
 
     ordered = list(SAMPLE_FEATURE_COLUMNS)
+    if include_additional_burden:
+        out["events_per_mutated_gene"] = _safe_ratio(
+            out["mutation_event_count"], out["mutated_gene_count"]
+        )
+        out["loss_of_function_ratio"] = _safe_ratio(
+            out["loss_of_function_count"], out["functional_event_count"]
+        )
+        out["indel_ratio"] = _safe_ratio(
+            pd.Series(indel_event_count, index=df.index),
+            out["mutation_event_count"],
+        )
+        out["complex_ratio"] = _safe_ratio(
+            out["complex_event_count"], out["mutation_event_count"]
+        )
+        out["duplicate_event_count"] = (
+            mutation_event_count - unique_gene_token_count
+        ).astype(np.int32)
+        out["duplicate_event_ratio"] = _safe_ratio(
+            out["duplicate_event_count"], out["mutation_event_count"]
+        )
+        out["high_multihit_gene_count"] = high_multihit_gene_count
+        out["max_gene_event_share"] = _safe_ratio(
+            out["max_events_per_gene"], out["mutation_event_count"]
+        )
+        ordered += list(ADDITIONAL_BURDEN_FEATURE_COLUMNS)
     if include_cell_rollup:
         for col, key in enumerate(_ROLLUP_SUM_COLUMNS):
             out[key] = rollup_sums[:, col]

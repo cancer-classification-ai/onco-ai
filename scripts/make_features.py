@@ -7,6 +7,7 @@
 
     python scripts/make_features.py sample --split train --overwrite
     python scripts/make_features.py sample --split test  --overwrite
+    python scripts/make_features.py sample --split train --include-additional-burden --overwrite
     python scripts/make_features.py tokens --split train --overwrite
     python scripts/make_features.py gene   --split train --kind mutated --overwrite
     python scripts/make_features.py gene-types --split train --overwrite
@@ -74,7 +75,13 @@ def _load_split(split: str, input_path: Path | None) -> tuple[pd.DataFrame, list
 
 def cmd_sample(args: argparse.Namespace) -> dict[str, object]:
     """복합 변이 샘플 단위 피처."""
-    output = _resolve_output(args.output, f"{args.split}_sample_mutation_features.parquet")
+    suffix = (
+        "_additional" if args.include_additional_burden else ""
+    )
+    output = _resolve_output(
+        args.output,
+        f"{args.split}_sample_mutation_features{suffix}.parquet",
+    )
     _guard_existing(output, args.overwrite)
 
     frame, genes = _load_split(args.split, args.input)
@@ -82,6 +89,7 @@ def cmd_sample(args: argparse.Namespace) -> dict[str, object]:
         frame,
         gene_columns=genes,
         include_cell_rollup=args.include_cell_rollup,
+        include_additional_burden=args.include_additional_burden,
     )
     features.insert(0, "ID", frame["ID"].astype(str).to_numpy())
     if "SUBCLASS" in frame.columns:
@@ -94,6 +102,7 @@ def cmd_sample(args: argparse.Namespace) -> dict[str, object]:
         "gene_count": len(genes),
         "feature_count": len(features.columns) - (1 + int("SUBCLASS" in frame.columns)),
         "cell_rollup": args.include_cell_rollup,
+        "additional_burden": args.include_additional_burden,
     }
 
 
@@ -170,6 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-cell-rollup",
         action="store_true",
         help="1차 전략표 이름(has_indel·mnv_count·unique_* 등) 17개를 함께 낸다.",
+    )
+    p_sample.add_argument(
+        "--include-additional-burden",
+        action="store_true",
+        help="추가 burden 비율·중복·고차 multihit 피처 8개를 함께 낸다.",
     )
     p_sample.set_defaults(func=cmd_sample)
 
