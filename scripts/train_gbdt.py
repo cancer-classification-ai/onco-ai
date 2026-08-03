@@ -163,7 +163,7 @@ ROBUST_ROLLUP_COLUMNS = (
 )
 
 #: chi2 top-K 대상 블록. 나머지는 전부 통과시킨다.
-GENE_BLOCKS = ("enc3", "gec", "gtype")
+GENE_BLOCKS = ("enc3", "gec", "gecr", "gtype")
 
 #: fold 안에서 어휘째 다시 만드는 블록. gene 블록과 달리 열의 *정체* 가 fold 마다
 #: 바뀌므로 `Dataset` 이 행렬을 미리 못 만든다. 들고 있는 건 문서 문자열이다.
@@ -212,6 +212,9 @@ BLOCK_SOURCES = {
     "rollup16": "{split}_sample_mutation_features_rollup.parquet",
     "enc3": "{split}_mutation_encoded.parquet",
     "gec": "{split}_gene_event_count_matrix.parquet",
+    # gec 와 같은 파일이다. `SELECT_KIND` 로 캐시 키를 갈라 두지 않으면
+    # rollup/rollup16 때와 똑같이 정규화 안 된 배열이 조용히 재사용된다.
+    "gecr": "{split}_gene_event_count_matrix.parquet",
     "gtype": "{split}_gene_mutation_type_matrix.parquet",
     "parsed19": "{split}_mutation_parsed_features.parquet",
     "burden8": "{split}_additional_burden_features.parquet",
@@ -246,7 +249,33 @@ SELECT_KIND = {
     "fe25": "fe25",
     "rollup": "rollup46",
     "rollup16": "rollup16",
+    "gecr": "gecr",
 }
+
+
+def _row_normalize(matrix: np.ndarray) -> np.ndarray:
+    """행 합을 1 로 맞춘다 — 카운트를 상대빈도로 바꾼다.
+
+    **왜 필요한가.** test 는 train 보다 샘플당 변이 유전자가 2.21배 많다. 원인이
+    실제 종양 차이가 아니라 주석 파이프라인 차이라면 유전자별 원시 카운트는
+    그 배율만큼 통째로 부풀고, 모델은 그걸 "고TMB 암종" 신호로 오독한다
+    (`research/03` §2.3, `research/07` §5). 실제로 `gec` 4,384열 중 70.2% 가
+    train→test 평균 배율 2배 밖이고 중앙값이 2.68배다.
+
+    행 안에서 총합을 1 로 맞추면 이 배율이 약분돼 사라진다. 유전자 **사이의
+    상대적 구성**만 남는데, 암종을 가르는 신호는 원래 거기 있다.
+
+    같은 발상이 이미 `gmod`·`csig` 의 `share` 값 모드에 들어가 있다("행의 변이
+    유전자 수로 나눠 시프트 내성이 있다" — `--module-value` 도움말). 여기서는
+    그 규약을 f16 최대 블록인 `gec` 로 넓히는 것뿐이다.
+
+    **규정.** 한 행 안에서만 나누므로 다른 행도 test 통계도 보지 않는다.
+    test 한 행만 따로 넣어도 같은 결과가 나온다.
+
+    변이가 하나도 없는 행은 합이 0 이라 그대로 0 벡터로 둔다.
+    """
+    total = matrix.sum(axis=1, keepdims=True)
+    return np.divide(matrix, total, out=np.zeros_like(matrix), where=total > 0)
 
 
 def block_cache_key(name: str) -> tuple[str, str]:
@@ -264,6 +293,7 @@ BLOCK_DESC = {
     "rollup16": "rollup 시프트내성 16",
     "enc3": "유전자 3단계",
     "gec": "유전자 토큰수",
+    "gecr": "유전자 토큰수 행정규화(상대빈도)",
     "sigtok": "서명 TF-IDF",
     "exacttok": "원문토큰 TF-IDF (대조군)",
     "ptok": "일반화 ParsedToken CountVectorizer",
@@ -474,6 +504,20 @@ CONFIGS: dict[str, dict] = {
         ),
         "weight": "balanced",
         "desc": "f16 에서 rollup 46 을 시프트내성 rollup16 으로 바꾼 것",
+    },
+    # `f16` 에서 gec 만 행정규화판 gecr 로 바꾼다. gec 는 f16 최대 블록(4,384열)
+    # 이면서 노출도 가장 크다 — 70.2% 가 train->test 평균 배율 2배 밖이고
+    # 중앙값 2.68배다. 행 합으로 나누면 그 배율이 약분된다.
+    #
+    # rollup 은 건드리지 않는다. f16r 에서 두 축을 같이 움직이면 델타가 섞인다.
+    "f16n": {
+        "blocks": (
+            "domain", "rollup", "enc3", "gecr", "gtype", "parsed19", "burden8",
+            "aa9", "sigtok", "exacttok", "ptok", "comut", "lsvd", "lnmf",
+            "gmod", "csig",
+        ),
+        "weight": "balanced",
+        "desc": "f16 에서 gec 를 행정규화(상대빈도) gecr 로 바꾼 것",
     },
 }
 
@@ -782,11 +826,12 @@ class Dataset:
         aligned = test_frame.reindex(columns=["ID", *columns])
         if aligned[columns].isna().to_numpy().any():
             raise ValueError(f"{name} test 재정렬 후 결측이 생겼다")
-        return (
-            columns,
-            train_frame[columns].to_numpy(np.float32),
-            aligned[columns].to_numpy(np.float32),
-        )
+        train_array = train_frame[columns].to_numpy(np.float32)
+        test_array = aligned[columns].to_numpy(np.float32)
+        if name == "gecr":
+            train_array = _row_normalize(train_array)
+            test_array = _row_normalize(test_array)
+        return columns, train_array, test_array
 
     def _load_folds(self, *, n_splits: int, folds_path: Path | None = None) -> pd.DataFrame:
         """사전계산 fold 파일을 **읽기만** 한다. 없으면 만들지 않고 멈춘다.
