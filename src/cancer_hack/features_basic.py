@@ -6,6 +6,7 @@ CLI 는 `scripts/make_features.py` 에 있고 이 모듈은 정의만 담는다.
 """
 
 from __future__ import annotations
+import argparse
 from pathlib import Path
 import re
 
@@ -14,7 +15,8 @@ import pandas as pd
 
 from .parser import (
     _check_columns,
-    _classify_token,
+    _COARSE_KIND,
+    classify_token,
     _INDEL_RE,
     _MUTATION_EMPTY,
     _parse_mutation_tokens,
@@ -24,6 +26,7 @@ from .parser import (
     CellMutation,
     parse_cell,
     split_tokens,
+    token_signature,
 )
 
 # Synonymous mutation 패턴 확인용 정규식
@@ -37,6 +40,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # parser.py의 _MUTATION_EMPTY와 동일한 값 — 중복 정의 대신 참조
 EXACT_MUTATION_EMPTY_VALUES = _MUTATION_EMPTY
 EXACT_MUTATION_NO_MUTATION_TOKEN = "SAMPLE__NO_MUTATION"
+#: 서명 문서의 토큰 접두사. exact 문서의 `MUT__` 와 갈라 둬서 두 블록을 한 행렬에
+#: 이어 붙여도 피처 이름이 안 겹친다.
+SIGNATURE_MUTATION_PREFIX = "SIG__"
 
 
 # 단일 mutation token을 WT / Synonymous / Functional 3단계 값으로 변환
@@ -98,6 +104,10 @@ _ROLLUP_SUM_COLUMNS: tuple[str, ...] = (
     "unique_indel_count",
     "unique_mnv_count",
     "other_count",
+    # 셀 안의 잉여 토큰 수 두 기준. `has_duplicate_token` 은 있음/없음만 말하는데
+    # 이소폼 중복은 셀당 수십 개까지 쌓여서 플래그로는 크기가 안 보인다.
+    "duplicate_token_count",
+    "duplicate_signature_count",
 )
 _ROLLUP_ANY_COLUMNS: tuple[str, ...] = (
     "has_missense",
@@ -553,26 +563,90 @@ def row_to_exact_mutation_document(
     return " ".join(tokens)
 
 
+def row_to_unique_mutation_document(
+    row: pd.Series,
+    gene_columns: list[str],
+) -> str:
+    """샘플 하나를 **위치 무시 서명** 문서로 바꾼다.
+
+    `row_to_exact_mutation_document` 와 두 가지가 다르다.
+
+    1. 토큰이 원문이 아니라 `parser.token_signature` 의 서명이다.
+    2. 한 셀 안에서 서명이 겹치면 하나만 남는다. 남기는 건 먼저 나온 토큰의
+       서명이라 결과가 실행마다 같다(`set` 을 순회하면 순서가 흔들린다).
+
+    ## 왜 원문 대표를 안 남기는가
+
+    test 는 같은 변이를 전사체마다 다른 좌표로 적는다(`M267I M206I`). 원문을
+    남기면 train 이 `M267I`, test 가 `M206I` 를 골라 어휘가 안 맞는다. train 에
+    fit 한 TF-IDF 로 test 를 transform 했을 때 `min_df=3` 기준 비영 행이 원문
+    60.5% / 서명 95.5%, 행당 비영 항이 1.1 / 16.5 다. 원문 문서의 TF-IDF 는
+    test 에서 사실상 0 행렬이다.
+
+    ## 부수 효과 — TF 가 항상 1 이다
+
+    셀 안에서 서명을 접었으므로 한 문서에 같은 토큰이 두 번 나올 수 없다.
+    TF-IDF 가 자동으로 이진 지시자 x IDF 가 되어, test 가 train 의 3.2배 길다는
+    문서 길이 격차가 TF 항에서 사라진다.
+
+    >>> row = pd.Series({"TP53": "M267I M206I", "KRAS": "Q369X"})
+    >>> row_to_unique_mutation_document(row, ["TP53", "KRAS"])
+    'SIG__TP53__missense|M>I SIG__KRAS__nonsense|Q'
+    """
+    tokens: list[str] = []
+
+    for gene in gene_columns:
+        value = row[gene]
+        if pd.isna(value):
+            continue
+
+        seen: set[str] = set()
+        for mutation in split_tokens(value):
+            signature = token_signature(mutation)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            tokens.append(f"{SIGNATURE_MUTATION_PREFIX}{gene}__{signature}")
+
+    if not tokens:
+        return EXACT_MUTATION_NO_MUTATION_TOKEN
+    return " ".join(tokens)
+
+
+def _build_documents(
+    frame: pd.DataFrame,
+    gene_columns: list[str],
+    row_builder,
+) -> pd.Series:
+    missing_columns = sorted(set(gene_columns).difference(frame.columns))
+    if missing_columns:
+        raise ValueError(f"Missing gene columns: {missing_columns[:10]}")
+
+    return frame.apply(row_builder, axis=1, gene_columns=gene_columns)
+
+
 def build_exact_mutation_documents(
     frame: pd.DataFrame,
     gene_columns: list[str],
 ) -> pd.Series:
     """Build one Exact Mutation Token document for every input sample."""
-    missing_columns = sorted(set(gene_columns).difference(frame.columns))
-    if missing_columns:
-        raise ValueError(f"Missing gene columns: {missing_columns[:10]}")
-
-    return frame.apply(
-        row_to_exact_mutation_document,
-        axis=1,
-        gene_columns=gene_columns,
-    )
+    return _build_documents(frame, gene_columns, row_to_exact_mutation_document)
 
 
-def make_exact_mutation_token_parquet(
+def build_unique_mutation_documents(
+    frame: pd.DataFrame,
+    gene_columns: list[str],
+) -> pd.Series:
+    """샘플마다 서명 문서를 하나씩 만든다."""
+    return _build_documents(frame, gene_columns, row_to_unique_mutation_document)
+
+
+def _make_document_parquet(
     input_path: Path,
     output_path: Path,
     *,
+    column: str,
+    builder,
     overwrite: bool = False,
 ) -> dict[str, int | str]:
     """Read a raw CSV and write ID/label/document columns to one Parquet file.
@@ -594,16 +668,16 @@ def make_exact_mutation_token_parquet(
 
     has_label = "SUBCLASS" in frame.columns
     gene_columns = [
-        column for column in frame.columns if column not in _GENE_EXCLUDE
+        column_name for column_name in frame.columns if column_name not in _GENE_EXCLUDE
     ]
     if not gene_columns:
         raise ValueError("No gene columns found")
 
-    documents = build_exact_mutation_documents(frame, gene_columns)
+    documents = builder(frame, gene_columns)
     columns: dict[str, pd.Series] = {"ID": frame["ID"].astype(str)}
     if has_label:
         columns["SUBCLASS"] = frame["SUBCLASS"].astype(str)
-    columns["exact_mutation_document"] = documents
+    columns[column] = documents
     output = pd.DataFrame(columns)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -620,6 +694,38 @@ def make_exact_mutation_token_parquet(
             (documents == EXACT_MUTATION_NO_MUTATION_TOKEN).sum()
         ),
     }
+
+
+def make_exact_mutation_token_parquet(
+    input_path: Path,
+    output_path: Path,
+    *,
+    overwrite: bool = False,
+) -> dict[str, int | str]:
+    """원문 토큰 문서 parquet. 열 이름은 `exact_mutation_document`."""
+    return _make_document_parquet(
+        input_path,
+        output_path,
+        column="exact_mutation_document",
+        builder=build_exact_mutation_documents,
+        overwrite=overwrite,
+    )
+
+
+def make_unique_mutation_token_parquet(
+    input_path: Path,
+    output_path: Path,
+    *,
+    overwrite: bool = False,
+) -> dict[str, int | str]:
+    """서명 문서 parquet. 열 이름은 `unique_mutation_document`."""
+    return _make_document_parquet(
+        input_path,
+        output_path,
+        column="unique_mutation_document",
+        builder=build_unique_mutation_documents,
+        overwrite=overwrite,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +1035,7 @@ def _compute_row_burden(row: pd.Series, gene_columns: list[str]) -> dict:
         gene_has_del = False
         for t in tokens:
             all_tokens.append(t)
-            cls = _classify_token(t)
+            cls = _COARSE_KIND[classify_token(t)]
             if cls == "synonymous":
                 synonymous += 1
             elif cls == "missense":

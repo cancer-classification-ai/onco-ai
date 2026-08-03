@@ -43,6 +43,9 @@ __all__ = [
     "available_models",
     "registered_models",
     "balanced_sample_weight",
+    "group_size_inverse_weight",
+    "resolve_sample_weight",
+    "SAMPLE_WEIGHT_BUILDERS",
     "gpu_available",
 ]
 
@@ -61,10 +64,91 @@ def gpu_available() -> bool:
 
 
 def balanced_sample_weight(y: Sequence) -> np.ndarray:
-    """클래스 빈도 역수 가중치. **폴드 내부의 train 부분에서만 호출한다.**"""
+    """클래스 빈도 역수 가중치. **폴드 내부의 train 부분에서만 호출한다.**
+
+    sklearn `compute_sample_weight("balanced")` 라 평균이 1 이고 합이 표본 수다.
+    아래 가중치들도 같은 정규화를 쓴다 — 섞어 곱해도 학습률 튜닝값이 안 흔들린다.
+    """
     from sklearn.utils.class_weight import compute_sample_weight
 
     return compute_sample_weight("balanced", y)
+
+
+def _normalize_to_unit_mean(weight: np.ndarray) -> np.ndarray:
+    return weight * (len(weight) / weight.sum())
+
+
+def group_size_inverse_weight(
+    groups: Sequence,
+    *,
+    power: float = 1.0,
+) -> np.ndarray:
+    """같은 그룹에 속한 행을 그룹 크기로 나눈다. 평균 1 로 맞춘다.
+
+    **폴드 내부의 train 부분에서만 호출한다.** 크기를 fold 밖에서 세면 안 되는
+    이유는 skf5 에서 그룹 364 개가 fold 를 가로지르기 때문이다(group5 는 0 개).
+    쌍둥이 중 한쪽만 학습에 들어갔으면 그 행은 한 번만 기여하므로 가중치가 1 이어야
+    맞는데, 전역 카운트를 쓰면 그 364 개가 기여보다 과하게 깎인다.
+
+    `power` 는 감쇠 세기다. train 그룹 크기 분포가
+    `{1: 5185, 2: 445, 3: 2, 4: 2, 18: 1, 94: 1}` 이라 `power=1.0` 이면 94 행짜리
+    무변이 그룹이 행당 0.0117 로 눌려 train 의 1.5% 가 사실상 사라진다.
+    `power=0.5` 는 같은 행을 0.11 근처에 둔다.
+
+    >>> w = group_size_inverse_weight([0, 0, 1])
+    >>> round(float(w.mean()), 6), round(float(w[0] / w[2]), 6)
+    (1.0, 0.5)
+    >>> group_size_inverse_weight(["a", "a", "b"]).round(4).tolist()
+    [0.75, 0.75, 1.5]
+    """
+    if power <= 0:
+        raise ValueError(f"power 는 양수여야 한다: {power}")
+
+    import pandas as pd
+
+    codes, _ = pd.factorize(np.asarray(groups))
+    sizes = np.bincount(codes)[codes].astype(np.float64)
+    return _normalize_to_unit_mean(sizes ** (-power))
+
+
+#: `CONFIGS[...]["weight"]` 가 받는 이름. `+` 로 이으면 곱한 뒤 평균 1 로 다시 맞춘다.
+SAMPLE_WEIGHT_BUILDERS = {
+    "balanced": lambda y, groups: balanced_sample_weight(y),
+    "group": lambda y, groups: group_size_inverse_weight(groups),
+    "group_sqrt": lambda y, groups: group_size_inverse_weight(groups, power=0.5),
+}
+
+
+def resolve_sample_weight(spec: str | None, y: Sequence, groups: Sequence) -> np.ndarray | None:
+    """가중치 이름을 배열로 바꾼다. `y` 와 `groups` 는 **fold 의 train 부분**이다.
+
+    이름을 `+` 로 이으면 원소별로 곱한다. 개별 가중치가 전부 평균 1 이어도 곱의
+    평균은 1 이 아니라서(상관이 있으면 어긋난다) 곱한 뒤 다시 맞춘다. 안 맞추면
+    실효 학습률이 조용히 달라져 기존 하이퍼파라미터 튜닝값이 의미를 잃는다.
+
+    >>> resolve_sample_weight("none", ["a", "b"], [0, 1]) is None
+    True
+    >>> w = resolve_sample_weight("balanced+group", list("aabb"), [0, 0, 1, 2])
+    >>> round(float(w.mean()), 6)
+    1.0
+    """
+    if spec in (None, "", "none"):
+        return None
+
+    parts = []
+    for name in spec.split("+"):
+        builder = SAMPLE_WEIGHT_BUILDERS.get(name)
+        if builder is None:
+            raise ValueError(
+                f"모르는 가중치 이름: {name!r} "
+                f"(가능: {sorted(SAMPLE_WEIGHT_BUILDERS)} · none)"
+            )
+        parts.append(np.asarray(builder(y, groups), dtype=np.float64))
+
+    weight = parts[0]
+    for part in parts[1:]:
+        weight = weight * part
+    return _normalize_to_unit_mean(weight)
 
 
 class BaseGBDT(ABC):
