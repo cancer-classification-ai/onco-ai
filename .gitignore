@@ -45,5 +45,11 @@ data/process/*
 *.cbm
 *.lgb
 
+# ==================== Optuna ====================
+# study 는 sqlite 파일로 쌓인다. 수백 KB 짜리 바이너리가 trial 마다 커지고,
+# 두 사람이 각자 돌리면 머지가 불가능하다. 결과는 노션 「모델 성능 기록」에 남긴다.
+artifacts/tuning/*
+!artifacts/tuning/.gitkeep
+
 # ==================== macOS ====================
 .DS_Store

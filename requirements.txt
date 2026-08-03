@@ -13,4 +13,8 @@ xgboost
 lightgbm
 catboost
 
+# 하이퍼파라미터 탐색 (scripts/tune_optuna.py)
+# sqlite storage 를 쓰므로 sqlalchemy 가 같이 딸려 온다.
+optuna
+
 # 설치 확인: python scripts/check_models.py

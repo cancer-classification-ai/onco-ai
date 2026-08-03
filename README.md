@@ -70,6 +70,21 @@ python src/train.py
 python src/predict.py
 ```
 
+### 하이퍼파라미터 탐색
+
+`scripts/tune_optuna.py` 는 `train_gbdt.py` 와 같은 피처·fold 를 쓰고 파라미터만 흔든다.
+탐색 결과를 믿기 전에 `--verify` 로 기준선 재현부터 확인한다 — 여기서 어긋나면
+파이프라인이 바뀐 것이고 그 위에서 고른 최적값은 무효다.
+
+```bash
+python scripts/tune_optuna.py --verify --cv both     # 기준선 재현 확인 (선행 필수)
+python scripts/tune_optuna.py --cv both --n-trials 60  # 탐색
+python scripts/tune_optuna.py --show-best             # 기존 study 결과만 다시 출력
+```
+
+study 는 `artifacts/tuning/<study>.db` 에 쌓이고 git 에는 올리지 않는다.
+제출 파일은 이 스크립트가 만들지 않는다 — 최고 설정을 `train_gbdt.py` 로 재실행해 뽑는다.
+
 
 # 프로젝트 구조
 
