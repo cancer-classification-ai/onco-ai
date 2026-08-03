@@ -217,6 +217,53 @@ def test_no_class_order_still_uses_alphabetical_sklearn_default():
     assert list(model.classes_) == sorted(set(y.tolist()))
 
 
+def test_non_alphabetical_class_order_actually_reorders_probability_columns():
+    """`classes_` 속성만 바꾸고 확률 열은 그대로 두면 안 된다 — 실제 재정렬을 검증한다.
+
+    sklearn 은 항상 사전식(`np.unique`) 순서로 확률 열을 낸다. 팀이 그와 다른
+    순서를 `class_order` 로 고정하면, wrapper 는 `classes_` 라벨만 바꿔치기
+    하는 게 아니라 확률 배열의 **열 자체**를 옮겨야 한다. 사전식이 아닌
+    순서(뒤섞은 순서)로 확인해야 이 둘을 구별할 수 있다 — 알파벳순이면 항등
+    치환이라 버그가 있어도 우연히 통과한다.
+    """
+    X, y = make_data()
+    non_alphabetical_order = [
+        CLASS_ORDER[2], CLASS_ORDER[0], CLASS_ORDER[5],
+        CLASS_ORDER[1], CLASS_ORDER[4], CLASS_ORDER[3],
+    ]
+    assert non_alphabetical_order != sorted(non_alphabetical_order)  # 진짜 뒤섞였는지 확인
+
+    reordered = create_model(
+        "rf", n_estimators=30, random_state=42, class_order=non_alphabetical_order
+    ).fit(X, y)
+    baseline = create_model("rf", n_estimators=30, random_state=42).fit(X, y)  # 알파벳순 대조군
+
+    assert list(reordered.classes_) == non_alphabetical_order
+
+    proba_reordered = reordered.predict_proba(X)
+    proba_baseline = baseline.predict_proba(X)
+    baseline_position = {c: i for i, c in enumerate(baseline.classes_)}
+
+    for i, cls in enumerate(non_alphabetical_order):
+        assert np.array_equal(proba_reordered[:, i], proba_baseline[:, baseline_position[cls]]), (
+            f"{cls} 열이 baseline 의 같은 클래스 확률과 다르다 — 실제 재정렬이 안 됐다"
+        )
+
+
+def test_class_order_reordering_is_deterministic_and_matches_seed():
+    """재정렬이 결정론성(동일 seed→동일 결과) 계약을 깨지 않는지 확인한다."""
+    X, y = make_data()
+    non_alphabetical_order = [CLASS_ORDER[3], CLASS_ORDER[1], CLASS_ORDER[0],
+                               CLASS_ORDER[2], CLASS_ORDER[5], CLASS_ORDER[4]]
+    proba_a = create_model(
+        "rf", n_estimators=20, random_state=7, class_order=non_alphabetical_order
+    ).fit(X, y).predict_proba(X)
+    proba_b = create_model(
+        "rf", n_estimators=20, random_state=7, class_order=non_alphabetical_order
+    ).fit(X, y).predict_proba(X)
+    assert np.array_equal(proba_a, proba_b)
+
+
 # ---------------------------------------------------------------- test 데이터 격리
 
 

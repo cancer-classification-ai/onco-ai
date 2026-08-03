@@ -63,7 +63,7 @@ def registered_models() -> list[str]:
 
 
 def default_n_jobs() -> int:
-    """물리 코어 수 - 1(최소 1). 코어 수를 못 읽으면 1(직렬)로 되돌린다.
+    """논리 CPU 수 - 1(최소 1). 코어 수를 못 읽으면 1(직렬)로 되돌린다.
 
     전체 코어를 다 쓰면(`-1`) 같은 머신에서 fold 루프 바깥의 다른 작업(로깅,
     다음 fold 준비)이 밀려 8코어 16GB 환경(spec §11)에서 스왑 위험이 커진다.
@@ -82,6 +82,16 @@ class ForestModel:
     책임 범위(spec §9.1): 모델 생성, 파라미터 검증, fit 상태 관리, canonical
     class order 정렬, 누락/예상외 클래스 방어, sample_weight 전달, seed/n_jobs
     설정. 피처 조립·fold 분할·확률 파일 저장은 `scripts/train_rf.py` 의 몫이다.
+
+    `class_order` 를 주면 `classes_` 는 그 순서를 그대로 반환하고,
+    `predict_proba` 의 열도 **실제로** 그 순서에 맞춰 재배열된다 — sklearn
+    estimator 는 항상 `np.unique(y)` 순서(사전식)로 `classes_`/확률 열을 내는데,
+    `class_order` 가 사전식이 아니면(예: 팀이 별도로 고정한 순서) 이 둘이
+    어긋난다. `classes_` 속성만 바꾸고 확률 배열은 그대로 두면 열 이름과 실제
+    값이 어긋난 채로 조용히 저장된다 — 그래서 fit 시점에 `estimator.classes_`
+    위치를 `class_order` 위치로 옮기는 인덱스(`_reorder_index_`)를 만들어 두고
+    `predict_proba` 에서 매번 적용한다. `class_order` 를 안 주면 재정렬하지
+    않고 sklearn 순서를 그대로 쓴다.
     """
 
     def __init__(
@@ -112,6 +122,7 @@ class ForestModel:
             raise ValueError(f"{self.name} 에 지원하지 않는 파라미터: {exc}") from exc
 
         self.classes_: np.ndarray | None = None
+        self._reorder_index_: np.ndarray | None = None
         self._fitted = False
 
     # -- fit ---------------------------------------------------------------
@@ -138,13 +149,26 @@ class ForestModel:
         weight = self._validate_sample_weight(sample_weight, n=len(y))
 
         self.estimator_.fit(X, y, sample_weight=weight)
-        self.classes_ = np.asarray(self.estimator_.classes_).astype(str)
+        estimator_classes = np.asarray(self.estimator_.classes_).astype(str)
 
-        if self.class_order is not None and list(self.classes_) != list(self.class_order):
-            raise RuntimeError(
-                "학습 후 classes_ 가 canonical class order 와 다르다: "
-                f"{list(self.classes_)} vs {list(self.class_order)}"
+        if self.class_order is None:
+            self.classes_ = estimator_classes
+            self._reorder_index_ = None
+        else:
+            # 위에서 이미 관측 라벨 집합 == canonical 집합을 확인했으므로 이건
+            # "일어나면 안 되는" 상태에 대한 방어일 뿐이다(정상 경로에서는 항상 같다).
+            if set(estimator_classes.tolist()) != set(self.class_order):
+                raise RuntimeError(
+                    "학습 후 estimator.classes_ 집합이 canonical class order 집합과 "
+                    f"다르다: {sorted(estimator_classes.tolist())} vs "
+                    f"{sorted(self.class_order)}"
+                )
+            position = {c: i for i, c in enumerate(estimator_classes)}
+            self._reorder_index_ = np.array(
+                [position[c] for c in self.class_order], dtype=np.int64
             )
+            self.classes_ = np.array(self.class_order)
+
         self._fitted = True
         return self
 
@@ -167,6 +191,8 @@ class ForestModel:
     def predict_proba(self, X) -> np.ndarray:
         self._check_fitted()
         proba = np.asarray(self.estimator_.predict_proba(X), dtype=np.float64)
+        if self._reorder_index_ is not None:
+            proba = proba[:, self._reorder_index_]
         n_classes = len(self.classes_)
         if proba.ndim != 2 or proba.shape[1] != n_classes:
             raise RuntimeError(

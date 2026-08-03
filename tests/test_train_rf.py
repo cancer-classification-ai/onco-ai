@@ -249,6 +249,54 @@ def test_synthetic_cli_smoke_produces_valid_artifacts(tmp_path):
     assert 0.0 <= logged["oof_macro_f1"] <= 1.0
 
 
+def test_saved_test_predictions_columns_are_exactly_id_and_probabilities(tmp_path):
+    """spec §8.2 — test_predictions.csv 는 `ID` + `p_{class}` 만 가진다(`y_pred` 없음)."""
+    ctx = build_data_dir(tmp_path)
+    out_dir = tmp_path / "artifacts"
+    run_cli(tmp_path, ctx, out_dir)
+
+    test_pred = pd.read_csv(out_dir / "test_predictions" / "test_rf_test_group5_s42.csv")
+    classes = sorted(set(pd.read_csv(ctx["data_dir"] / "train.csv")["SUBCLASS"]))
+    assert list(test_pred.columns) == ["ID", *[f"p_{c}" for c in classes]]
+    assert "y_pred" not in test_pred.columns
+
+
+def test_saved_oof_y_pred_matches_persisted_probability_argmax_exactly(tmp_path):
+    """저장·재읽은 OOF `y_pred` 가 그 파일 자체의 확률 argmax 와 정확히 일치해야 한다."""
+    ctx = build_data_dir(tmp_path)
+    out_dir = tmp_path / "artifacts"
+    run_cli(tmp_path, ctx, out_dir)
+
+    oof = pd.read_csv(out_dir / "oof" / "oof_rf_test_group5_s42.csv")
+    classes = np.array(sorted(set(pd.read_csv(ctx["data_dir"] / "train.csv")["SUBCLASS"])))
+    proba_cols = [f"p_{c}" for c in classes]
+
+    recomputed = classes[oof[proba_cols].to_numpy(dtype=np.float64).argmax(axis=1)]
+    assert (oof["y_pred"].to_numpy() == recomputed).all()
+
+
+def test_saved_submission_matches_persisted_test_probability_argmax_exactly(tmp_path):
+    """저장·재읽은 submission 의 SUBCLASS 가 저장된 test 확률 argmax 와 정확히 일치해야 한다."""
+    ctx = build_data_dir(tmp_path)
+    out_dir = tmp_path / "artifacts"
+    run_cli(tmp_path, ctx, out_dir)
+
+    test_pred = pd.read_csv(out_dir / "test_predictions" / "test_rf_test_group5_s42.csv")
+    submission = pd.read_csv(
+        out_dir / "submissions" / "submission_rf_test_group5_s42.csv",
+        encoding="utf-8-sig",
+        dtype=str,
+    )
+    classes = np.array(sorted(set(pd.read_csv(ctx["data_dir"] / "train.csv")["SUBCLASS"])))
+    proba_cols = [f"p_{c}" for c in classes]
+
+    recomputed = classes[test_pred[proba_cols].to_numpy(dtype=np.float64).argmax(axis=1)]
+    merged = submission.merge(
+        test_pred[["ID"]].assign(argmax=recomputed), on="ID", how="left", validate="one_to_one"
+    )
+    assert (merged["SUBCLASS"].to_numpy() == merged["argmax"].to_numpy()).all()
+
+
 def test_et_model_also_runs_end_to_end(tmp_path):
     ctx = build_data_dir(tmp_path)
     out_dir = tmp_path / "artifacts"

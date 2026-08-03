@@ -31,6 +31,7 @@ import os
 import subprocess
 import sys
 import time
+from io import StringIO
 from pathlib import Path
 
 import numpy as np
@@ -185,6 +186,28 @@ def check_overwrite(paths: dict[str, Path], *, overwrite: bool) -> None:
         )
 
 
+def _csv_round_trip(frame: pd.DataFrame) -> pd.DataFrame:
+    """실제 저장 후 다시 읽었을 때와 동일한 float 표현이 되도록 미리 한 번 왕복시킨다.
+
+    `pandas.to_csv` 기본 float 포맷팅은 float64 완전 왕복을 보장하지 않는다
+    (실측: 5,000행×6열 중 22,037개 셀이 첫 왕복에서 값이 바뀌었다 — 드문 ULP
+    수준이 아니라 흔한 정밀도 절단이다). 대신 **한 번 왕복한 값을 다시
+    왕복시키면 더 바뀌지 않는다**(멱등, 같은 실측으로 확인됨). 그래서 `y_pred`/
+    `SUBCLASS` 를 계산하기 전에 확률을 이 함수로 한 번 정규화해 두면, 그 값을
+    기준으로 계산한 `y_pred`/`SUBCLASS` 는 실제 디스크에 저장된 뒤 나중에
+    다시 읽어도 항상 같은 `np.argmax` 를 낸다 — 저장 전 계산과 저장 후 재읽기가
+    서로 다른 값을 보고 근접 동점의 승자가 갈리는 사고를 막는다.
+
+    실제 파일 대신 메모리 버퍼로 왕복시킨다 — `to_csv`/`read_csv` 의 float
+    포맷팅 로직은 대상이 파일이든 버퍼든 동일해서 결과가 같고, 검증 실패 시
+    디스크에 중간 산출물을 남기지 않는다.
+    """
+    buffer = StringIO()
+    frame.to_csv(buffer, index=False)
+    buffer.seek(0)
+    return pd.read_csv(buffer, dtype={"ID": str})
+
+
 def _git_commit_sha() -> str | None:
     try:
         result = subprocess.run(
@@ -280,14 +303,29 @@ def main(argv: list[str] | None = None) -> dict:
     elapsed = time.perf_counter() - started
 
     proba_cols = probability_columns(classes)
-    oof_frame = build_prediction_frame(train_ids, oof, classes, y_true=y)
-    oof_frame.insert(1, "fold", fold_ids)
+
+    # OOF: 확률(+fold/y_true)을 먼저 조립하고, 저장될 값으로 정규화(`_csv_round_trip`)
+    # 한 뒤에야 그 값을 기준으로 `y_pred` 를 계산한다 — 왕복 전 값으로 계산하면
+    # 나중에 저장된 파일을 다시 읽어 재계산한 argmax 와 근접 동점에서 어긋날 수 있다.
+    oof_proba = build_prediction_frame(train_ids, oof, classes, y_true=y).drop(columns=["y_pred"])
+    oof_proba.insert(1, "fold", fold_ids)
+    oof_proba = oof_proba[["ID", "fold", "y_true", *proba_cols]]
+    oof_proba = _csv_round_trip(oof_proba)
+    oof_pred = classes[oof_proba[proba_cols].to_numpy(dtype=np.float64).argmax(axis=1)]
+    oof_frame = oof_proba.copy()
+    oof_frame.insert(3, "y_pred", oof_pred)
     oof_frame = oof_frame[["ID", "fold", "y_true", "y_pred", *proba_cols]]
     oof_macro_f1 = macro_f1_with_labels(oof_frame["y_true"], oof_frame["y_pred"], classes)
 
-    test_frame = build_prediction_frame(test_ids, test_proba, classes)
+    # test 확률: spec §8.2 대로 `ID` + `p_{class}` 만 저장한다(`y_pred` 없음).
+    # 마찬가지로 저장될 값으로 정규화해 둔다 — submission 을 여기서 뽑아낼 때
+    # 저장된 test_predictions.csv 와 다른 값을 볼 위험이 없어야 한다.
+    test_frame = build_prediction_frame(test_ids, test_proba, classes)[["ID", *proba_cols]]
+    test_frame = _csv_round_trip(test_frame)
 
     # 저장 전에 자체 검증한다 — 문제가 있으면 파일을 남기지 않고 여기서 죽는다.
+    # 위에서 이미 저장될 값으로 정규화했으므로, 이 검증은 실제로 디스크에 쓰일
+    # 내용과 동일한 값을 보고 있다.
     validate_oof_frame(
         oof_frame,
         class_order=classes,
@@ -299,8 +337,17 @@ def main(argv: list[str] | None = None) -> dict:
 
     save_csv(oof_frame, paths["oof"])
     save_csv(test_frame, paths["test"])
+
+    # submission 은 저장한 test 확률(정규화된 `test_frame`)에서 별도로 생성한다.
+    # `write_submission` 이 `y_pred` 열을 요구하므로, 저장용 test_frame(순수
+    # ID+p_*)과는 별개의 내부 frame 을 만든다 — 저장 파일 스키마에 y_pred 를
+    # 다시 섞지 않기 위해서다.
+    submission_source = test_frame.copy()
+    submission_source["y_pred"] = classes[
+        test_frame[proba_cols].to_numpy(dtype=np.float64).argmax(axis=1)
+    ]
     submission_info = write_submission(
-        test_frame, data_dir / "sample_submission.csv", paths["submission"]
+        submission_source, data_dir / "sample_submission.csv", paths["submission"]
     )
 
     submission_frame = pd.read_csv(paths["submission"], dtype=str, encoding="utf-8-sig")

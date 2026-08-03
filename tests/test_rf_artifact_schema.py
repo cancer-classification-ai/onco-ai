@@ -41,9 +41,14 @@ def make_valid_oof() -> pd.DataFrame:
 
 
 def make_valid_test_proba() -> pd.DataFrame:
-    """`build_prediction_frame` 그대로 — `y_pred` 열이 함께 붙는다(팀 관례, spec §8)."""
+    """spec §8.2 스키마 — `ID` + `p_{class}` 만. `y_pred` 는 넣지 않는다.
+
+    `build_prediction_frame` 은 편의상 `y_pred` 를 항상 붙이지만, 저장용 test
+    확률 파일에는 그 열이 있으면 안 된다(`scripts/train_rf.py` 가 저장 전
+    잘라낸다) — 그래서 여기서도 드롭해 실제 저장될 스키마와 맞춘다.
+    """
     proba = _random_proba(len(TEST_IDS), len(CLASS_ORDER))
-    return build_prediction_frame(TEST_IDS, proba, CLASS_ORDER)
+    return build_prediction_frame(TEST_IDS, proba, CLASS_ORDER).drop(columns=["y_pred"])
 
 
 def make_valid_submission(test_proba: pd.DataFrame) -> pd.DataFrame:
@@ -152,6 +157,40 @@ def test_oof_y_pred_not_argmax_is_rejected():
         validate_oof_frame(frame, class_order=CLASS_ORDER, train_ids=TRAIN_IDS, n_splits=N_SPLITS)
 
 
+def test_oof_y_pred_5e7_below_max_is_rejected():
+    """예전에 있던 atol=1e-6 근접동점 허용을 되돌린다 — 이제는 정확히 일치해야 한다.
+
+    최댓값보다 5e-7 낮은(=예전 atol 1e-6 보다 작은 차이) 클래스를 골라도 지금은
+    반드시 실패해야 한다.
+    """
+    frame = make_valid_oof()
+    proba_cols = [f"p_{c}" for c in CLASS_ORDER]
+    custom = np.array([0.5 - 5e-7, 0.5, 5e-7, 0.0])
+    assert abs(custom.sum() - 1.0) < 1e-12
+    frame.loc[0, proba_cols] = custom
+    frame.loc[0, "y_pred"] = CLASS_ORDER[0]  # 진짜 최댓값(CLASS_ORDER[1])이 아니다
+    with pytest.raises(ValueError, match="argmax"):
+        validate_oof_frame(frame, class_order=CLASS_ORDER, train_ids=TRAIN_IDS, n_splits=N_SPLITS)
+
+
+def test_oof_exact_tie_must_pick_first_canonical_class():
+    """정확한 동점에서는 `np.argmax` 규칙대로 canonical 순서상 첫 클래스만 유효하다."""
+    frame = make_valid_oof()
+    proba_cols = [f"p_{c}" for c in CLASS_ORDER]
+    frame.loc[0, proba_cols] = [0.5, 0.5, 0.0, 0.0]  # CLASS_ORDER[0]/[1] 정확한 동점
+    frame.loc[0, "y_pred"] = CLASS_ORDER[1]  # 동점의 두 번째 클래스 — np.argmax 규칙 위반
+    with pytest.raises(ValueError, match="argmax"):
+        validate_oof_frame(frame, class_order=CLASS_ORDER, train_ids=TRAIN_IDS, n_splits=N_SPLITS)
+
+
+def test_oof_exact_tie_picking_first_canonical_class_passes():
+    frame = make_valid_oof()
+    proba_cols = [f"p_{c}" for c in CLASS_ORDER]
+    frame.loc[0, proba_cols] = [0.5, 0.5, 0.0, 0.0]
+    frame.loc[0, "y_pred"] = CLASS_ORDER[0]  # 동점의 첫 클래스 — np.argmax 규칙과 일치
+    validate_oof_frame(frame, class_order=CLASS_ORDER, train_ids=TRAIN_IDS, n_splits=N_SPLITS)
+
+
 def test_oof_unexpected_label_is_rejected():
     frame = make_valid_oof()
     frame.loc[0, "y_true"] = "NOT_CANONICAL"
@@ -196,13 +235,28 @@ def test_valid_test_probability_frame_passes():
     )
 
 
-def test_test_probability_frame_with_extra_y_pred_column_still_passes():
-    """`build_prediction_frame` 재사용 시 붙는 `y_pred` 열은 위반이 아니다(팀 관례, spec §8.2)."""
+def test_test_probability_frame_with_y_pred_column_is_rejected():
+    """spec §8.2 스키마는 `ID` + `p_{class}` 뿐이다 — `y_pred` 가 섞이면 실패해야 한다.
+
+    `build_prediction_frame` 을 그대로 쓰면 `y_pred` 가 편의상 따라오는데,
+    저장 전에 잘라내지 않으면 스키마가 어긋난다. index/Unnamed 열도 같은
+    이유로 실패해야 한다(§9.2).
+    """
     frame = make_valid_test_proba()
-    assert "y_pred" in frame.columns
-    validate_test_probability_frame(
-        frame, class_order=CLASS_ORDER, sample_submission_ids=TEST_IDS
-    )
+    frame["y_pred"] = CLASS_ORDER[0]
+    with pytest.raises(ValueError, match="예상 밖 컬럼"):
+        validate_test_probability_frame(
+            frame, class_order=CLASS_ORDER, sample_submission_ids=TEST_IDS
+        )
+
+
+def test_test_probability_frame_with_unnamed_index_column_is_rejected():
+    frame = make_valid_test_proba()
+    frame["Unnamed: 0"] = range(len(frame))
+    with pytest.raises(ValueError, match="예상 밖 컬럼"):
+        validate_test_probability_frame(
+            frame, class_order=CLASS_ORDER, sample_submission_ids=TEST_IDS
+        )
 
 
 def test_test_probability_wrong_order_is_rejected():
@@ -279,6 +333,22 @@ def test_submission_mismatched_argmax_is_rejected():
     submission = make_valid_submission(test_proba)
     other = [c for c in CLASS_ORDER if c != submission.loc[0, "SUBCLASS"]][0]
     submission.loc[0, "SUBCLASS"] = other
+    with pytest.raises(ValueError, match="argmax"):
+        validate_submission_frame(
+            submission,
+            class_order=CLASS_ORDER,
+            sample_submission_ids=TEST_IDS,
+            test_proba_frame=test_proba,
+        )
+
+
+def test_submission_5e7_below_max_is_rejected():
+    """OOF 와 동일한 엄격성 — submission 쪽 argmax 교차검증도 근접동점을 허용하지 않는다."""
+    test_proba = make_valid_test_proba()
+    proba_cols = [f"p_{c}" for c in CLASS_ORDER]
+    test_proba.loc[0, proba_cols] = [0.5 - 5e-7, 0.5, 5e-7, 0.0]
+    submission = make_valid_submission(test_proba)
+    submission.loc[0, "SUBCLASS"] = CLASS_ORDER[0]  # 진짜 최댓값(CLASS_ORDER[1])이 아니다
     with pytest.raises(ValueError, match="argmax"):
         validate_submission_frame(
             submission,

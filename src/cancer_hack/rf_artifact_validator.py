@@ -69,18 +69,20 @@ def _check_ids_no_dup_no_missing(ids: pd.Series, expected: Sequence[str], *, lab
     return ids
 
 
-def _argmax_mismatch(proba: np.ndarray, chosen_index: np.ndarray, *, atol: float) -> np.ndarray:
-    """`chosen_index` 가 각 행의 최댓값과 `atol` 이내인지(=동점 포함 유효한 argmax인지).
+def _canonical_argmax_labels(proba: np.ndarray, class_order: Sequence[str]) -> np.ndarray:
+    """행별 canonical `np.argmax` 라벨. 정확한 동점은 `class_order` 에서 먼저
+    나오는 클래스를 고른다(`np.argmax` 자체의 규칙 — 최댓값의 첫 위치를 돌려준다).
 
-    CSV round-trip 이 마지막 몇 ULP 를 깎아 실제로는 동점이던 두 확률이 원본에서는
-    미세하게 갈렸을 수 있다(실측: `pandas.to_csv` 기본 포맷팅이 완전한 왕복을
-    보장하지 않는다). 정확히 `argmax` 인덱스 하나만 정답으로 인정하면 이런 근접
-    동점에서 재현 불가능한 오탐이 난다 — 그래서 최댓값과 `atol` 이내인 클래스는
-    전부 유효한 argmax 로 받아들인다.
+    y_pred/SUBCLASS 판정은 **항상 이 값과 정확히 일치**해야 한다. 근접 동점을
+    허용하는 오차범위(atol)는 여기 없다 — 오차범위를 두면 "최댓값에 가깝지만
+    아닌" 클래스가 조용히 통과한다. 대신 CSV round-trip 으로 인한 부동소수점
+    오차 문제(`pandas.to_csv` 기본 포맷팅이 float64 완전 왕복을 보장하지
+    않음 — 실측됨)는 **저장·재읽은 값을 기준으로 y_pred/SUBCLASS 를 계산**하는
+    방식으로 `scripts/train_rf.py` 쪽에서 해결한다. 즉, 이 함수가 보는 `proba`
+    는 이미 최종적으로 저장될(또는 저장된) 값이어야 한다.
     """
-    row_max = proba.max(axis=1)
-    chosen = proba[np.arange(len(proba)), chosen_index]
-    return (row_max - chosen) > atol
+    classes = np.asarray([str(c) for c in class_order])
+    return classes[proba.argmax(axis=1)]
 
 
 def _check_probabilities(frame: pd.DataFrame, columns: Sequence[str], *, label: str) -> np.ndarray:
@@ -111,7 +113,10 @@ def validate_oof_frame(
 
     `group_key_by_id` 를 주면 동일 그룹의 fold 교차를 함께 검사한다(선택).
     `expected_macro_f1` 을 주면 저장된 값과 독립 재계산 결과를 `atol` 이내로
-    비교한다(§9.2 "저장된 Macro F1이 재계산한 값과 일치").
+    비교한다(§9.2 "저장된 Macro F1이 재계산한 값과 일치") — `atol` 은 **이
+    Macro F1 비교에만** 쓰인다. `y_pred` 가 `p_{class}` 의 canonical
+    `np.argmax` 와 일치하는지는 오차범위 없이 정확히 비교한다(근접 동점을
+    허용하면 "최댓값에 가깝지만 아닌" 클래스가 조용히 통과한다).
     """
     label = "OOF"
     proba_columns = probability_columns(class_order)
@@ -140,9 +145,8 @@ def validate_oof_frame(
 
     proba = _check_probabilities(frame, proba_columns, label=label)
 
-    class_index = {str(c): i for i, c in enumerate(class_order)}
-    chosen = np.array([class_index[v] for v in frame["y_pred"].astype(str)])
-    mismatched = _argmax_mismatch(proba, chosen, atol=atol)
+    argmax_pred = _canonical_argmax_labels(proba, class_order)
+    mismatched = frame["y_pred"].astype(str).to_numpy() != argmax_pred
     if mismatched.any():
         raise ValueError(f"{label} y_pred 가 argmax 와 다른 행 {int(mismatched.sum())}개")
 
@@ -179,17 +183,19 @@ def validate_test_probability_frame(
     class_order: Sequence[str],
     sample_submission_ids: Sequence[str],
 ) -> None:
-    """spec §9.2 test 확률 계약(`ID, p_{class}*len(class_order)`, sample_submission 순서).
+    """spec §9.2 test 확률 계약 — 컬럼이 정확히 `ID` + `p_{class}*len(class_order)`.
 
-    `build_prediction_frame` 을 그대로 재사용하면(spec §8) `y_pred` 열이 함께
-    따라온다 — 기존 `train_gbdt.py` 의 test_predictions 산출물도 이미 그렇다.
-    그래서 필수 열의 **존재**만 확인하고 컬럼 집합을 정확히 맞추라고 요구하지
-    않는다("정확히 ID,SUBCLASS" 제약은 submission 에만 있다, spec §9.2).
+    `build_prediction_frame` 을 그대로 쓰면 `y_pred` 열이 따라오는데, 저장용
+    test 확률 파일에는 spec §8.2 스키마대로 `y_pred` 를 넣지 않는다
+    (`scripts/train_rf.py` 가 저장 전 `["ID", *p_columns]` 로 잘라낸다).
+    그래서 이 validator 는 `y_pred`/index/`Unnamed` 등 예상 밖 컬럼이 하나라도
+    섞이면 실패한다 — 있으면 저장 경로가 스키마를 어긴 것이다.
     """
     label = "test probability"
     proba_columns = probability_columns(class_order)
     required = ["ID", *proba_columns]
     _require_columns(frame, required, label=label)
+    _reject_extra_columns(frame, required, label=label)
 
     expected = [str(i) for i in sample_submission_ids]
     ids = _check_ids_no_dup_no_missing(frame["ID"], expected, label=label)
@@ -206,9 +212,14 @@ def validate_submission_frame(
     class_order: Sequence[str],
     sample_submission_ids: Sequence[str],
     test_proba_frame: pd.DataFrame | None = None,
-    atol: float = 1e-6,
 ) -> None:
-    """spec §9.2 submission 계약(`ID,SUBCLASS` 정확히, canonical 클래스, argmax 일치)."""
+    """spec §9.2 submission 계약(`ID,SUBCLASS` 정확히, canonical 클래스, argmax 일치).
+
+    `test_proba_frame` 을 주면 SUBCLASS 가 그 확률의 canonical `np.argmax` 와
+    **정확히** 일치하는지 검사한다(오차범위 없음, `_canonical_argmax_labels`
+    참고). `test_proba_frame` 은 실제로 저장·재읽은 test 확률이어야 한다 —
+    저장 전 메모리 값과 비교하면 CSV round-trip 부동소수점 오차로 오탐이 난다.
+    """
     label = "submission"
     if list(frame.columns) != ["ID", "SUBCLASS"]:
         raise ValueError(
@@ -234,17 +245,13 @@ def validate_submission_frame(
         proba_columns = probability_columns(class_order)
         proba_ids = test_proba_frame["ID"].astype(str).tolist()
         proba = test_proba_frame[proba_columns].to_numpy(dtype=np.float64)
-        proba_by_id = dict(zip(proba_ids, proba))
-        class_index = {str(c): i for i, c in enumerate(class_order)}
+        argmax_by_id = dict(zip(proba_ids, _canonical_argmax_labels(proba, class_order)))
 
-        mismatched = []
-        for id_, label_value in zip(ids.tolist(), subclass.tolist()):
-            row = proba_by_id.get(id_)
-            if row is None:
-                mismatched.append(id_)
-                continue
-            if _argmax_mismatch(row[None, :], np.array([class_index[label_value]]), atol=atol)[0]:
-                mismatched.append(id_)
+        mismatched = [
+            id_
+            for id_, label_value in zip(ids.tolist(), subclass.tolist())
+            if argmax_by_id.get(id_) != label_value
+        ]
         if mismatched:
             raise ValueError(
                 f"{label} SUBCLASS 가 test probability argmax 와 다른 ID {len(mismatched)}개 "
