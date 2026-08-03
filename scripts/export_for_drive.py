@@ -213,7 +213,14 @@ def main() -> None:
     metrics = build_metrics(oof, mapping, source_log)
 
     score = metrics["oof_macro_f1"]
-    folder = args.out / f"{args.version}_seed{args.seed}_{args.config}_macroF1_{score:.4f}"
+    # 폴더 이름에 분할을 박는다. 같은 모델·같은 피처라도 skf 와 sgkf 는 점수가
+    # 0.01~0.02 벌어져서, 이름에 없으면 나중에 둘을 나란히 놓고 "왜 다르지" 하게 된다.
+    # 스태킹은 같은 분할끼리만 섞어야 하므로 눈으로 걸러낼 수 있어야 한다.
+    cv_slug = {"fold_skf5": "skf5", "fold_group5": "group5"}.get(fold_column, fold_column)
+    folder = (
+        args.out
+        / f"{args.version}_seed{args.seed}_{args.config}_{cv_slug}_macroF1_{score:.4f}"
+    )
     if folder.exists() and not args.overwrite:
         raise SystemExit(f"{folder} 가 이미 있다. 버전을 올리거나 --overwrite 를 준다")
     folder.mkdir(parents=True, exist_ok=True)
