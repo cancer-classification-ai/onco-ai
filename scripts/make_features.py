@@ -8,6 +8,7 @@
     python scripts/make_features.py sample --split train --overwrite
     python scripts/make_features.py sample --split test  --overwrite
     python scripts/make_features.py tokens --split train --overwrite
+    python scripts/make_features.py sigtokens --split train --overwrite
     python scripts/make_features.py gene   --split train --kind mutated --overwrite
 
 `sample` 이 복합 변이 처리 전략의 산출물이다. train/test 를 **따로** 돌린다 —
@@ -34,6 +35,11 @@ from cancer_hack.features_basic import (  # noqa: E402
     make_gene_event_count_matrix,
     make_gene_mutated_matrix,
     make_sample_mutation_features,
+    make_unique_mutation_token_parquet,
+)
+from cancer_hack.features_domain import (  # noqa: E402
+    ALL_DOMAIN_PREFIXES,
+    make_domain_features,
 )
 
 RAW_DIR = PROJECT_ROOT / "data/raw"
@@ -115,6 +121,37 @@ def cmd_gene(args: argparse.Namespace) -> dict[str, object]:
     }
 
 
+def cmd_domain(args: argparse.Namespace) -> dict[str, object]:
+    """도메인 지식 블록 — 드라이버·TMB·유형조성·치환쌍·코돈 역추론.
+
+    `_load_split` 을 쓰지 않는다. 4,386열을 pandas 로 올리면 메모리가 아까워서
+    `make_domain_features` 가 `csv.reader` 로 직접 흘려 읽는다.
+    """
+    output = _resolve_output(args.output, f"{args.split}_domain_features.parquet")
+    _guard_existing(output, args.overwrite)
+
+    source = args.input if args.input is not None else RAW_DIR / f"{args.split}.csv"
+    if not source.exists():
+        raise FileNotFoundError(
+            f"{source} 가 없다. 원본 csv 는 git 에 없으니 data/raw 에 먼저 놓는다."
+        )
+    features = make_domain_features(source, has_label=(args.split == "train"))
+
+    # `"A2_TP53_lof".startswith("A_")` 는 False 라 접두사끼리 겹치지 않는다.
+    blocks = {
+        prefix: sum(c.startswith(prefix) for c in features.columns)
+        for prefix in ALL_DOMAIN_PREFIXES
+    }
+
+    _write_parquet(features, output)
+    return {
+        "output_path": str(output),
+        "sample_count": len(features),
+        "column_count": len(features.columns),
+        "blocks": blocks,
+    }
+
+
 def cmd_tokens(args: argparse.Namespace) -> dict[str, object]:
     """Exact Mutation Token 문서 — 셀 안의 변이를 토큰별로 나눠 적는다."""
     output = _resolve_output(
@@ -122,6 +159,17 @@ def cmd_tokens(args: argparse.Namespace) -> dict[str, object]:
     )
     source = args.input if args.input is not None else RAW_DIR / f"{args.split}.csv"
     return make_exact_mutation_token_parquet(
+        source, output, overwrite=args.overwrite
+    )
+
+
+def cmd_sigtokens(args: argparse.Namespace) -> dict[str, object]:
+    """서명 문서 — 잔기 번호를 지워 이소폼 중복을 접은 TF-IDF 입력."""
+    output = _resolve_output(
+        args.output, f"{args.split}_signature_mutation_tokens.parquet"
+    )
+    source = args.input if args.input is not None else RAW_DIR / f"{args.split}.csv"
+    return make_unique_mutation_token_parquet(
         source, output, overwrite=args.overwrite
     )
 
@@ -153,9 +201,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_gene.add_argument("--kind", choices=["mutated", "event_count"], default="mutated")
     p_gene.set_defaults(func=cmd_gene)
 
+    p_domain = sub.add_parser("domain", help="도메인 지식 블록 (A/A2/B/C/D/M/N)")
+    add_common(p_domain)
+    p_domain.set_defaults(func=cmd_domain)
+
     p_tokens = sub.add_parser("tokens", help="Exact Mutation Token 문서")
     add_common(p_tokens)
     p_tokens.set_defaults(func=cmd_tokens)
+
+    p_sigtokens = sub.add_parser("sigtokens", help="서명(위치 무시) 변이 문서")
+    add_common(p_sigtokens)
+    p_sigtokens.set_defaults(func=cmd_sigtokens)
 
     return parser
 
