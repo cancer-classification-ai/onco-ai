@@ -59,7 +59,8 @@ test 에 40토큰뿐이다. 즉 문자열 포함 정의로 가면 train 2.94% / 
 
 from __future__ import annotations
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+import math
 
 import pandas as pd
 import re
@@ -357,3 +358,201 @@ def _row_token_class_counts(row: pd.Series, gene_columns: list[str]) -> Counter:
         for token in _parse_mutation_tokens(row[gene]):
             counts[_classify_token(token)] += 1
     return counts
+
+
+# ---------------------------------------------------------------------------
+# 변이 문자열 구조 피처 (정규표현식 전용 — 외부 어노테이션 없음)
+# ---------------------------------------------------------------------------
+# 토큰 시작의 아미노산 문자 (대문자 한 글자, 예: R132H → R)
+_STR_REF_AA_RE = re.compile(r"^([A-Z])")
+# 마지막 대문자 한 글자 또는 * (예: R132H → H, Q369* → *, Q369X → X)
+_STR_ALT_AA_RE = re.compile(r"([A-Z*X])$")
+# 연속된 숫자 구간 전부 (위치 추출 및 개수 계산에 사용)
+_STR_NUMS_RE = re.compile(r"\d+")
+# 정지코돈 표기: train *  / test X
+_STR_STOP_RE = re.compile(r"[*X]")
+# 프레임시프트
+_STR_FS_RE = re.compile(r"fs", re.IGNORECASE)
+# 결실·삽입 (delins 포함)
+_STR_DEL_INS_RE = re.compile(r"del|ins", re.IGNORECASE)
+
+
+@dataclass(slots=True)
+class TokenStringFeatures:
+    """단일 변이 토큰에서 정규표현식으로 추출한 문자열 구조 피처 9종.
+
+    ref_aa / alt_aa 가 빈 문자열인 경우는 패턴에서 알파벳을 추출하지 못한 것
+    (예: frameshift `R132fs` 의 alt_aa, 복합 범위 표기의 ref_aa 등).
+    position 이 -1 이면 토큰에 숫자가 없다는 의미다.
+    """
+
+    ref_aa: str          # 원래 아미노산 문자 (없으면 "")
+    alt_aa: str          # 변경 아미노산 또는 정지코돈 기호 (없으면 "")
+    position: int        # 첫 번째 숫자 구간 값 (-1 = 없음)
+    log_position: float  # log1p(position), position == -1 이면 0.0
+    has_stop: int        # * 또는 X 포함 여부 (0/1)
+    has_frameshift: int  # fs 포함 여부 (0/1)
+    has_deletion_insertion: int  # del 또는 ins 포함 여부 (0/1)
+    mutation_string_length: int  # 토큰 문자열 길이
+    numeric_token_count: int     # 토큰 내 숫자 연속 구간 수
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def extract_token_string_features(token: str) -> TokenStringFeatures:
+    """변이 토큰 하나에서 9개 문자열 구조 피처를 추출한다.
+
+    외부 어노테이션 없이 정규표현식만으로 분해한다.
+
+    >>> f = extract_token_string_features("R132H")
+    >>> f.ref_aa, f.position, f.alt_aa
+    ('R', 132, 'H')
+    >>> f.has_stop
+    0
+    >>> extract_token_string_features("Q369*").has_stop
+    1
+    >>> extract_token_string_features("Q369X").has_stop
+    1
+    >>> extract_token_string_features("R132fs").has_frameshift
+    1
+    >>> extract_token_string_features("E746_A750del").has_deletion_insertion
+    1
+    >>> extract_token_string_features("R132H").numeric_token_count
+    1
+    """
+    ref_m = _STR_REF_AA_RE.match(token)
+    ref_aa = ref_m.group(1) if ref_m else ""
+
+    alt_m = _STR_ALT_AA_RE.search(token)
+    alt_aa = alt_m.group(1) if alt_m else ""
+
+    numbers = _STR_NUMS_RE.findall(token)
+    position = int(numbers[0]) if numbers else -1
+    log_position = math.log1p(position) if position >= 0 else 0.0
+
+    return TokenStringFeatures(
+        ref_aa=ref_aa,
+        alt_aa=alt_aa,
+        position=position,
+        log_position=log_position,
+        has_stop=int(bool(_STR_STOP_RE.search(token))),
+        has_frameshift=int(bool(_STR_FS_RE.search(token))),
+        has_deletion_insertion=int(bool(_STR_DEL_INS_RE.search(token))),
+        mutation_string_length=len(token),
+        numeric_token_count=len(numbers),
+    )
+
+
+@dataclass(slots=True)
+class CellStringFeatures:
+    """셀 값(복수 토큰 가능)에서 추출한 변이 문자열 구조 피처 11종.
+
+    피처 1-4 (ref_aa, alt_aa, position, log_position) 는 셀의 **첫 번째** 토큰 기준.
+    WT·결측 셀은 모든 필드가 기본값(0 / "" / -1)으로 채워진다.
+    피처 11 (변이 형식별 count) 은 각 유형별 필드로 펼쳐 제공한다.
+    """
+
+    # 피처 1 — 시작 아미노산 문자
+    ref_aa: str
+    # 피처 2 — 종료 아미노산 문자
+    alt_aa: str
+    # 피처 3 — 변이 위치 (-1 = 없음)
+    position: int
+    # 피처 4 — 위치의 로그 변환값
+    log_position: float
+    # 피처 5 — 동일 위치 반복 여부 (셀 내 토큰들 사이에서)
+    has_repeated_position: int
+    # 피처 6 — stop(*, X) 표기 포함 여부
+    has_stop: int
+    # 피처 7 — frameshift(fs) 표기 포함 여부
+    has_frameshift: int
+    # 피처 8 — deletion·insertion(del, ins) 형식 여부
+    has_deletion_insertion: int
+    # 피처 9 — 변이 문자열 길이 (모든 토큰 길이 합)
+    mutation_string_length: int
+    # 피처 10 — 숫자 token 개수 (모든 토큰의 숫자 구간 수 합)
+    numeric_token_count: int
+    # 피처 11 — 변이 형식별 count (유형별로 펼침)
+    missense_count: int = 0
+    synonymous_count: int = 0
+    nonsense_count: int = 0
+    frameshift_count: int = 0
+    deletion_count: int = 0
+    insertion_count: int = 0
+    delins_count: int = 0
+    complex_count: int = 0
+    other_count: int = 0
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def extract_cell_string_features(value: object) -> CellStringFeatures:
+    """셀 값 하나에서 11종 변이 문자열 구조 피처를 추출한다.
+
+    정규표현식으로만 분해하며 외부 어노테이션을 사용하지 않는다.
+    WT·결측이면 모든 피처가 기본값으로 반환된다.
+
+    >>> f = extract_cell_string_features("R132H")
+    >>> f.ref_aa, f.position, f.alt_aa
+    ('R', 132, 'H')
+    >>> round(f.log_position, 4)
+    4.8903
+    >>> extract_cell_string_features("V600E V600K").has_repeated_position
+    1
+    >>> extract_cell_string_features("R132H G827R").has_repeated_position
+    0
+    >>> extract_cell_string_features("Q369* I368N").has_stop
+    1
+    >>> extract_cell_string_features("R132fs").has_frameshift
+    1
+    >>> extract_cell_string_features("WT").position
+    -1
+    >>> extract_cell_string_features("R132H").missense_count
+    1
+    >>> extract_cell_string_features("Q369* I368N").nonsense_count
+    1
+    """
+    tokens = split_tokens(value)
+
+    if not tokens:
+        return CellStringFeatures(
+            ref_aa="", alt_aa="", position=-1, log_position=0.0,
+            has_repeated_position=0, has_stop=0, has_frameshift=0,
+            has_deletion_insertion=0, mutation_string_length=0, numeric_token_count=0,
+        )
+
+    tok_feats = [extract_token_string_features(t) for t in tokens]
+    first = tok_feats[0]
+
+    # 피처 5: 셀 안 토큰들 중 동일한 위치 숫자가 2회 이상 등장하는지 확인
+    positions = [f.position for f in tok_feats if f.position >= 0]
+    has_repeated_position = int(len(positions) > len(set(positions)))
+
+    # 피처 11: 유형별 count — 기존 classify_token 활용
+    type_counts: dict[str, int] = {k: 0 for k in ALL_KINDS}
+    for token in tokens:
+        type_counts[classify_token(token)] += 1
+
+    return CellStringFeatures(
+        ref_aa=first.ref_aa,
+        alt_aa=first.alt_aa,
+        position=first.position,
+        log_position=first.log_position,
+        has_repeated_position=has_repeated_position,
+        has_stop=int(any(f.has_stop for f in tok_feats)),
+        has_frameshift=int(any(f.has_frameshift for f in tok_feats)),
+        has_deletion_insertion=int(any(f.has_deletion_insertion for f in tok_feats)),
+        mutation_string_length=sum(f.mutation_string_length for f in tok_feats),
+        numeric_token_count=sum(f.numeric_token_count for f in tok_feats),
+        missense_count=type_counts[MISSENSE],
+        synonymous_count=type_counts[SYNONYMOUS],
+        nonsense_count=type_counts[NONSENSE],
+        frameshift_count=type_counts[FRAMESHIFT],
+        deletion_count=type_counts[DELETION],
+        insertion_count=type_counts[INSERTION],
+        delins_count=type_counts[DELINS],
+        complex_count=type_counts[COMPLEX],
+        other_count=type_counts[OTHER],
+    )
