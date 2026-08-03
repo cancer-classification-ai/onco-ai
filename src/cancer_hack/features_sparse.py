@@ -20,7 +20,9 @@ B 전략은 변이를 구성 요소로 분해해 train에서 학습한 부분 �
     GENE_PARSE_FAILED__BRAF
 
 생성된 토큰 문서(공백 구분 문자열)는 ParsedTokenHasher 로 희소행렬로 변환한다.
-HashingVectorizer 기반이라 어휘를 저장하지 않으므로 fold-safe 하다.
+CountVectorizer 를 train fold 에만 fit 하므로 어휘는 train에서만 결정되어
+fold-safe 하다. 어휘가 보존되므로 get_feature_names_out() 으로 피처 이름을
+확인할 수 있어 중요도 분석이 가능하다.
 
 공개 API
 --------
@@ -28,14 +30,16 @@ HashingVectorizer 기반이라 어휘를 저장하지 않으므로 fold-safe 하
     build_token_list(gene, mutation_token, position_bin_size)  → list[str]
     row_to_parsed_token_document(row, gene_columns, position_bin_size) → str
     build_parsed_token_documents(df, gene_columns, *, position_bin_size) → pd.Series
-    ParsedTokenHasher                         — HashingVectorizer 래퍼
+    ParsedTokenHasher                         — CountVectorizer 래퍼
 """
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import scipy.sparse as sp
-from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.preprocessing import normalize
 
 from .parser import (
     classify_token,
@@ -171,16 +175,17 @@ def build_parsed_token_documents(
 
 
 class ParsedTokenHasher:
-    """파싱 토큰 문서를 희소행렬로 변환한다 (stateless — fit 없음, fold-safe).
+    """파싱 토큰 문서를 희소행렬로 변환한다 (train fold에만 fit — fold-safe).
 
-    HashingVectorizer 를 사용하므로 어휘를 저장하지 않는다. train / valid / test
-    구분 없이 동일 객체로 transform 하면 된다.
+    CountVectorizer 를 train fold 에만 fit 해 어휘를 확정한다. valid / test 에는
+    transform 만 적용하므로 데이터 누수 없이 fold-safe 하다. 어휘가 보존되므로
+    get_feature_names_out() 으로 피처 이름을 조회할 수 있다.
 
     Parameters
     ----------
-    n_features : int
-        해시 공간 크기. 2 의 거듭제곱 권장. 기본 2^18(=262144).
-        충돌이 우려되면 2^20 이상으로 늘린다.
+    min_df : int or float
+        최소 문서 빈도. 기본 1 (모든 토큰 유지).
+        노이즈 토큰을 제거하려면 2 이상으로 올린다.
     ngram_range : tuple[int, int]
         word n-gram 범위. 기본 (1, 1) — 단일 토큰.
         (1, 2) 로 바꾸면 인접 토큰 쌍도 피처로 추가된다.
@@ -191,34 +196,45 @@ class ParsedTokenHasher:
     --------
     >>> import pandas as pd
     >>> docs = pd.Series(["GENE__BRAF TYPE__MISSENSE", "GENE__TP53 TYPE__NONSENSE"])
-    >>> mat = ParsedTokenHasher().transform(docs)
+    >>> hasher = ParsedTokenHasher()
+    >>> mat = hasher.fit_transform(docs)
     >>> mat.shape[0]
     2
+    >>> "GENE__BRAF" in hasher.get_feature_names_out()
+    True
     """
 
     def __init__(
         self,
         *,
-        n_features: int = 2 ** 18,
+        min_df: int | float = 1,
         ngram_range: tuple[int, int] = (1, 1),
         norm: str | None = None,
     ) -> None:
-        self._vec = HashingVectorizer(
+        self._vec = CountVectorizer(
             analyzer="word",
-            n_features=n_features,
+            lowercase=False,
+            min_df=min_df,
             ngram_range=ngram_range,
-            norm=norm,
-            alternate_sign=False,  # 음수 카운트 방지 — 양수 TF 만 의미 있음
         )
+        self._norm = norm
 
     def fit(self, documents: pd.Series) -> "ParsedTokenHasher":
-        """no-op — HashingVectorizer 는 fit 이 필요 없다."""
+        """train fold 문서로 어휘를 구축한다."""
+        self._vec.fit(documents)
         return self
 
     def transform(self, documents: pd.Series) -> sp.csr_matrix:
         """문서 Series 를 희소행렬(n_samples × n_features)로 변환한다."""
-        return self._vec.transform(documents)
+        mat = self._vec.transform(documents)
+        if self._norm is not None:
+            mat = normalize(mat, norm=self._norm)
+        return mat
 
     def fit_transform(self, documents: pd.Series) -> sp.csr_matrix:
         """fit(documents).transform(documents) 의 편의 함수."""
-        return self.transform(documents)
+        return self.fit(documents).transform(documents)
+
+    def get_feature_names_out(self) -> np.ndarray:
+        """학습된 피처 이름 배열을 반환한다."""
+        return self._vec.get_feature_names_out()
