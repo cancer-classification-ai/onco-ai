@@ -73,24 +73,6 @@ MODULE_VALUES = ("share", "enrich", "wshare", "any", "logcount", "fraction", "wb
 #: 대조군 값 방식 — 위 docstring 의 배율 표 참고. `train_gbdt.py` 가 로그 경고에 쓴다.
 SHIFT_EXPOSED_VALUES = ("any", "logcount", "fraction", "wburden")
 
-LATENT_DEFAULTS: dict[str, object] = {
-    "method": "svd",
-    "n_components": 64,
-    "mode": "mutated",
-    "row_norm": "l2",
-    "gene_weight": "none",
-    "min_gene_support": 5,
-    "random_state": 0,
-}
-
-MODULE_DEFAULTS: dict[str, object] = {
-    "n_modules": 24,
-    "svd_components": 64,
-    "mode": "mutated",
-    "min_gene_support": 5,
-    "random_state": 0,
-}
-
 
 # ------------------------------------------------------------------ 공통 유틸
 def _binarize(matrix: np.ndarray, mode: str) -> sparse.csr_matrix:
@@ -161,8 +143,8 @@ def aggregate_by_membership(
     """유전자 그룹별 집계 — 7가지 값 방식의 **단일 구현**.
 
     `membership` 은 `(n_genes_total, n_groups)` 0/1 희소 행렬이다. 하드 모듈은 행마다
-    1이 하나뿐인 분할이고, pathway 는 한 유전자가 여러 그룹에 속할 수 있어 행에 1이
-    여럿이다 — 집계 식은 둘이 같으므로 여기 한 번만 쓴다.
+    1이 하나뿐인 분할이고, `features_signature` 의 클래스 서명은 한 유전자가 여러
+    클래스에 들어갈 수 있어 행에 1이 여럿이다 — 집계 식은 둘이 같으므로 여기 한 번만 쓴다.
 
     `share`/`enrich`/`wshare` 의 분모는 **행 전체의 변이 유전자 수**다(그룹 안쪽이
     아니라). 그래야 test 에서 유전자가 균일하게 퍼질 때 분자와 분모가 같이 부푼다.

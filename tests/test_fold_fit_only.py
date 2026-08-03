@@ -26,7 +26,6 @@ from cancer_hack.features_graph import (
     select_comutation_pairs,
     transform_comutation_pairs,
 )
-from cancer_hack.features_domain import DRIVERS
 from cancer_hack.features_latent import (
     MODULE_VALUES,
     build_fold_latent_block,
@@ -36,7 +35,11 @@ from cancer_hack.features_latent import (
     transform_gene_modules,
     transform_latent_basis,
 )
-from cancer_hack.features_pathway import PATHWAYS, build_fold_pathway_block
+from cancer_hack.features_signature import (
+    build_fold_signature_block,
+    select_class_signatures,
+    transform_class_signatures,
+)
 from cancer_hack.features_sparse import MutationTfidfBlock, build_fold_tfidf_block
 from cancer_hack.validation import Chi2TopKSelector
 
@@ -429,7 +432,7 @@ def test_comutation_width_never_exceeds_topk():
     assert len(pairs.names) <= 2
 
 
-# --- 유전자 모듈 (잠재 · 하드 · pathway) ------------------------------------
+# --- 유전자 모듈 (잠재 · 하드) ----------------------------------------------
 # 유전자 8개, 12행. 행 0-7 이 train_index, 8-11 은 valid 전용이다. GG&GH 는 valid
 # 행에서만 함께 켜진다 — fold-train 만 보는 fit 은 그 축을 절대 못 배워야 한다.
 # 행 8 은 GA/GB 도 같이 켜 둔다(comut 픽스처와 같은 이유). 안 그러면 valid 행의 변이가
@@ -662,29 +665,177 @@ def test_module_value_modes_emit_expected_names():
         assert np.isfinite(train_out).all()
 
 
-def test_pathway_genes_all_live_inside_drivers():
-    """규정 근거가 'DRIVERS 안에서만 묶는다' 이므로 그 경계를 테스트로도 지킨다.
+# --- 클래스 서명 (지도) ------------------------------------------------------
+# 위 모듈 픽스처를 그대로 쓴다. fold-train(행 0-7)에는 X·Y 두 클래스만 있고 Z 는
+# valid 전용이다. 클래스별 변이율은 이렇게 갈린다:
+#
+#     GA·GB  X 3/3, Y 0/5    GD·GE  Y 3/5, X 0/3    GF  Y 2/5, X 0/3
+#     GC     X 1/3, Y 2/5 (대비가 거의 없다)        GG·GH  valid 행에만
+#
+# 행 2 는 변이 유전자가 3개로 fold-train 상위 분위라 과변이로 잡힌다 — GC 의 X 쪽
+# 변이는 그 한 행이 전부라 과변이 가드에 걸린다.
+_SIG_KWARGS = dict(gene_names=_MOD_GENES, min_class_support=2, min_lift=0.3)
 
-    `features_pathway._validate_membership` 이 import 시점에 이미 막지만, 그 검사
-    자체가 지워지는 걸 막는 이중 방어다. compliance/PATHWAY_SOURCE.md 참고.
+
+def test_signature_selection_takes_no_test_matrix():
+    """지도 블록이라도 test 를 안 받는 계약은 같다."""
+    parameters = inspect.signature(select_class_signatures).parameters
+    assert not [p for p in parameters if "test" in p.lower()]
+
+
+def test_signature_selection_requires_a_label_argument():
+    """비지도 블록과 반대 방향의 계약이다 — 여기서는 `y` 가 **필수 인자**여야 한다.
+
+    `fit_latent_basis`·`fit_gene_modules` 는 `y` 를 아예 안 받는 것이 계약이고
+    (`test_fit_functions_take_no_label_argument`), 이 블록은 라벨을 본다는 사실이
+    시그니처에 드러나야 한다. 지도/비지도가 같은 파일에 섞이면 그 구분이 흐려진다.
     """
-    known = set(DRIVERS)
-    for name, genes in PATHWAYS.items():
-        assert set(genes) <= known, f"{name} 에 DRIVERS 밖 유전자: {set(genes) - known}"
+    parameters = inspect.signature(select_class_signatures).parameters
+    assert "y_train_fold" in parameters
+    assert parameters["y_train_fold"].default is inspect.Parameter.empty
 
 
-def test_pathway_block_is_row_independent():
-    genes = list(DRIVERS)
-    rng = np.random.default_rng(0)
-    matrix = (rng.random((12, len(genes))) < 0.2).astype(np.float32)
-    names, train_out, _, _ = build_fold_pathway_block(
-        matrix, matrix[:3], _MOD_TRAIN_INDEX, _MOD_Y_FOLD, gene_names=genes
+def test_signature_unchanged_by_valid_row_content():
+    disturbed = _MOD_MATRIX.copy()
+    disturbed[8:] = 1.0  # valid 행을 전부 흔든다
+    a = select_class_signatures(_MOD_MATRIX, _MOD_TRAIN_INDEX, _MOD_Y_FOLD, **_SIG_KWARGS)
+    b = select_class_signatures(disturbed, _MOD_TRAIN_INDEX, _MOD_Y_FOLD, **_SIG_KWARGS)
+    assert [s["genes"] for s in a.stats] == [s["genes"] for s in b.stats]
+
+
+def test_signature_responds_to_fit_labels():
+    """위 테스트가 공허하지 않으려면 라벨에는 실제로 반응해야 한다."""
+    a = select_class_signatures(_MOD_MATRIX, _MOD_TRAIN_INDEX, _MOD_Y_FOLD, **_SIG_KWARGS)
+    b = select_class_signatures(
+        _MOD_MATRIX, _MOD_TRAIN_INDEX, _MOD_Y_FOLD[::-1], **_SIG_KWARGS
     )
-    single = build_fold_pathway_block(
-        matrix, matrix[[5]], _MOD_TRAIN_INDEX, _MOD_Y_FOLD, gene_names=genes
-    )[2]
-    assert np.allclose(single[0], train_out[5], atol=1e-6)
-    assert len(names) == len(PATHWAYS)
+    assert [s["genes"] for s in a.stats] != [s["genes"] for s in b.stats]
+
+
+def test_signature_rejects_mismatched_label_length():
+    """라벨이 밀린 채로 조용히 학습되는 것보다 멈추는 쪽이 낫다."""
+    with pytest.raises(ValueError, match="y_train_fold"):
+        select_class_signatures(
+            _MOD_MATRIX, _MOD_TRAIN_INDEX, _MOD_Y[:5], **_SIG_KWARGS
+        )
+
+
+def test_signature_picks_the_genes_that_separate_classes():
+    """선택 규칙이 실제로 동작하는지 — 이게 안 맞으면 나머지 테스트가 다 공허하다."""
+    signatures = select_class_signatures(
+        _MOD_MATRIX, _MOD_TRAIN_INDEX, _MOD_Y_FOLD, **_SIG_KWARGS
+    )
+    picked = {s["class"]: set(s["genes"]) for s in signatures.stats}
+    assert picked["X"] == {"GA", "GB"}
+    assert picked["Y"] == {"GD", "GE", "GF"}
+    # valid 전용 유전자는 어느 클래스에도 못 들어간다.
+    assert not any({"GG", "GH"} & genes for genes in picked.values())
+
+
+def test_signature_hyper_guard_drops_hypermutation_driven_genes():
+    """과변이 가드가 없으면 서명이 '이 클래스는 변이가 많다' 를 다시 배운다.
+
+    `GB` 는 P 클래스의 과변이 행 하나에서만 켜진다. lift 는 0.33 으로 문턱을 넘지만
+    그 대비가 통째로 과변이 행 하나에서 온 것이라 가드가 걸러야 한다. 같은 픽스처의
+    `GA` 는 평범한 행에도 있어서 남아야 한다 — 가드가 다 죽이는 게 아니라는 대조다.
+    """
+    genes = ["GA", "GB", "GC", "GD"]
+    matrix = np.array(
+        [
+            [1, 0, 0, 0],  # P
+            [1, 0, 0, 0],  # P
+            [1, 1, 1, 0],  # P — 변이 3개, fold-train 상위 분위라 과변이
+            [0, 0, 0, 1],  # Q
+            [0, 0, 0, 1],  # Q
+            [0, 0, 0, 1],  # Q
+        ],
+        dtype=np.float32,
+    )
+    y = np.array(["P", "P", "P", "Q", "Q", "Q"])
+    index = np.arange(6)
+    loose = dict(gene_names=genes, min_class_support=1, min_lift=0.1)
+    without = select_class_signatures(
+        matrix, index, y, max_hyper_fraction=1.0, **loose
+    )
+    with_guard = select_class_signatures(
+        matrix, index, y, max_hyper_fraction=0.5, **loose
+    )
+    def p_genes(signatures):
+        return {g for s in signatures.stats if s["class"] == "P" for g in s["genes"]}
+
+    assert "GB" in p_genes(without)
+    assert "GB" not in p_genes(with_guard)
+    assert "GA" in p_genes(with_guard), "가드가 평범한 서명 유전자까지 죽이면 안 된다"
+
+
+def test_signature_transform_is_row_independent():
+    """행 하나만 넣은 값 == 전체를 넣었을 때 그 행."""
+    signatures = select_class_signatures(
+        _MOD_MATRIX, _MOD_TRAIN_INDEX, _MOD_Y_FOLD, **_SIG_KWARGS
+    )
+    full = transform_class_signatures(_MOD_MATRIX, signatures)
+    for row in (0, 5, 9):
+        single = transform_class_signatures(_MOD_MATRIX[[row]], signatures)
+        assert np.allclose(single[0], full[row], atol=1e-6)
+
+
+def test_signature_share_is_dilation_invariant_but_controls_are_not():
+    """**리뷰가 요청한 핵심 검사.** signature_share 가 변이 부담에 안 흔들려야 한다.
+
+    한 행의 변이 유전자를 서명 안팎으로 같은 비율씩 늘린다. `share` 는 분모가 행 전체의
+    변이 유전자 수라 값이 그대로여야 하고, 단순 카운트 계열(`fraction`/`logcount`/
+    `wburden`)은 움직여야 한다. test 의 변이 유전자 수가 train 의 2.21배라는 사실을
+    실행 가능한 단언으로 박은 것이다.
+    """
+    signatures = select_class_signatures(
+        _MOD_MATRIX, _MOD_TRAIN_INDEX, _MOD_Y_FOLD, **_SIG_KWARGS
+    )
+    inside = [_MOD_GENES.index(g) for g in ("GA", "GB")]  # X 서명
+    outside = [_MOD_GENES.index(g) for g in ("GG", "GH")]  # 어느 서명에도 없다
+
+    base = np.zeros((1, len(_MOD_GENES)), dtype=np.float32)
+    base[0, [inside[0], outside[0]]] = 1.0
+    diluted = base.copy()
+    diluted[0, [inside[1], outside[1]]] = 1.0
+
+    for value in ("share", "enrich"):
+        a = transform_class_signatures(base, signatures, value=value)
+        b = transform_class_signatures(diluted, signatures, value=value)
+        assert np.allclose(a, b, atol=1e-6), f"{value} 가 희석에 흔들린다"
+
+    moved = [
+        not np.allclose(
+            transform_class_signatures(base, signatures, value=value),
+            transform_class_signatures(diluted, signatures, value=value),
+        )
+        for value in ("fraction", "logcount", "wburden")
+    ]
+    assert all(moved), "대조군이 희석에 안 움직이면 대조군이 아니다"
+
+
+def test_signature_block_emits_one_column_per_fold_train_class():
+    """폭이 fold-train 클래스 수로 고정이라야 f4r 과의 델타가 차원 변동에 안 오염된다."""
+    names, train_out, test_out, diagnostics = build_fold_signature_block(
+        _MOD_MATRIX, _MOD_MATRIX[:3], _MOD_TRAIN_INDEX, _MOD_Y_FOLD, **_SIG_KWARGS
+    )
+    assert names == ["sig_share__X", "sig_share__Y"]
+    assert train_out.shape == (_MOD_MATRIX.shape[0], 2)
+    assert test_out.shape == (3, 2)
+    assert len(diagnostics) == 2
+    assert np.isfinite(train_out).all()
+    assert train_out[8:].sum() > 0, "valid 행도 transform 은 받아야 한다"
+
+
+def test_signature_unseen_gene_pattern_stays_finite():
+    """서명 유전자가 하나도 안 켜진 행도, 변이가 아예 없는 행도 유한해야 한다."""
+    signatures = select_class_signatures(
+        _MOD_MATRIX, _MOD_TRAIN_INDEX, _MOD_Y_FOLD, **_SIG_KWARGS
+    )
+    empty = np.zeros((2, len(_MOD_GENES)), dtype=np.float32)
+    empty[1, -1] = 1.0  # 서명 밖 유전자만 켜진 행
+    for value in MODULE_VALUES:
+        out = transform_class_signatures(empty, signatures, value=value)
+        assert np.isfinite(out).all(), value
 
 
 # --- stem 슬러그 -----------------------------------------------------------
@@ -750,7 +901,8 @@ def test_latent_and_module_slugs_empty_without_their_blocks():
     과거 실험과 이름이 어긋나 비교가 통째로 끊긴다.
     """
     assert train_gbdt._latent_slug({}) == ""
-    assert train_gbdt._module_slug({}, {}) == ""
+    assert train_gbdt._module_slug({}) == ""
+    assert train_gbdt._signature_slug({}) == ""
 
 
 def test_latent_slug_distinguishes_all_params():
@@ -781,7 +933,7 @@ def test_latent_slug_distinguishes_all_params():
         seen.add(slug)
 
 
-def test_module_slug_distinguishes_all_params_and_never_collides_with_pathway():
+def test_module_slug_distinguishes_all_params():
     base = dict(
         value="share",
         n_modules=24,
@@ -790,7 +942,7 @@ def test_module_slug_distinguishes_all_params_and_never_collides_with_pathway():
         min_gene_support=5,
         random_state=0,
     )
-    seen = {train_gbdt._module_slug(base, {})}
+    seen = {train_gbdt._module_slug(base)}
     for variant in (
         {**base, "value": "fraction"},
         {**base, "n_modules": 12},
@@ -799,11 +951,63 @@ def test_module_slug_distinguishes_all_params_and_never_collides_with_pathway():
         {**base, "min_gene_support": 10},
         {**base, "random_state": 1},
     ):
-        slug = train_gbdt._module_slug(variant, {})
+        slug = train_gbdt._module_slug(variant)
         assert slug not in seen, f"충돌: {variant}"
         seen.add(slug)
 
-    # gmod 와 kpath 는 접두사로 갈린다 — 같은 value 여도 stem 이 안 겹쳐야 한다.
-    pathway = train_gbdt._module_slug({}, dict(value="share", mode="mutated"))
-    assert pathway not in seen
-    assert pathway.startswith("_kp")
+
+def test_signature_slug_distinguishes_all_params_and_never_collides_with_module():
+    base = dict(
+        value="share",
+        topk=30,
+        mode="mutated",
+        min_class_support=5,
+        min_lift=0.05,
+        max_hyper_fraction=0.50,
+    )
+    seen = {train_gbdt._signature_slug(base)}
+    for variant in (
+        {**base, "value": "fraction"},
+        {**base, "topk": 10},
+        {**base, "mode": "functional"},
+        {**base, "min_class_support": 8},
+        {**base, "min_lift": 0.10},
+        {**base, "max_hyper_fraction": 0.30},
+    ):
+        slug = train_gbdt._signature_slug(variant)
+        assert slug not in seen, f"충돌: {variant}"
+        seen.add(slug)
+
+    # gmod 와 csig 는 접두사로 갈린다 — 두 블록이 한 config 에 같이 들어가도 겹치면
+    # 안 된다. 슬러그는 이어 붙으므로 접두사만 다르면 충분하다.
+    module = train_gbdt._module_slug(
+        dict(
+            value="share",
+            n_modules=24,
+            svd_components=64,
+            mode="mutated",
+            min_gene_support=5,
+            random_state=0,
+        )
+    )
+    assert module.startswith("_gm")
+    assert train_gbdt._signature_slug(base).startswith("_sg")
+    assert module not in seen
+
+
+def test_every_config_block_belongs_to_a_known_family():
+    """config 이 참조하는 블록이 전부 어느 가족엔가 등록돼 있어야 한다.
+
+    `FOLD_MATRIX_BLOCKS` 에 안 넣은 블록은 `Dataset` 이 dense 주머니에 담고
+    `assemble` 이 그대로 붙인다 — 예외도 안 나고 fold 로직도 돌지만 fold 안에서
+    만들어야 할 열이 fold 밖에서 만들어진다. 조용히 새는 자리라 여기서 막는다.
+    """
+    known = (
+        set(train_gbdt.BLOCK_SOURCES)
+        | set(train_gbdt.SPARSE_SOURCES)
+        | {"domain"}
+    )
+    for config, spec in train_gbdt.CONFIGS.items():
+        for block in spec["blocks"]:
+            assert block in known, f"{config} 의 {block} 이 소스 표에 없다"
+            assert block in train_gbdt.BLOCK_DESC, f"{block} 설명이 없다"

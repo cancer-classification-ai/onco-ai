@@ -19,9 +19,9 @@
     lsvd       64  잠재 SVD 성분 — 행을 L2 정규화하고 fold 안에서 기저를 fit
     lnmf       64  잠재 NMF 성분 — 같은 계약, 비음수 혼합
     gmod       24  하드 유전자 모듈 — fold 안에서 KMeans 로 배타 배정
-    kpath      12  수기 pathway 그룹 (규정 회색지대 — compliance/PATHWAY_SOURCE.md)
-            (`--latent-*`/`--module-*`/`--pathway-*` 플래그,
-             `cancer_hack.features_latent`·`features_pathway` 참고)
+            (`--latent-*`/`--module-*` 플래그, `cancer_hack.features_latent` 참고)
+    csig       26  클래스 서명 몫 — fold 안에서 라벨로 클래스별 유전자 집합을 고른다
+            (`--signature-*` 플래그, `cancer_hack.features_signature` 참고)
 
 ## 왜 래더인가
 
@@ -106,7 +106,7 @@ from cancer_hack.features_latent import (  # noqa: E402
     module_membership_frame,
     subspace_alignment,
 )
-from cancer_hack.features_pathway import build_fold_pathway_block  # noqa: E402
+from cancer_hack.features_signature import build_fold_signature_block  # noqa: E402
 from cancer_hack.features_sparse import (  # noqa: E402
     build_fold_parsed_token_block,
     build_fold_tfidf_block,
@@ -182,10 +182,21 @@ PAIR_BLOCKS = ("comut",)
 #: 이쪽 안정성은 `features_latent.subspace_alignment`(주각 코사인)로 따로 잰다.
 LATENT_BLOCKS = ("lsvd", "lnmf")
 
-#: 유전자를 그룹으로 묶어 집계하는 블록. `gmod` 는 fold 마다 지지도 필터가 다시 걸려
-#: 모듈에 든 유전자 집합이 실제로 바뀌므로 `selected` 등록이 의미가 있고, `kpath` 는
-#: 멤버십이 상수라 값 계산의 희귀도 가중만 fold 안에서 fit 한다.
-MODULE_BLOCKS = ("gmod", "kpath")
+#: 유전자를 그룹으로 묶어 집계하는 블록. fold 마다 지지도 필터가 다시 걸려 모듈에 든
+#: 유전자 집합이 실제로 바뀌므로 `selected` 등록이 의미가 있다.
+MODULE_BLOCKS = ("gmod",)
+
+#: **라벨을 보고** 유전자를 묶는 블록. 위 세 가족과 그래서 갈라 둔다 — LATENT/MODULE 는
+#: `fit` 시그니처에 `y` 가 아예 없는 게 계약이고, 이쪽은 `y` 가 필수 인자다. 한 상수에
+#: 섞으면 그 계약 차이가 코드에서 안 보이고, fold 루프도 `y` 를 어디까지 넘기는지가
+#: 흐려진다. 지도 블록이라 `selected` 등록도 의미가 있다(고른 유전자가 fold 마다 바뀐다).
+SIGNATURE_BLOCKS = ("csig",)
+
+#: 원본 유전자 행렬을 그대로 들고 있다가 **fold 안에서** 열을 만드는 블록 전부.
+#: `Dataset` 은 이들을 `pairs` 주머니에 담고 `assemble` 은 건너뛴다. 가족을 새로 만들 때
+#: 여기 한 줄만 더하면 두 자리가 같이 따라온다 — 예전엔 세 상수를 두 곳에서 각각 나열해서
+#: 한쪽만 고치면 블록이 조용히 dense 로 떨어졌다(`KeyError` 도 안 난다).
+FOLD_MATRIX_BLOCKS = PAIR_BLOCKS + LATENT_BLOCKS + MODULE_BLOCKS + SIGNATURE_BLOCKS
 
 #: sparse 블록 -> (parquet 파일명 템플릿, 문서 열 이름)
 SPARSE_SOURCES = {
@@ -212,7 +223,7 @@ BLOCK_SOURCES = {
     "lsvd": "{split}_mutation_encoded.parquet",
     "lnmf": "{split}_mutation_encoded.parquet",
     "gmod": "{split}_mutation_encoded.parquet",
-    "kpath": "{split}_mutation_encoded.parquet",
+    "csig": "{split}_mutation_encoded.parquet",
 }
 
 DENSE_BLOCK_COLUMNS = {
@@ -264,7 +275,7 @@ BLOCK_DESC = {
     "lsvd": "잠재 SVD (fold 안 fit)",
     "lnmf": "잠재 NMF (fold 안 fit)",
     "gmod": "하드 유전자 모듈 (fold 안 KMeans)",
-    "kpath": "수기 pathway (규정 회색지대)",
+    "csig": "클래스 서명 몫 (fold 안 라벨 선택)",
 }
 
 #: 래더. 한 번에 한 축만 바꾼다.
@@ -384,12 +395,18 @@ CONFIGS: dict[str, dict] = {
         "weight": "balanced",
         "desc": "f4r + 하드 유전자 모듈",
     },
-    # 규정 회색지대. compliance/PATHWAY_SOURCE.md 를 읽고 쓴다 — 주최측 확인 전까지
-    # 제출 후보가 아니다. 빼려면 이 항목 하나만 지우면 된다.
-    "f4rk": {
-        "blocks": ("domain", "rollup16", "enc3", "kpath"),
+    # --- 클래스 서명 (지도) ------------------------------------------------
+    # 위 셋과 달리 그룹을 **라벨로** 만든다. 그래서 CV 를 하나만 보면 안 된다 — skf 는
+    # 쌍둥이 행(프로파일이 같은 샘플 842행)이 fold 를 가로질러서 valid 행의 서명에
+    # 자기와 같은 프로파일의 라벨이 들어가고, sgkf(Profile Group CV)가 그걸 막는다.
+    # 실측은 막은 쪽이 3배 컸다(시드 3개 평균 skf +0.0050 / sgkf +0.0156). 이득의
+    # 출처는 쌍둥이가 아니라 희소 클래스다 — sgkf 기준 DLBC +0.26, ACC +0.12 이고
+    # macro F1 이 26클래스를 같은 무게로 세니 그 둘만으로 +0.0147 이 설명된다.
+    # 자세한 근거와 남은 위험은 `cancer_hack.features_signature` docstring 에 있다.
+    "f4rsig": {
+        "blocks": ("domain", "rollup16", "enc3", "csig"),
         "weight": "balanced",
-        "desc": "f4r + 수기 pathway (규정 회색지대)",
+        "desc": "f4r + 클래스 서명 몫",
     },
     # 중복성 대조군. f2c 와 같은 역할이다 — "enc3 위에 얹었을 때 이득이 있나"와
     # "블록 자체가 유전자 신호를 담고 있나"는 다른 질문이고, 후자를 이걸로 잰다.
@@ -403,6 +420,11 @@ CONFIGS: dict[str, dict] = {
         "blocks": ("domain", "rollup16", "gmod"),
         "weight": "balanced",
         "desc": "도메인 + 시프트내성 rollup + 하드 모듈 (enc3 없음, 중복성 대조군)",
+    },
+    "f2sig": {
+        "blocks": ("domain", "rollup16", "csig"),
+        "weight": "balanced",
+        "desc": "도메인 + 시프트내성 rollup + 클래스 서명 (enc3 없음, 중복성 대조군)",
     },
 }
 
@@ -553,10 +575,10 @@ class Dataset:
                 train_frame, test_frame = self._load_pair(name, base, test_base)
                 columns, train_array, test_array = self._select(name, train_frame, test_frame)
                 self._block_cache[cache_key] = (columns, train_array, test_array)
-            # 셋 다 "원본 유전자 행렬을 그대로 들고 있다가 fold 안에서 가공"이라
+            # 넷 다 "원본 유전자 행렬을 그대로 들고 있다가 fold 안에서 가공"이라
             # 저장 형태가 같다. `_select` 도 유전자 분기로 그대로 흘러가므로
             # `SELECT_KIND` 에 넣지 않는다 — 갈래를 새로 만들 필요가 없다.
-            if name in PAIR_BLOCKS or name in LATENT_BLOCKS or name in MODULE_BLOCKS:
+            if name in FOLD_MATRIX_BLOCKS:
                 target = self.pairs
             elif name in GENE_BLOCKS:
                 target = self.gene
@@ -745,9 +767,7 @@ class Dataset:
             if (
                 block in GENE_BLOCKS
                 or block in SPARSE_BLOCKS
-                or block in PAIR_BLOCKS
-                or block in LATENT_BLOCKS
-                or block in MODULE_BLOCKS
+                or block in FOLD_MATRIX_BLOCKS
             ):
                 continue
             columns, train_array, test_array = self.dense[block]
@@ -769,6 +789,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     pair_blocks = [b for b in spec["blocks"] if b in PAIR_BLOCKS]
     latent_blocks = [b for b in spec["blocks"] if b in LATENT_BLOCKS]
     module_blocks = [b for b in spec["blocks"] if b in MODULE_BLOCKS]
+    signature_blocks = [b for b in spec["blocks"] if b in SIGNATURE_BLOCKS]
     topk = args.topk if gene_blocks else None
     k_slug = f"k{topk}" if topk else "kall"
     # sparse 축을 stem 에 안 넣으면 --sparse-topk 를 바꿔 두 번 돌릴 때 두 번째가
@@ -832,26 +853,35 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             min_gene_support=args.module_min_support,
             random_state=args.module_random_state,
         )
-        if "gmod" in module_blocks
+        if module_blocks
         else {}
     )
-    pathway_kwargs = (
-        dict(value=args.pathway_value, mode=args.pathway_mode)
-        if "kpath" in module_blocks
+    signature_kwargs = (
+        dict(
+            value=args.signature_value,
+            topk=args.signature_topk,
+            mode=args.signature_mode,
+            min_class_support=args.signature_min_class_support,
+            min_lift=args.signature_min_lift,
+            max_hyper_fraction=args.signature_max_hyper,
+        )
+        if signature_blocks
         else {}
     )
     latent_slug = _latent_slug(latent_kwargs)
-    module_slug = _module_slug(module_kwargs, pathway_kwargs)
+    module_slug = _module_slug(module_kwargs)
+    signature_slug = _signature_slug(signature_kwargs)
     stem = (
         f"{args.model}_{args.tag}_{config}_{CV_SLUG[cv]}_{k_slug}"
-        f"{sparse_slug}{comut_slug}{latent_slug}{module_slug}_s{args.seed}"
+        f"{sparse_slug}{comut_slug}{latent_slug}{module_slug}{signature_slug}"
+        f"_s{args.seed}"
     )
 
     # 대조군 설정은 조용히 지나가면 안 된다 — 나중에 로그만 보고 "왜 이건 나빴지"를
     # 되짚을 때 의도였는지 실수였는지가 구별돼야 한다.
     for label, value in (
         ("모듈", module_kwargs.get("value")),
-        ("pathway", pathway_kwargs.get("value")),
+        ("클래스 서명", signature_kwargs.get("value")),
     ):
         if value in SHIFT_EXPOSED_VALUES:
             log(
@@ -885,6 +915,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     comut_widths: list[int] = []
     latent_diagnostics: dict[str, dict[str, list[dict]]] = {}
     module_diagnostics: dict[str, dict[str, list[dict]]] = {}
+    signature_diagnostics: dict[str, dict[str, list[dict]]] = {}
     # fold 별 기저·모듈맵. 안정성 진단(주각 코사인)과 모듈맵 CSV 에 쓴다.
     latent_bases: dict[str, list] = {}
     module_maps: dict[str, list] = {}
@@ -1004,38 +1035,49 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             x_train = np.hstack([x_train, lat_tr])
             x_test = np.hstack([x_test, lat_te])
 
-        # 유전자 모듈 — KMeans 배정(gmod)도 희귀도 가중(kpath)도 fold 의 train
-        # 부분에서만 fit 한다.
+        # 유전자 모듈 — KMeans 배정을 fold 의 train 부분에서만 fit 한다.
         for block in module_blocks:
             columns, module_train, module_test = data.pairs[block]
-            if block == "kpath":
-                mod_names, mod_tr, mod_te, mod_diag = build_fold_pathway_block(
-                    module_train,
-                    module_test,
-                    train_index,
-                    data.y[train_index],
-                    gene_names=columns,
-                    **pathway_kwargs,
-                )
-            else:
-                mod_names, mod_tr, mod_te, mod_diag, modules = build_fold_module_block(
-                    module_train,
-                    module_test,
-                    train_index,
-                    data.y[train_index],
-                    gene_names=columns,
-                    **module_kwargs,
-                )
-                frame = module_membership_frame(modules, columns)
-                module_maps.setdefault(block, []).append(frame)
-                # 모듈에 들어간 유전자 집합은 fold 마다 진짜 바뀐다(지지도 필터가
-                # fold-train 에서 다시 걸린다). 다만 모듈 *번호* 는 KMeans 초기화에
-                # 따라 뒤섞이니 여기서 재는 건 "어떤 유전자가 모듈 체계에 포함됐나"
-                # 까지다. 배정 자체의 안정성(seed 간 ARI)은 inspect_latent.py 가 잰다.
-                selected.setdefault(block, {})[str(fold)] = list(frame["gene"])
+            mod_names, mod_tr, mod_te, mod_diag, modules = build_fold_module_block(
+                module_train,
+                module_test,
+                train_index,
+                data.y[train_index],
+                gene_names=columns,
+                **module_kwargs,
+            )
+            frame = module_membership_frame(modules, columns)
+            module_maps.setdefault(block, []).append(frame)
+            # 모듈에 들어간 유전자 집합은 fold 마다 진짜 바뀐다(지지도 필터가
+            # fold-train 에서 다시 걸린다). 다만 모듈 *번호* 는 KMeans 초기화에
+            # 따라 뒤섞이니 여기서 재는 건 "어떤 유전자가 모듈 체계에 포함됐나"
+            # 까지다. 배정 자체의 안정성(seed 간 ARI)은 inspect_latent.py 가 잰다.
+            selected.setdefault(block, {})[str(fold)] = list(frame["gene"])
             module_diagnostics.setdefault(block, {})[str(fold)] = mod_diag
             x_train = np.hstack([x_train, mod_tr])
             x_test = np.hstack([x_test, mod_te])
+
+        # 클래스 서명 — 라벨을 보는 유일한 블록이다. 넘기는 `y` 는 chi2·comut 과
+        # 같은 `data.y[train_index]` 이고, 선택 함수는 test 행렬을 인자로 받지 않는다.
+        for block in signature_blocks:
+            columns, sig_train, sig_test = data.pairs[block]
+            sig_names, sig_tr, sig_te, sig_diag = build_fold_signature_block(
+                sig_train,
+                sig_test,
+                train_index,
+                data.y[train_index],
+                gene_names=columns,
+                **signature_kwargs,
+            )
+            # 클래스별로 고른 유전자를 한 줄에 편다. 열 이름은 fold 마다 같지만
+            # (`sig_share__BRCA`) 그 안의 유전자 집합이 실제로 바뀌므로, 잠재 블록과
+            # 달리 Jaccard 가 거짓말을 하지 않는다.
+            selected.setdefault(block, {})[str(fold)] = [
+                f"{d['class']}:{gene}" for d in sig_diag for gene in d["genes"]
+            ]
+            signature_diagnostics.setdefault(block, {})[str(fold)] = sig_diag
+            x_train = np.hstack([x_train, sig_tr])
+            x_test = np.hstack([x_test, sig_te])
 
         n_features = x_train.shape[1]
         fold_widths.append(n_features)
@@ -1125,10 +1167,21 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         "module": (
             {
                 "blocks": module_blocks,
-                "params": {**module_kwargs, **pathway_kwargs},
+                "params": module_kwargs,
                 "diagnostics": module_diagnostics,
             }
             if module_blocks
+            else None
+        ),
+        "signature": (
+            {
+                "blocks": signature_blocks,
+                "params": signature_kwargs,
+                # 클래스별로 고른 유전자와 lift·지지도, 그리고 선택이 끝난 뒤에만
+                # 계산하는 train/test 평균비(감사 기록 — 어떤 필터도 안 읽는다).
+                "diagnostics": signature_diagnostics,
+            }
+            if signature_blocks
             else None
         ),
         "n_features": int(n_features),
@@ -1289,20 +1342,28 @@ def _latent_slug(latent_kwargs: dict) -> str:
     )
 
 
-def _module_slug(module_kwargs: dict, pathway_kwargs: dict) -> str:
-    """모듈·pathway 파라미터 -> stem 슬러그. 둘 다 비어 있으면 `""`.
+def _module_slug(module_kwargs: dict) -> str:
+    """모듈 파라미터 -> stem 슬러그. 비어 있으면 `""`."""
+    if not module_kwargs:
+        return ""
+    return (
+        f"_gm{module_kwargs['n_modules']}{module_kwargs['value'][:3]}"
+        f"{_digest(module_kwargs)}"
+    )
 
-    두 블록이 한 슬러그를 나눠 쓴다. 같은 config 에 둘이 같이 들어가는 일이 없고
-    (`f4rm` 은 gmod, `f4rk` 는 kpath) 접두사(`_gm`/`_kp`)로 갈리므로 충돌하지 않는다.
+
+def _signature_slug(signature_kwargs: dict) -> str:
+    """클래스 서명 파라미터 -> stem 슬러그. 비어 있으면 `""`.
+
+    `_module_slug` 와 접두사(`_gm`/`_sg`)로 갈린다. 두 블록이 같은 config 에 같이
+    들어가도 슬러그가 이어 붙으므로 충돌하지 않는다.
     """
-    if module_kwargs:
-        return (
-            f"_gm{module_kwargs['n_modules']}{module_kwargs['value'][:3]}"
-            f"{_digest(module_kwargs)}"
-        )
-    if pathway_kwargs:
-        return f"_kp{pathway_kwargs['value'][:3]}{_digest(pathway_kwargs)}"
-    return ""
+    if not signature_kwargs:
+        return ""
+    return (
+        f"_sg{signature_kwargs['topk']}{signature_kwargs['value'][:3]}"
+        f"{_digest(signature_kwargs)}"
+    )
 
 
 def _pairwise_alignment(bases: list) -> float:
@@ -1487,15 +1548,43 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--module-min-support", type=int, default=5)
     parser.add_argument("--module-random-state", type=int, default=0)
 
-    # --- 수기 pathway 블록 (kpath) -----------------------------------------
+    # --- 클래스 서명 블록 (csig) -------------------------------------------
     parser.add_argument(
-        "--pathway-value",
+        "--signature-value",
         choices=list(MODULE_VALUES),
         default="share",
-        help="pathway 집계 값. --module-value 와 같은 규약이다",
+        help="서명 집계 값. --module-value 와 같은 규약이다. 기본 share 가 리뷰에서 "
+        "요청된 signature_share — 행의 변이 유전자 수로 나눠 변이 부담 차이를 지운다",
     )
     parser.add_argument(
-        "--pathway-mode", choices=["mutated", "functional"], default="mutated"
+        "--signature-topk",
+        type=int,
+        default=30,
+        help="클래스당 서명 유전자 상한 (필터가 먼저 물린다)",
+    )
+    parser.add_argument(
+        "--signature-mode", choices=["mutated", "functional"], default="mutated"
+    )
+    parser.add_argument(
+        "--signature-min-class-support",
+        type=int,
+        default=5,
+        help="fold-train 의 그 클래스에서 이 행수 미만 변이된 유전자는 후보에서 뺀다. "
+        "DLBC 는 fold-train 이 30행뿐이라 이 값이 실질 하한을 정한다",
+    )
+    parser.add_argument(
+        "--signature-min-lift",
+        type=float,
+        default=0.05,
+        help="클래스 안 변이율 - 밖 변이율의 하한. comut 의 --comut-min-lift 와 같은 "
+        "덧셈 규약이다",
+    )
+    parser.add_argument(
+        "--signature-max-hyper",
+        type=float,
+        default=0.50,
+        help="서명 유전자의 클래스 안 변이가 과변이 샘플에 몰린 정도의 상한. "
+        "--comut-max-hyper 와 같은 가드다",
     )
     return parser
 
