@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from cancer_hack.dataset_dl import (
+    GENE_RULE_FEATURE_NAMES,
     MutationSampleDataset,
     MutationTokenizer,
     collate_mutation_samples,
@@ -49,3 +50,53 @@ def test_tokenizer_does_not_treat_operation_words_as_amino_acids() -> None:
     assert deletion.alt_id == 0
     assert insertion.ref_id > 0
     assert insertion.alt_id == insertion.ref_id
+
+
+def test_multi_amino_acid_frameshift_is_retained_as_unknown_ref() -> None:
+    tokenizer = MutationTokenizer(["TP53"])
+    token = tokenizer.encode("TP53", "WQ288fs")
+
+    assert token.kind_id > 0
+    assert token.position == 288
+    assert token.ref_id == 0
+    assert token.has_unknown
+
+
+def test_gene_rule_stats_preserve_count_type_and_position_structure() -> None:
+    frame = pd.DataFrame(
+        {
+            "ID": ["sample"],
+            "TP53": ["R132H R132H Q369* R132R"],
+        }
+    )
+    tokenizer = MutationTokenizer(["TP53"])
+    samples = tokenize_frame(frame, tokenizer)
+    dataset = MutationSampleDataset(samples, frame["ID"])
+    batch = collate_mutation_samples([dataset[0]])
+    stats = dict(
+        zip(GENE_RULE_FEATURE_NAMES, batch["gene_rule_stats"][0].tolist())
+    )
+
+    assert batch["gene_rule_stats"].shape == (1, 19)
+    assert stats["variant_count"] == 4
+    assert stats["unique_variant_count"] == 3
+    assert stats["duplicate_count"] == 1
+    assert stats["unique_position_count"] == 2
+    assert stats["missense_ratio"] == 0.5
+    assert stats["synonymous_ratio"] == 0.25
+    assert stats["nonsense_ratio"] == 0.25
+    assert stats["same_position_ratio"] == 0.5
+    assert stats["has_multiple_variants"] == 1
+    assert stats["has_mixed_mutation_types"] == 1
+    assert stats["has_duplicate_variant"] == 1
+
+
+def test_gene_rule_stats_are_zero_width_safe_for_wt_samples() -> None:
+    frame = pd.DataFrame({"ID": ["sample"], "TP53": ["WT"]})
+    tokenizer = MutationTokenizer(["TP53"])
+    samples = tokenize_frame(frame, tokenizer)
+    dataset = MutationSampleDataset(samples, frame["ID"])
+    batch = collate_mutation_samples([dataset[0]])
+
+    assert batch["gene_rule_stats"].shape == (0, len(GENE_RULE_FEATURE_NAMES))
+    assert batch["gene_ids"].numel() == 0

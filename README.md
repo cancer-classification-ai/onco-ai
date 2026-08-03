@@ -82,6 +82,20 @@ python scripts/run_dl_ladder.py --models set_encoder --device cuda --seed 42
 python scripts/run_dl_ladder.py --models hybrid --device cuda --seed 42
 ```
 
+Gene Set Encoder의 유전자별 count·중복·유형·위치 통계를 누적 비교하려면 별도
+ablation ladder를 실행한다.
+
+```bash
+# set_v0 → set_v1_count → set_v2_type → set_v3_position → set_v4_full → hybrid_v2
+python scripts/run_gene_rule_ladder.py --device cuda --seed 42
+
+# 최종 강화형 두 모델만 실행
+python scripts/run_gene_rule_ladder.py \
+  --experiments set_v4_full hybrid_v2 \
+  --device cuda \
+  --seed 42
+```
+
 ### 예측 생성
 
 ```bash

@@ -85,3 +85,45 @@ def test_set_encoder_is_permutation_invariant() -> None:
 
     with torch.no_grad():
         assert torch.allclose(model(original), model(changed), atol=1e-6)
+
+
+def test_enhanced_gene_rule_encoder_is_permutation_invariant() -> None:
+    tokenizer, samples, _ = _batch()
+    permuted = copy.deepcopy(samples)
+    for sample in permuted:
+        sample.reverse()
+        for gene_tokens in sample:
+            gene_tokens.reverse()
+    original_dataset = MutationSampleDataset(samples, ["a", "b"])
+    permuted_dataset = MutationSampleDataset(permuted, ["a", "b"])
+    original = collate_mutation_samples([original_dataset[0], original_dataset[1]])
+    changed = collate_mutation_samples([permuted_dataset[0], permuted_dataset[1]])
+    model = create_dl_model(
+        "set_encoder",
+        num_classes=3,
+        dense_dim=0,
+        vocab_sizes=tokenizer.vocab_sizes,
+        model_params={
+            "embedding_dim": 4,
+            "token_dim": 8,
+            "gene_dim": 8,
+            "sample_dim": 8,
+            "classifier_hidden": [8],
+            "dropout": 0.0,
+            "use_sum_sqrt_pool": True,
+            "explicit_gene_embedding": True,
+            "gene_rule_projection_dim": 4,
+            "gene_rule_features": {
+                "enabled": True,
+                "use_counts": True,
+                "use_type_ratios": True,
+                "use_position_stats": True,
+                "use_duplicate_stats": True,
+                "use_state_flags": True,
+                "log_transform_counts": True,
+            },
+        },
+    ).eval()
+
+    with torch.no_grad():
+        assert torch.allclose(model(original), model(changed), atol=1e-6)
