@@ -33,7 +33,6 @@
 
 
 
-
 # 모델링
 
 - 사용 모델
@@ -110,6 +109,7 @@ onco-ai/
 │       ├── validation.py       # StratifiedKFold 생성, CV 관리
 │       ├── parser.py           # 변이 문자열 파서(기본 특성 추출)
 │       ├── features_basic.py   # Gene binary, burden 등 Tier1 피처 생성
+│       ├── features_frequency.py # Train-fold 빈도·IDF·희귀도 피처
 │       ├── features_amino_acid.py # 아미노산 물리화학적 치환 피처
 │       ├── features_sparse.py  # Token TF-IDF 등 희소 피처 생성
 │       ├── features_latent.py  # NMF, SVD, Autoencoder 등 잠재 피처

@@ -1,3 +1,28 @@
+# Fold-dependent frequency/rarity features.
+# 이 설정으로 만든 통계는 CV의 train fold에서만 fit해야 한다.
+frequency_rarity:
+  enabled: true
+  token_identity: gene_and_mutation
+  frequency_basis: sample_document_frequency
+  frequency_families:
+    - gene
+    - exact_mutation
+    - aa_change
+    - gene_aa_change
+    - position
+  exact_mutation_identity: gene_and_sorted_cell_tokens
+  position_identity: numeric_signature_without_gene
+  token_rarity: smoothed_idf
+  rare_df_threshold: 2
+  unseen_token_frequency: 0.0
+
+aa_transition:
+  enabled: false
+  alpha: 1.0
+  unique_transitions_per_sample: true
+  frequency_basis: train_fold_sample_document_frequency
+  conditional_smoothing_categories: 19
+
 amino_acid_penalty:
   enabled: false
   property_normalization: fixed_20_amino_acid_minmax

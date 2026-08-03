@@ -1,20 +1,3 @@
-from __future__ import annotations
-from collections.abc import Sequence
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.preprocessing import normalize
-from scipy import sparse
-from .parser import (
-    classify_token,
-    extract_token_string_features,
-    OTHER,
-    split_tokens,
-)
-
-import numpy as np
-import pandas as pd
-import scipy.sparse as sp
-
-
 """
 변이 문서 -> 희소 TF-IDF 블록. **fold 의 train 문서에서만 fit 한다.**
 
@@ -54,6 +37,24 @@ IDF 는 문서 집합 통계다. train 과 test 를 합쳐 어휘를 만들면 �
 격차(train 행당 41.2 항 / test 132.6 항)는 서명 단계에서 39.9 / 79.8 로 줄고, 남은
 2배는 L2 정규화가 흡수한다.
 """
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+from scipy import sparse
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.preprocessing import normalize
+
+from .parser import (
+    OTHER,
+    classify_token,
+    extract_token_string_features,
+    split_tokens,
+)
 
 
 #: 기본 TF-IDF 설정. 근거는 모듈 docstring 의 어휘 진단표.
@@ -383,6 +384,5 @@ class ParsedTokenHasher:
     def get_feature_names_out(self) -> np.ndarray:
         """학습된 피처 이름 배열을 반환한다."""
         return self._vec.get_feature_names_out()
-
 
 
