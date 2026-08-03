@@ -7,9 +7,12 @@
 
     python scripts/make_features.py sample --split train --overwrite
     python scripts/make_features.py sample --split test  --overwrite
+    python scripts/make_features.py sample --split train --include-additional-burden --overwrite
     python scripts/make_features.py tokens --split train --overwrite
     python scripts/make_features.py sigtokens --split train --overwrite
     python scripts/make_features.py gene   --split train --kind mutated --overwrite
+    python scripts/make_features.py gene-types --split train --overwrite
+    python scripts/make_features.py gene-types --split test  --overwrite
 
 `sample` 이 복합 변이 처리 전략의 산출물이다. train/test 를 **따로** 돌린다 —
 행마다 독립 계산이라 train 통계가 test 로 새지 않는다. fold 안에서 잡아야 하는
@@ -30,9 +33,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cancer_hack.features_basic import (  # noqa: E402
+    GENE_MUTATION_TYPES,
     SAMPLE_FEATURE_COLUMNS,
     make_exact_mutation_token_parquet,
     make_gene_event_count_matrix,
+    make_gene_mutation_type_matrix,
     make_gene_mutated_matrix,
     make_sample_mutation_features,
     make_unique_mutation_token_parquet,
@@ -76,7 +81,13 @@ def _load_split(split: str, input_path: Path | None) -> tuple[pd.DataFrame, list
 
 def cmd_sample(args: argparse.Namespace) -> dict[str, object]:
     """복합 변이 샘플 단위 피처."""
-    output = _resolve_output(args.output, f"{args.split}_sample_mutation_features.parquet")
+    suffix = (
+        "_additional" if args.include_additional_burden else ""
+    )
+    output = _resolve_output(
+        args.output,
+        f"{args.split}_sample_mutation_features{suffix}.parquet",
+    )
     _guard_existing(output, args.overwrite)
 
     frame, genes = _load_split(args.split, args.input)
@@ -84,6 +95,7 @@ def cmd_sample(args: argparse.Namespace) -> dict[str, object]:
         frame,
         gene_columns=genes,
         include_cell_rollup=args.include_cell_rollup,
+        include_additional_burden=args.include_additional_burden,
     )
     features.insert(0, "ID", frame["ID"].astype(str).to_numpy())
     if "SUBCLASS" in frame.columns:
@@ -96,6 +108,7 @@ def cmd_sample(args: argparse.Namespace) -> dict[str, object]:
         "gene_count": len(genes),
         "feature_count": len(features.columns) - (1 + int("SUBCLASS" in frame.columns)),
         "cell_rollup": args.include_cell_rollup,
+        "additional_burden": args.include_additional_burden,
     }
 
 
@@ -163,6 +176,27 @@ def cmd_tokens(args: argparse.Namespace) -> dict[str, object]:
     )
 
 
+def cmd_gene_types(args: argparse.Namespace) -> dict[str, object]:
+    """유전자별 6종 변이 유형 존재 여부 행렬."""
+    output = _resolve_output(
+        args.output, f"{args.split}_gene_mutation_type_matrix.parquet"
+    )
+    _guard_existing(output, args.overwrite)
+
+    frame, genes = _load_split(args.split, args.input)
+    matrix = make_gene_mutation_type_matrix(frame, gene_columns=genes)
+    matrix.insert(0, "ID", frame["ID"].astype(str).to_numpy())
+
+    _write_parquet(matrix, output)
+    return {
+        "output_path": str(output),
+        "sample_count": len(matrix),
+        "gene_count": len(genes),
+        "type_count": len(GENE_MUTATION_TYPES),
+        "feature_count": len(matrix.columns) - 1,
+    }
+
+
 def cmd_sigtokens(args: argparse.Namespace) -> dict[str, object]:
     """서명 문서 — 잔기 번호를 지워 이소폼 중복을 접은 TF-IDF 입력."""
     output = _resolve_output(
@@ -194,6 +228,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="1차 전략표 이름(has_indel·mnv_count·unique_* 등) 17개를 함께 낸다.",
     )
+    p_sample.add_argument(
+        "--include-additional-burden",
+        action="store_true",
+        help="추가 burden 비율·중복·고차 multihit 피처 8개를 함께 낸다.",
+    )
     p_sample.set_defaults(func=cmd_sample)
 
     p_gene = sub.add_parser("gene", help="유전자별 행렬")
@@ -208,6 +247,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_tokens = sub.add_parser("tokens", help="Exact Mutation Token 문서")
     add_common(p_tokens)
     p_tokens.set_defaults(func=cmd_tokens)
+
+    p_gene_types = sub.add_parser(
+        "gene-types",
+        help="유전자별 6종 변이 유형 존재 여부 wide matrix",
+    )
+    add_common(p_gene_types)
+    p_gene_types.set_defaults(func=cmd_gene_types)
 
     p_sigtokens = sub.add_parser("sigtokens", help="서명(위치 무시) 변이 문서")
     add_common(p_sigtokens)

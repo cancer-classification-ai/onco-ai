@@ -187,6 +187,17 @@ SAMPLE_FEATURE_COLUMNS: tuple[str, ...] = (
     "loss_of_function_count",
 )
 
+ADDITIONAL_BURDEN_FEATURE_COLUMNS: tuple[str, ...] = (
+    "events_per_mutated_gene",
+    "loss_of_function_ratio",
+    "indel_ratio",
+    "complex_ratio",
+    "duplicate_event_count",
+    "duplicate_event_ratio",
+    "high_multihit_gene_count",
+    "max_gene_event_share",
+)
+
 
 def _resolve_gene_columns(
     df: pd.DataFrame,
@@ -210,6 +221,7 @@ def make_sample_mutation_features(
     *,
     gene_columns: list[str] | None = None,
     include_cell_rollup: bool = False,
+    include_additional_burden: bool = False,
 ) -> pd.DataFrame:
     """샘플(행) 하나를 유전자 전체에 걸친 복합 변이 요약 피처로 접는다.
 
@@ -235,6 +247,11 @@ def make_sample_mutation_features(
     `mnv_count`, `unique_*_count`, `has_duplicate_token`, `other_count`. 팀 목록에
     없는 이름이라 기본값은 False 다. 목록 계약을 깨지 않으면서 1차 표 정보도
     꺼내 쓸 수 있게 스위치로 뒀다.
+
+    `include_additional_burden=True` 를 주면 기존 burden count에서 유도한 비율과
+    중복·고차 multihit 요약 8개가 붙는다. 기본 스키마와 기존 Parquet 계약을
+    깨지 않도록 opt-in으로 둔다. 정확히 중복인 `singleton_gene_count`
+    (`mutated_gene_count - multihit_gene_count`)는 만들지 않는다.
 
     `mutation_event_count` 가 1차 표의 `mutation_token_count` 와 같은 값이고,
     `complex_event_count` 가 `mnv_count` 와 같은 값이다. 이름만 팀 목록을 따른다.
@@ -268,6 +285,9 @@ def make_sample_mutation_features(
     max_events_per_gene = np.zeros(n_rows, dtype=np.int32)
     explicit_deletion_event_count = np.zeros(n_rows, dtype=np.int32)
     explicit_deletion_gene_count = np.zeros(n_rows, dtype=np.int32)
+    indel_event_count = np.zeros(n_rows, dtype=np.int32)
+    unique_gene_token_count = np.zeros(n_rows, dtype=np.int32)
+    high_multihit_gene_count = np.zeros(n_rows, dtype=np.int32)
 
     rollup_sums = np.zeros((n_rows, len(_ROLLUP_SUM_COLUMNS)), dtype=np.int32)
     rollup_anys = np.zeros((n_rows, len(_ROLLUP_ANY_COLUMNS)), dtype=np.int8)
@@ -287,6 +307,12 @@ def make_sample_mutation_features(
             functional_event_count[i] += cell.functional_count
             if n_tokens >= 2:
                 multihit_gene_count[i] += 1
+            if include_additional_burden:
+                if n_tokens >= 3:
+                    high_multihit_gene_count[i] += 1
+                indel_event_count[i] += cell.indel_count
+                # 셀 하나가 유전자 하나이므로 셀별 unique 합은 unique (gene, token) 수다.
+                unique_gene_token_count[i] += cell.unique_mutation_token_count
             if n_tokens > max_events_per_gene[i]:
                 max_events_per_gene[i] = n_tokens
 
@@ -352,6 +378,31 @@ def make_sample_mutation_features(
     )
 
     ordered = list(SAMPLE_FEATURE_COLUMNS)
+    if include_additional_burden:
+        out["events_per_mutated_gene"] = _safe_ratio(
+            out["mutation_event_count"], out["mutated_gene_count"]
+        )
+        out["loss_of_function_ratio"] = _safe_ratio(
+            out["loss_of_function_count"], out["functional_event_count"]
+        )
+        out["indel_ratio"] = _safe_ratio(
+            pd.Series(indel_event_count, index=df.index),
+            out["mutation_event_count"],
+        )
+        out["complex_ratio"] = _safe_ratio(
+            out["complex_event_count"], out["mutation_event_count"]
+        )
+        out["duplicate_event_count"] = (
+            mutation_event_count - unique_gene_token_count
+        ).astype(np.int32)
+        out["duplicate_event_ratio"] = _safe_ratio(
+            out["duplicate_event_count"], out["mutation_event_count"]
+        )
+        out["high_multihit_gene_count"] = high_multihit_gene_count
+        out["max_gene_event_share"] = _safe_ratio(
+            out["max_events_per_gene"], out["mutation_event_count"]
+        )
+        ordered += list(ADDITIONAL_BURDEN_FEATURE_COLUMNS)
     if include_cell_rollup:
         for col, key in enumerate(_ROLLUP_SUM_COLUMNS):
             out[key] = rollup_sums[:, col]
@@ -418,6 +469,72 @@ def make_gene_event_count_matrix(
         columns=[f"{prefix}{gene}" for gene in gene_columns],
         index=df.index,
     )
+
+
+GENE_MUTATION_TYPES: tuple[str, ...] = (
+    "missense",
+    "nonsense",
+    "frameshift",
+    "indel",
+    "synonymous",
+    "complex",
+)
+
+
+def make_gene_mutation_type_matrix(
+    df: pd.DataFrame,
+    *,
+    gene_columns: list[str] | None = None,
+    prefix: str = "gene_",
+) -> pd.DataFrame:
+    """유전자별 변이 유형 존재 여부를 0/1 wide matrix로 만든다.
+
+    출력 컬럼은 입력 유전자 순서마다 ``GENE_MUTATION_TYPES`` 순서로 생성한다.
+    예를 들어 TP53 뒤에는 ``gene_missense__TP53``부터
+    ``gene_complex__TP53``까지 6개 컬럼이 붙는다. 같은 유형의 token이 한 셀에
+    여러 개 있어도 존재 여부이므로 값은 1이다.
+
+    이 함수는 각 행을 독립적으로 파싱하며 train 통계나 ``SUBCLASS``를 사용하지
+    않는다. 따라서 train/test split별 Parquet을 미리 만들어도 데이터 누수가 없다.
+
+    >>> frame = pd.DataFrame({"TP53": ["Q369* I368N"], "KRAS": ["WT"]})
+    >>> out = make_gene_mutation_type_matrix(
+    ...     frame, gene_columns=["TP53", "KRAS"]
+    ... )
+    >>> int(out["gene_nonsense__TP53"].iloc[0])
+    1
+    >>> int(out["gene_missense__TP53"].iloc[0])
+    1
+    """
+    gene_columns = _resolve_gene_columns(df, gene_columns)
+    values = df[gene_columns].to_numpy(dtype=object)
+    n_types = len(GENE_MUTATION_TYPES)
+    encoded = np.zeros(
+        (len(df), len(gene_columns) * n_types),
+        dtype=np.int8,
+    )
+    cache = _parse_cache()
+
+    for row_idx in range(values.shape[0]):
+        for gene_idx, value in enumerate(values[row_idx]):
+            # 원본의 대부분이 WT이므로 파서 호출 전에 빠르게 건너뛴다.
+            if value is None or value == "WT" or value == "":
+                continue
+            cell = _parse_cached(value, cache)
+            if cell.mutation_token_count == 0:
+                continue
+            offset = gene_idx * n_types
+            for type_idx, mutation_type in enumerate(GENE_MUTATION_TYPES):
+                encoded[row_idx, offset + type_idx] = getattr(
+                    cell, f"has_{mutation_type}"
+                )
+
+    columns = [
+        f"{prefix}{mutation_type}__{gene}"
+        for gene in gene_columns
+        for mutation_type in GENE_MUTATION_TYPES
+    ]
+    return pd.DataFrame(encoded, columns=columns, index=df.index)
 
 
 class BurdenBinner:
