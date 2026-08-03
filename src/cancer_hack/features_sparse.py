@@ -386,3 +386,40 @@ class ParsedTokenHasher:
         return self._vec.get_feature_names_out()
 
 
+def build_fold_parsed_token_block(
+    train_documents: Sequence[str],
+    test_documents: Sequence[str],
+    train_index: np.ndarray,
+    y_train_fold: Sequence,
+    *,
+    prefix: str = "count__ptok__",
+    topk: int | None = 1000,
+    min_df: int | float = 2,
+    norm: str | None = None,
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """한 fold의 일반화 parsed-token CountVectorizer 블록을 만든다.
+
+    어휘와 chi2 선택은 모두 fold-train 문서에만 fit한다. valid와 test 문서는
+    transform만 받으므로 미등록 변이 토큰이 평가 쪽에서 어휘에 섞이지 않는다.
+    """
+    from .validation import Chi2TopKSelector
+
+    train_documents = np.asarray(train_documents, dtype=object)
+    test_documents = np.asarray(test_documents, dtype=object)
+
+    block = ParsedTokenHasher(min_df=min_df, norm=norm).fit(
+        train_documents[train_index]
+    )
+    sparse_train = block.transform(train_documents)
+    sparse_test = block.transform(test_documents)
+    selector = Chi2TopKSelector(k=topk).fit(
+        sparse_train[train_index], y_train_fold
+    )
+    feature_names = block.get_feature_names_out()
+    names = [f"{prefix}{feature_names[i]}" for i in selector.indices_]
+    return (
+        names,
+        selector.transform(sparse_train).toarray().astype(np.float32),
+        selector.transform(sparse_test).toarray().astype(np.float32),
+    )
+

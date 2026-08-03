@@ -60,7 +60,9 @@ def _encode_single(token: str) -> int:
 
 # 하나의 mutation cell 값을 분석하여 가장 높은 변이 영향도로 인코딩
 def encode_mutation(value: str) -> int:
-    tokens = value.split()
+    tokens = str(value).split()
+    if not tokens:
+        return 0
     if len(tokens) == 1:
         return _encode_single(tokens[0])
     return max(_encode_single(t) for t in tokens)
