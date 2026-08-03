@@ -84,9 +84,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cancer_hack.features_basic import (  # noqa: E402
+    ADDITIONAL_BURDEN_FEATURE_COLUMNS,
+    MUTATION_STRING_PARSED_COLUMNS,
     SAMPLE_FEATURE_COLUMNS,
     BurdenBinner,
 )
+from cancer_hack.features_amino_acid import AMINO_ACID_FEATURE_COLUMNS  # noqa: E402
 from cancer_hack.features_domain import (  # noqa: E402
     DOMAIN_PREFIXES,
     align_domain_columns,
@@ -104,7 +107,10 @@ from cancer_hack.features_latent import (  # noqa: E402
     subspace_alignment,
 )
 from cancer_hack.features_signature import build_fold_signature_block  # noqa: E402
-from cancer_hack.features_sparse import build_fold_tfidf_block  # noqa: E402
+from cancer_hack.features_sparse import (  # noqa: E402
+    build_fold_parsed_token_block,
+    build_fold_tfidf_block,
+)
 from cancer_hack.io import save_csv, write_submission  # noqa: E402
 from cancer_hack.metrics import (  # noqa: E402
     build_prediction_frame,
@@ -157,11 +163,11 @@ ROBUST_ROLLUP_COLUMNS = (
 )
 
 #: chi2 top-K 대상 블록. 나머지는 전부 통과시킨다.
-GENE_BLOCKS = ("enc3", "gec")
+GENE_BLOCKS = ("enc3", "gec", "gtype")
 
 #: fold 안에서 어휘째 다시 만드는 블록. gene 블록과 달리 열의 *정체* 가 fold 마다
 #: 바뀌므로 `Dataset` 이 행렬을 미리 못 만든다. 들고 있는 건 문서 문자열이다.
-SPARSE_BLOCKS = ("sigtok", "exacttok")
+SPARSE_BLOCKS = ("sigtok", "exacttok", "ptok")
 
 #: fold 안에서 쌍을 고르는 블록. 열의 정체와 **개수**가 fold 마다 바뀐다는 점은
 #: SPARSE_BLOCKS 와 같지만, 원본 유전자 행렬 자체는 고정이라 GENE_BLOCKS 처럼 미리
@@ -196,6 +202,7 @@ FOLD_MATRIX_BLOCKS = PAIR_BLOCKS + LATENT_BLOCKS + MODULE_BLOCKS + SIGNATURE_BLO
 SPARSE_SOURCES = {
     "sigtok": ("{split}_signature_mutation_tokens.parquet", "unique_mutation_document"),
     "exacttok": ("{split}_exact_mutation_tokens.parquet", "exact_mutation_document"),
+    "ptok": ("{split}_parsed_mutation_tokens.parquet", "parsed_mutation_document"),
 }
 
 BLOCK_SOURCES = {
@@ -205,6 +212,10 @@ BLOCK_SOURCES = {
     "rollup16": "{split}_sample_mutation_features_rollup.parquet",
     "enc3": "{split}_mutation_encoded.parquet",
     "gec": "{split}_gene_event_count_matrix.parquet",
+    "gtype": "{split}_gene_mutation_type_matrix.parquet",
+    "parsed19": "{split}_mutation_parsed_features.parquet",
+    "burden8": "{split}_additional_burden_features.parquet",
+    "aa9": "{split}_amino_acid_features.parquet",
     # enc3 와 같은 파일이다 — Dataset 이 `block_cache_key` 기준으로 캐시해 두 번 안 읽는다.
     "comut": "{split}_mutation_encoded.parquet",
     # 잠재·모듈 블록도 같은 파일이고 `_select` 분기도 같은 유전자 갈래라
@@ -213,6 +224,12 @@ BLOCK_SOURCES = {
     "lnmf": "{split}_mutation_encoded.parquet",
     "gmod": "{split}_mutation_encoded.parquet",
     "csig": "{split}_mutation_encoded.parquet",
+}
+
+DENSE_BLOCK_COLUMNS = {
+    "parsed19": tuple(MUTATION_STRING_PARSED_COLUMNS),
+    "burden8": tuple(ADDITIONAL_BURDEN_FEATURE_COLUMNS),
+    "aa9": tuple(AMINO_ACID_FEATURE_COLUMNS),
 }
 
 #: `_select` 가 이름을 보고 갈라지는 블록 -> 그 분기의 이름. 여기 없는 블록은 전부
@@ -249,6 +266,11 @@ BLOCK_DESC = {
     "gec": "유전자 토큰수",
     "sigtok": "서명 TF-IDF",
     "exacttok": "원문토큰 TF-IDF (대조군)",
+    "ptok": "일반화 ParsedToken CountVectorizer",
+    "gtype": "유전자별 6종 변이 유형",
+    "parsed19": "Mutation 문자열 구조 19종",
+    "burden8": "추가 burden 8종",
+    "aa9": "아미노산 치환 페널티 9종",
     "comut": "공변이 쌍 (fold 안 선택)",
     "lsvd": "잠재 SVD (fold 안 fit)",
     "lnmf": "잠재 NMF (fold 안 fit)",
@@ -288,6 +310,32 @@ CONFIGS: dict[str, dict] = {
         "blocks": ("domain", "rollup16", "enc3"),
         "weight": "balanced",
         "desc": "도메인 + 시프트내성 rollup + 유전자",
+    },
+    # --- 오늘 추가된 피처의 독립 ablation ---------------------------------
+    "f4r_parse": {
+        "blocks": ("domain", "rollup16", "enc3", "parsed19"),
+        "weight": "balanced",
+        "desc": "f4r + Mutation 문자열 구조 19종",
+    },
+    "f4r_burden": {
+        "blocks": ("domain", "rollup16", "enc3", "burden8"),
+        "weight": "balanced",
+        "desc": "f4r + 추가 burden 8종",
+    },
+    "f4r_gtype": {
+        "blocks": ("domain", "rollup16", "enc3", "gtype"),
+        "weight": "balanced",
+        "desc": "f4r + 유전자별 6종 변이 유형",
+    },
+    "f4r_ptok": {
+        "blocks": ("domain", "rollup16", "enc3", "ptok"),
+        "weight": "balanced",
+        "desc": "f4r + 일반화 ParsedToken CountVectorizer",
+    },
+    "f4r_aa": {
+        "blocks": ("domain", "rollup16", "enc3", "aa9"),
+        "weight": "balanced",
+        "desc": "f4r + 아미노산 치환 페널티 9종",
     },
     # --- 중복 처리 전략 --------------------------------------------------
     # 서명 TF-IDF 축. f5x 를 대조군으로 함께 둔다 — "서명이 원문 문자열보다 낫다"는
@@ -617,6 +665,21 @@ class Dataset:
                 test_frame[columns].to_numpy(np.float32),
             )
 
+        if name in DENSE_BLOCK_COLUMNS:
+            columns = list(DENSE_BLOCK_COLUMNS[name])
+            missing_train = sorted(set(columns) - set(train_frame.columns))
+            missing_test = sorted(set(columns) - set(test_frame.columns))
+            if missing_train or missing_test:
+                raise ValueError(
+                    f"{name} 스키마 불일치: train 누락 {missing_train[:5]}, "
+                    f"test 누락 {missing_test[:5]}"
+                )
+            return (
+                columns,
+                train_frame[columns].to_numpy(np.float32),
+                test_frame[columns].to_numpy(np.float32),
+            )
+
         if name in ("rollup", "rollup16"):
             # BurdenBinner 가 fit 할 원본은 burden 2열을 붙이기 전 상태여야 한다.
             # `SUBCLASS` 도 빼야 한다 — train parquet 에만 있는 라벨이라 남겨 두면
@@ -735,6 +798,8 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     sparse_slug = (
         f"_sp{args.sparse_topk}m{args.tfidf_min_df}" if sparse_blocks else ""
     )
+    if "ptok" in sparse_blocks:
+        sparse_slug += f"p{args.parsed_min_df}"
     # 공변이 축도 같은 이유로 slug 가 필요하다. 파라미터가 11개라 전부 펴면 파일명을
     # 못 읽으니, 사다리로 실제로 바꾸는 4축(topk·pool·value·mode)만 노출하고 나머지는
     # digest 하나로 접는다. 전체 dict 는 결과 JSON 의 comut.params 에 그대로 남아서
@@ -893,15 +958,28 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         # train 과 test 를 합쳐 어휘를 만들면 규정 위반이다.
         for block in sparse_blocks:
             train_docs, test_docs = data.docs[block]
-            sparse_names, sparse_train, sparse_test = build_fold_tfidf_block(
-                train_docs,
-                test_docs,
-                train_index,
-                data.y[train_index],
-                prefix=f"tfidf__{block}__",
-                topk=args.sparse_topk,
-                min_df=args.tfidf_min_df,
-            )
+            if block == "ptok":
+                sparse_names, sparse_train, sparse_test = (
+                    build_fold_parsed_token_block(
+                        train_docs,
+                        test_docs,
+                        train_index,
+                        data.y[train_index],
+                        prefix="count__ptok__",
+                        topk=args.sparse_topk,
+                        min_df=args.parsed_min_df,
+                    )
+                )
+            else:
+                sparse_names, sparse_train, sparse_test = build_fold_tfidf_block(
+                    train_docs,
+                    test_docs,
+                    train_index,
+                    data.y[train_index],
+                    prefix=f"tfidf__{block}__",
+                    topk=args.sparse_topk,
+                    min_df=args.tfidf_min_df,
+                )
             selected.setdefault(block, {})[str(fold)] = sparse_names
             x_train = np.hstack([x_train, sparse_train])
             x_test = np.hstack([x_test, sparse_test])
@@ -1052,6 +1130,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             {
                 "blocks": sparse_blocks,
                 "min_df": args.tfidf_min_df,
+                "parsed_min_df": args.parsed_min_df,
                 "topk": args.sparse_topk,
             }
             if sparse_blocks
@@ -1339,6 +1418,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tfidf-min-df", type=int, default=3, help="TF-IDF 최소 문서 빈도"
+    )
+    parser.add_argument(
+        "--parsed-min-df",
+        type=int,
+        default=2,
+        help="ParsedToken CountVectorizer 최소 문서 빈도",
     )
     parser.add_argument(
         "--n-splits",
