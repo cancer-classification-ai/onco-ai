@@ -29,6 +29,17 @@
 읽어 자동으로 맞춘다 — 손으로 고르게 두면 OOF 를 만든 분할과 다른 번호가 붙어도
 아무 경고 없이 통과한다.
 
+## 산출물
+
+    oof.csv         sample_id, fold, true_label, prob_class_0..N
+    test_pred.csv   sample_id, prob_class_0..N
+    submission.csv  ID, SUBCLASS  — test_pred.csv 의 argmax
+    metrics.json    OOF·fold 별 macro F1 과 멤버 점수
+    config.json     클래스 매핑·피처 블록·분할
+
+`submission.csv` 는 `test_pred.csv` 에서 파생시킨다. 기존 제출 파일을 복사해 오면
+확률과 라벨이 서로 다른 실험에서 온 조합이 될 수 있는데 폴더만 봐서는 구분이 안 된다.
+
 ## 만들지 않는 것
 
 DACON 제출은 하지 않는다. 이 스크립트는 로컬 폴더만 만들고, 드라이브 업로드도
@@ -55,9 +66,11 @@ for _stream in (sys.stdout, sys.stderr):
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+from cancer_hack.io import write_submission  # noqa: E402
 from cancer_hack.metrics import macro_f1, read_prediction_frame  # noqa: E402
 
 DEFAULT_FOLDS = PROJECT_ROOT / "data/process/train_folds.parquet"
+DEFAULT_SAMPLE_SUBMISSION = PROJECT_ROOT / "data/raw/sample_submission.csv"
 DEFAULT_OUT = PROJECT_ROOT / "artifacts/drive_export"
 
 
@@ -117,6 +130,22 @@ def convert_test(test_path: Path, mapping: dict[str, int]) -> pd.DataFrame:
     return out
 
 
+def build_submission_frame(test: pd.DataFrame, mapping: dict[str, int]) -> pd.DataFrame:
+    """test 확률 -> `io.build_submission` 이 받는 프레임(`ID` / `y_pred`).
+
+    **같이 올리는 `test_pred.csv` 에서 그대로 뽑는다.** 기존 제출 파일을 복사해 오면
+    확률과 라벨이 다른 실험에서 온 조합이 될 수 있는데, 폴더만 봐서는 구분이 안 된다.
+    한 파일에서 파생시키면 그 어긋남이 원천적으로 불가능하다.
+    """
+    inverse = {index: name for name, index in mapping.items()}
+    columns = [f"prob_class_{i}" for i in range(len(mapping))]
+    labels = np.array([inverse[i] for i in range(len(mapping))])
+    return pd.DataFrame({
+        "ID": test["sample_id"],
+        "y_pred": labels[test[columns].to_numpy(np.float64).argmax(axis=1)],
+    })
+
+
 def build_metrics(oof: pd.DataFrame, mapping: dict[str, int], source_log: dict | None) -> dict:
     inverse = {index: name for name, index in mapping.items()}
     prob_columns = [f"prob_class_{i}" for i in range(len(mapping))]
@@ -157,6 +186,7 @@ def main() -> None:
     parser.add_argument("--test", type=Path, required=True)
     parser.add_argument("--log", type=Path, help="앙상블/학습 로그 json — fold_column 을 여기서 읽는다")
     parser.add_argument("--folds", type=Path, default=DEFAULT_FOLDS)
+    parser.add_argument("--sample-submission", type=Path, default=DEFAULT_SAMPLE_SUBMISSION)
     parser.add_argument("--fold-column", default=None, help="생략하면 --log 에서 읽는다")
     parser.add_argument("--version", required=True, help="v001 처럼")
     parser.add_argument("--config", required=True, help="f11 처럼 — 폴더 이름에 들어간다")
@@ -191,6 +221,14 @@ def main() -> None:
     oof.to_csv(folder / "oof.csv", index=False, encoding="utf-8")
     test.to_csv(folder / "test_pred.csv", index=False, encoding="utf-8")
 
+    # 제출 파일도 같이 넣는다 — 확률만 보면 "그래서 뭘 낸 거냐"를 되짚기 어렵다.
+    # test_pred.csv 에서 파생시키므로 둘이 어긋날 수 없다. 만들 뿐 올리지 않는다.
+    summary = write_submission(
+        build_submission_frame(test, mapping),
+        args.sample_submission,
+        folder / "submission.csv",
+    )
+
     with open(folder / "metrics.json", "w", encoding="utf-8") as handle:
         json.dump(metrics, handle, ensure_ascii=False, indent=2)
 
@@ -206,6 +244,7 @@ def main() -> None:
         "class_order_note": "prob_class_N 의 N 은 클래스 이름 알파벳순 인덱스다",
         "source_files": {"oof": args.oof.name, "test": args.test.name},
         "test_pred_note": "각 fold 의 test 예측을 평균한 값이다",
+        "submission_note": "test_pred.csv 의 argmax 다. DACON 업로드는 하지 않았다",
     }
     with open(folder / "config.json", "w", encoding="utf-8") as handle:
         json.dump(config, handle, ensure_ascii=False, indent=2)
@@ -219,6 +258,9 @@ def main() -> None:
     for path in sorted(folder.iterdir()):
         log(f"  {path.name:16s} {path.stat().st_size:>10,} bytes")
     log(f"\nOOF Macro F1 = {score:.4f}  ·  fold {sorted(oof['fold'].unique().tolist())}")
+    log(f"제출 {summary['rows']}행 · 클래스 {summary['n_classes']}종 · "
+        f"최다 {summary['top_class']} · 최소 {summary['rarest_class']}")
+    log("DACON 업로드는 하지 않는다 — 로컬 파일만 만들었다.")
     if not args.ready:
         log("READY.txt 는 안 만들었다 — 업로드가 끝난 뒤 --ready 로 붙인다.")
 
