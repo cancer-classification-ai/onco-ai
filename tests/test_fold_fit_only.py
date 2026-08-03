@@ -1077,3 +1077,28 @@ def test_f11_covers_every_cached_block():
         "comut", "lsvd", "lnmf", "gmod", "csig",
     }
     assert set(train_gbdt.CONFIGS["f11"]["blocks"]) == expected
+
+
+def test_f16_matches_the_shared_teammate_config():
+    """팀원 `repo_allfeat` 재현용이라 블록 구성이 그쪽 config.json 과 같아야 한다.
+
+    스태킹 멤버로 쓰려면 "같은 피처를 우리 fold 로 다시 뽑은 것"이어야 하는데,
+    블록이 하나라도 어긋나면 그 전제가 조용히 깨진다. 순서까지 고정한다 — 열 순서가
+    바뀌면 CatBoost 의 `rsm`(열 샘플링)이 다른 열을 뽑는다.
+    """
+    shared = (
+        "domain", "rollup", "enc3", "gec", "gtype", "parsed19", "burden8",
+        "aa9", "sigtok", "exacttok", "ptok", "comut", "lsvd", "lnmf",
+        "gmod", "csig",
+    )
+    assert train_gbdt.CONFIGS["f16"]["blocks"] == shared
+
+
+def test_f16_runs_both_latent_methods():
+    """팀원 실행은 lsvd·lnmf 동거 버그로 NMF 만 두 번 돌았다(슬러그 lt64nmf...).
+
+    고쳐진 코드에서는 SVD 와 NMF 가 각각 돌아야 한다. 여기가 되돌아가면 f16 이
+    재현하려던 16블록이 실제로는 15블록 + 중복 64열이 된다.
+    """
+    latent = [b for b in train_gbdt.CONFIGS["f16"]["blocks"] if b in train_gbdt.LATENT_BLOCKS]
+    assert train_gbdt._resolve_latent_methods(latent, "svd") == ["svd", "nmf"]

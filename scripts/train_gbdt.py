@@ -439,6 +439,27 @@ CONFIGS: dict[str, dict] = {
         "weight": "balanced",
         "desc": "캐시 11블록 전부 — 앙상블 입력",
     },
+    # 팀원(CatBoost 담당)이 Colab 에서 돌린 `repo_allfeat` 재현용. 블록 구성과 CLI
+    # 기본값을 그쪽 config.json 그대로 맞췄다 — `rollup16` 이 아니라 `rollup` 이고
+    # `kpath` 는 제외다.
+    #
+    # 그쪽 결과와 숫자가 그대로 맞지는 않는다. 이유가 둘 있다.
+    #   1. fold 가 다르다. 그쪽은 Colab 에서 새로 만든 group 분할이라 우리 두 분할
+    #      어느 쪽과도 20% 밖에 안 겹친다. 스태킹을 하려면 우리 fold 로 다시 뽑아야 한다.
+    #   2. 그쪽 실행에는 lsvd·lnmf 동거 버그가 있었다. 슬러그가 `lt64nmfl2bb3575`
+    #      (NMF 단독)라 SVD 는 안 돌고 NMF 64열이 두 벌 붙었다. 여기서는 고쳐진 코드로
+    #      도니 SVD 64 + NMF 64 가 제대로 들어간다.
+    #
+    # gtype 은 원본 26,304열이라 이 config 를 돌리면 메모리를 900MB 쯤 더 쓴다.
+    "f16": {
+        "blocks": (
+            "domain", "rollup", "enc3", "gec", "gtype", "parsed19", "burden8",
+            "aa9", "sigtok", "exacttok", "ptok", "comut", "lsvd", "lnmf",
+            "gmod", "csig",
+        ),
+        "weight": "balanced",
+        "desc": "구현된 피처 16블록 전부 — 팀원 repo_allfeat 재현",
+    },
 }
 
 #: 모델별 기본 하이퍼파라미터.
