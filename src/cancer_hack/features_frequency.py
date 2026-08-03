@@ -11,6 +11,7 @@ document frequency이고, token rarity는 smoothed IDF다.
 
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from collections.abc import Iterator, Sequence
@@ -18,14 +19,21 @@ from collections.abc import Iterator, Sequence
 import numpy as np
 import pandas as pd
 
-from .parser import split_tokens
+from .parser import classify_token, split_tokens
 
 TOKEN_PREFIX = "MUT__"
 AA_CHANGE_PREFIX = "AA__"
 EXACT_MUTATION_PREFIX = "EXACT__"
 POSITION_PREFIX = "POS__"
+STANDARD_AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+N_DIRECTED_MISSENSE_TRANSITIONS = len(STANDARD_AMINO_ACIDS) * (
+    len(STANDARD_AMINO_ACIDS) - 1
+)
 _META_COLUMNS = frozenset({"ID", "SUBCLASS", "fold"})
 _POSITION_RE = re.compile(r"\d+")
+_MISSENSE_TRANSITION_RE = re.compile(
+    rf"^([{STANDARD_AMINO_ACIDS}])\d+([{STANDARD_AMINO_ACIDS}])$"
+)
 
 FREQUENCY_RARITY_FEATURE_COLUMNS: tuple[str, ...] = (
     "rare_mutation_token_count",
@@ -49,6 +57,18 @@ FREQUENCY_RARITY_FEATURE_COLUMNS: tuple[str, ...] = (
     "mean_position_frequency",
     "min_position_frequency",
     "max_position_frequency",
+)
+
+AA_TRANSITION_FEATURE_COLUMNS: tuple[str, ...] = (
+    "aa_transition_frequency_mean",
+    "aa_transition_frequency_max",
+    "aa_transition_rarity_mean",
+    "aa_transition_rarity_max",
+    "aa_transition_log_odds_mean",
+    "aa_transition_log_odds_min",
+    "aa_transition_log_odds_max",
+    "aa_unseen_transition_count",
+    "aa_unseen_transition_ratio",
 )
 
 
@@ -90,6 +110,39 @@ def _position_token(mutation: str) -> str | None:
     if not positions:
         return None
     return f"{POSITION_PREFIX}{'_'.join(positions)}"
+
+
+def _parse_missense_transition(mutation: str) -> tuple[str, str] | None:
+    """현재 parser가 missense로 판정한 표준 AA 치환에서 방향성 pair를 뽑는다."""
+    if classify_token(mutation) != "missense":
+        return None
+    matched = _MISSENSE_TRANSITION_RE.fullmatch(mutation)
+    if matched is None:
+        return None
+    wt, mutant = matched.groups()
+    if wt == mutant:
+        return None
+    return wt, mutant
+
+
+def _iter_sample_transitions(
+    frame: pd.DataFrame,
+    gene_columns: Sequence[str],
+    *,
+    unique_transitions_per_sample: bool,
+) -> Iterator[list[tuple[str, str]]]:
+    """샘플별 directed WT→mutant pair를 기존 공백 token parser로 추출한다."""
+    values = frame[list(gene_columns)].to_numpy(dtype=object)
+    for row in values:
+        transitions: list[tuple[str, str]] = []
+        for value in row:
+            for mutation in split_tokens(value):
+                transition = _parse_missense_transition(mutation)
+                if transition is not None:
+                    transitions.append(transition)
+        if unique_transitions_per_sample:
+            transitions = sorted(set(transitions))
+        yield transitions
 
 
 def _iter_sample_entities(
@@ -376,9 +429,7 @@ class TrainFrequencyFeatures:
         gene_columns: Sequence[str] | None = None,
     ) -> pd.DataFrame:
         """``fit(train_frame).transform(train_frame)`` 편의 메서드."""
-        return self.fit(
-            train_frame, gene_columns=gene_columns
-        ).transform(
+        return self.fit(train_frame, gene_columns=gene_columns).transform(
             train_frame, gene_columns=gene_columns
         )
 
@@ -474,4 +525,229 @@ class TrainFrequencyFeatures:
             raise RuntimeError(
                 "TrainFrequencyFeatures.fit()을 train 또는 train fold에서 먼저 "
                 "호출해야 합니다."
+            )
+
+
+class TrainAATransitionFeatures:
+    """Train-fold 내부 directed WT→mutant 빈도·희귀도·log-odds 피처.
+
+    물리화학적 변화량이 아니라 대회 train fold 안에서 관찰된 치환 경향을
+    표현한다. 기본값은 한 샘플 안의 같은 transition을 한 번만 세는 document
+    frequency 방식이다. ``fit``과 ``transform``에 동일한 중복 규칙을 적용한다.
+    """
+
+    def __init__(
+        self,
+        *,
+        alpha: float = 1.0,
+        unique_transitions_per_sample: bool = True,
+    ) -> None:
+        if alpha <= 0:
+            raise ValueError("alpha must be > 0")
+        self.alpha = float(alpha)
+        self.unique_transitions_per_sample = bool(unique_transitions_per_sample)
+
+        self.n_train_samples_: int | None = None
+        self.gene_columns_: tuple[str, ...] | None = None
+        self.transition_document_count_: dict[tuple[str, str], int] | None = None
+        self.wt_transition_count_: dict[str, int] | None = None
+        self.mutant_transition_count_: dict[str, int] | None = None
+        self.total_transition_count_: int | None = None
+
+    def fit(
+        self,
+        train_frame: pd.DataFrame,
+        *,
+        gene_columns: Sequence[str] | None = None,
+    ) -> "TrainAATransitionFeatures":
+        """Train 또는 train fold의 directed missense transition만 집계한다."""
+        if train_frame.empty:
+            raise ValueError("Cannot fit AA transition features on an empty frame")
+        genes = _resolve_gene_columns(train_frame, gene_columns)
+
+        pair_counts: Counter[tuple[str, str]] = Counter()
+        wt_counts: Counter[str] = Counter()
+        mutant_counts: Counter[str] = Counter()
+        for transitions in _iter_sample_transitions(
+            train_frame,
+            genes,
+            unique_transitions_per_sample=self.unique_transitions_per_sample,
+        ):
+            for wt, mutant in transitions:
+                pair_counts[(wt, mutant)] += 1
+                wt_counts[wt] += 1
+                mutant_counts[mutant] += 1
+
+        self.n_train_samples_ = len(train_frame)
+        self.gene_columns_ = tuple(genes)
+        self.transition_document_count_ = {
+            pair: int(count) for pair, count in pair_counts.items()
+        }
+        self.wt_transition_count_ = {
+            aa: int(wt_counts.get(aa, 0)) for aa in STANDARD_AMINO_ACIDS
+        }
+        self.mutant_transition_count_ = {
+            aa: int(mutant_counts.get(aa, 0)) for aa in STANDARD_AMINO_ACIDS
+        }
+        self.total_transition_count_ = int(sum(pair_counts.values()))
+        return self
+
+    def transform(
+        self,
+        frame: pd.DataFrame,
+        *,
+        gene_columns: Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        """저장된 train-fold transition 통계만 사용해 샘플 피처를 만든다."""
+        self._check_fitted()
+        genes = self._validate_transform_columns(frame, gene_columns)
+        output = np.zeros(
+            (len(frame), len(AA_TRANSITION_FEATURE_COLUMNS)),
+            dtype=np.float32,
+        )
+
+        for row_idx, transitions in enumerate(
+            _iter_sample_transitions(
+                frame,
+                genes,
+                unique_transitions_per_sample=self.unique_transitions_per_sample,
+            )
+        ):
+            if not transitions:
+                continue
+
+            frequencies = np.empty(len(transitions), dtype=np.float64)
+            rarities = np.empty(len(transitions), dtype=np.float64)
+            log_odds_values = np.empty(len(transitions), dtype=np.float64)
+            unseen_count = 0
+            for transition_idx, (wt, mutant) in enumerate(transitions):
+                frequency, rarity, log_odds, unseen = self._score_transition(
+                    wt, mutant
+                )
+                frequencies[transition_idx] = frequency
+                rarities[transition_idx] = rarity
+                log_odds_values[transition_idx] = log_odds
+                unseen_count += int(unseen)
+
+            output[row_idx] = (
+                frequencies.mean(),
+                frequencies.max(),
+                rarities.mean(),
+                rarities.max(),
+                log_odds_values.mean(),
+                log_odds_values.min(),
+                log_odds_values.max(),
+                unseen_count,
+                unseen_count / len(transitions),
+            )
+
+        return pd.DataFrame(
+            output,
+            columns=list(AA_TRANSITION_FEATURE_COLUMNS),
+            index=frame.index,
+        )
+
+    def fit_transform(
+        self,
+        train_frame: pd.DataFrame,
+        *,
+        gene_columns: Sequence[str] | None = None,
+    ) -> pd.DataFrame:
+        return self.fit(
+            train_frame, gene_columns=gene_columns
+        ).transform(
+            train_frame, gene_columns=gene_columns
+        )
+
+    def get_transition_statistics(self) -> pd.DataFrame:
+        """관측된 transition별 count/frequency/rarity/log-odds 표."""
+        self._check_fitted()
+        rows: list[dict[str, object]] = []
+        for wt, mutant in sorted(self.transition_document_count_):
+            frequency, rarity, log_odds, _ = self._score_transition(wt, mutant)
+            rows.append(
+                {
+                    "wt": wt,
+                    "mutant": mutant,
+                    "document_count": self.transition_document_count_[(wt, mutant)],
+                    "frequency": frequency,
+                    "conditional_rarity": rarity,
+                    "log_odds": log_odds,
+                }
+            )
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "wt",
+                "mutant",
+                "document_count",
+                "frequency",
+                "conditional_rarity",
+                "log_odds",
+            ],
+        )
+
+    def get_feature_names_out(self) -> np.ndarray:
+        return np.asarray(AA_TRANSITION_FEATURE_COLUMNS, dtype=object)
+
+    def _score_transition(
+        self,
+        wt: str,
+        mutant: str,
+    ) -> tuple[float, float, float, bool]:
+        pair_count = self.transition_document_count_.get((wt, mutant), 0)
+        wt_count = self.wt_transition_count_.get(wt, 0)
+        mutant_count = self.mutant_transition_count_.get(mutant, 0)
+
+        # 동일 AA는 missense에서 제외하므로 WT당 가능한 mutant는 19종이다.
+        conditional_probability = (
+            pair_count + self.alpha
+        ) / (
+            wt_count + (len(STANDARD_AMINO_ACIDS) - 1) * self.alpha
+        )
+        rarity = -math.log(conditional_probability)
+
+        # 20 × 19 directed missense pair 전체에 additive smoothing을 적용한다.
+        denominator = (
+            self.total_transition_count_
+            + N_DIRECTED_MISSENSE_TRANSITIONS * self.alpha
+        )
+        joint_probability = (pair_count + self.alpha) / denominator
+        wt_probability = (
+            wt_count + (len(STANDARD_AMINO_ACIDS) - 1) * self.alpha
+        ) / denominator
+        mutant_probability = (
+            mutant_count + (len(STANDARD_AMINO_ACIDS) - 1) * self.alpha
+        ) / denominator
+        log_odds = math.log(
+            joint_probability / (wt_probability * mutant_probability)
+        )
+
+        frequency = pair_count / self.n_train_samples_
+        return float(frequency), float(rarity), float(log_odds), pair_count == 0
+
+    def _validate_transform_columns(
+        self,
+        frame: pd.DataFrame,
+        gene_columns: Sequence[str] | None,
+    ) -> list[str]:
+        genes = (
+            list(self.gene_columns_)
+            if gene_columns is None
+            else _resolve_gene_columns(frame, gene_columns)
+        )
+        missing = sorted(set(genes).difference(frame.columns))
+        if missing:
+            raise ValueError(f"Missing gene columns: {missing[:10]}")
+        if tuple(genes) != self.gene_columns_:
+            raise ValueError(
+                "gene_columns must match fit() columns and order exactly"
+            )
+        return genes
+
+    def _check_fitted(self) -> None:
+        if self.n_train_samples_ is None:
+            raise RuntimeError(
+                "TrainAATransitionFeatures.fit()을 train 또는 train fold에서 "
+                "먼저 호출해야 합니다."
             )

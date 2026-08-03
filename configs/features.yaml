@@ -15,3 +15,10 @@ frequency_rarity:
   token_rarity: smoothed_idf
   rare_df_threshold: 2
   unseen_token_frequency: 0.0
+
+aa_transition:
+  enabled: false
+  alpha: 1.0
+  unique_transitions_per_sample: true
+  frequency_basis: train_fold_sample_document_frequency
+  conditional_smoothing_categories: 19
