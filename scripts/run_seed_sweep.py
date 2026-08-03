@@ -64,9 +64,13 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 ARTIFACTS = PROJECT_ROOT / "artifacts"
 PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
 
-# --- v002 를 재현하는 설정. 여기를 바꾸면 기준선과 비교가 깨진다 -----------------
+# --- v002 를 재현하는 설정. `--config` 로 고르는 축 말고는 바꾸지 않는다 -----------
+#: 기본은 v002 의 피처 구성. `--config f16n` 이면 tag 도 같이 바뀐다(TAG_BY_CONFIG).
 CONFIG = "f16"
 TAG = "repo16"
+
+#: config -> train_gbdt 의 --tag. 파일명 stem 이 이걸로 갈리므로 섞이면 안 된다.
+TAG_BY_CONFIG = {"f16": "repo16", "f16r": "repo16r", "f16n": "repo16n"}
 TOPK = 500
 N_SPLITS = 5
 MODELS = ["xgb", "catboost", "rf"]
@@ -192,7 +196,7 @@ def blend_report(args) -> None:
                 log(f"  {cv_name:7s} seed {n_seed}개  {scheme:16s} macro F1 = {score:.4f}")
 
     if rows:
-        out = ARTIFACTS / "logs" / "seed_sweep_blend_report.json"
+        out = ARTIFACTS / "logs" / f"seed_sweep_blend_{CONFIG}.json"
         out.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
         best = max(rows, key=lambda r: r["macro_f1"])
         log(f"\n최고: {best['cv']} · seed {best['n_seed']}개 · {best['weights']} "
@@ -204,6 +208,19 @@ def blend_report(args) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--config", default=CONFIG, choices=sorted(TAG_BY_CONFIG),
+        help="피처 구성. f16 = v002 기준선, f16n = gec 행정규화, f16r = rollup16",
+    )
+    parser.add_argument(
+        "--seeds", type=int, nargs="+", default=None,
+        help=f"채울 seed 를 고른다 (기본 {SEEDS}). 앞에서부터 잘라 쓰는 게 안전하다 — "
+        "blend 가 SEEDS 순서로 3/4/5개를 자른다",
+    )
+    parser.add_argument(
+        "--only-cv", choices=sorted(CV_KEYS), default=None,
+        help="한 분할만 채운다. 쓸 수 있는 베이스라인을 먼저 만들 때 group5 만 돌리면 절반이다",
+    )
     parser.add_argument("--dry-run", action="store_true", help="계획만 찍고 끝낸다")
     parser.add_argument("--blend-only", action="store_true",
                         help="학습을 건너뛰고 이미 있는 파일로 12 조합만 비교한다")
@@ -212,7 +229,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
-    log(f"기준선 v002 설정 — config {CONFIG} · tag {TAG} · topk {TOPK} · "
+    # 모듈 전역을 갈아끼운다. `paths_for`·`is_complete` 가 이걸 보고 stem 을 만든다 —
+    # 여기서 tag 를 같이 안 바꾸면 f16n 파일을 f16 이름으로 찾아 전부 "없음" 이 된다.
+    globals()["CONFIG"] = args.config
+    globals()["TAG"] = TAG_BY_CONFIG[args.config]
+    if args.seeds:
+        unknown = [s for s in args.seeds if s not in SEEDS]
+        if unknown:
+            raise SystemExit(f"SEEDS 에 없는 seed {unknown} — blend 가 못 집는다. {SEEDS} 중에서 고른다")
+        globals()["SEEDS"] = [s for s in SEEDS if s in args.seeds]  # 원래 순서 유지
+    if args.only_cv:
+        globals()["CV_KEYS"] = {args.only_cv: CV_KEYS[args.only_cv]}
+    log(f"설정 — config {CONFIG} · tag {TAG} · topk {TOPK} · "
         f"n_splits {N_SPLITS} · weight balanced · folds {FOLDS_FILE.name}")
     log(f"seed {SEEDS} × 모델 {MODELS} × 분할 {list(CV_KEYS)}")
 
