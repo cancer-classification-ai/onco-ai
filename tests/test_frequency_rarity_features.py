@@ -173,3 +173,132 @@ def test_statistics_tables_are_stable_and_shareable(frequency_train):
         "idf",
     ]
     assert token_stats["mutation_token"].is_monotonic_increasing
+
+
+def test_five_frequency_families_are_distinct_and_backward_compatible():
+    frame = pd.DataFrame(
+        {
+            "TP53": ["R175H", "R175H Q369*", "WT"],
+            "KRAS": ["WT", "WT", "R175H"],
+        }
+    )
+    builder = TrainFrequencyFeatures().fit(
+        frame, gene_columns=["TP53", "KRAS"]
+    )
+
+    assert builder.gene_frequency_["TP53"] == pytest.approx(2 / 3)
+    assert builder.aa_change_frequency_["AA__R175H"] == 1.0
+    assert builder.gene_aa_change_frequency_["MUT__TP53__R175H"] == pytest.approx(
+        2 / 3
+    )
+    assert builder.gene_aa_change_frequency_["MUT__KRAS__R175H"] == pytest.approx(
+        1 / 3
+    )
+    assert builder.position_frequency_["POS__175"] == 1.0
+    assert builder.exact_mutation_frequency_["EXACT__TP53__Q369*|R175H"] == pytest.approx(
+        1 / 3
+    )
+
+    # token_*은 기존 노트북 호환용 gene_aa_change alias다.
+    assert builder.token_frequency_ is builder.gene_aa_change_frequency_
+    assert builder.token_document_count_ is builder.gene_aa_change_document_count_
+
+
+def test_exact_cell_signature_ignores_order_but_preserves_duplicate_count():
+    frame = pd.DataFrame(
+        {
+            "TP53": [
+                "R175H Q369*",
+                "Q369* R175H",
+                "R175H R175H Q369*",
+            ]
+        }
+    )
+    builder = TrainFrequencyFeatures().fit(frame, gene_columns=["TP53"])
+
+    assert (
+        builder.exact_mutation_document_count_["EXACT__TP53__Q369*|R175H"] == 2
+    )
+    assert (
+        builder.exact_mutation_document_count_[
+            "EXACT__TP53__Q369*|R175H|R175H"
+        ]
+        == 1
+    )
+
+
+def test_position_frequency_uses_numeric_signature_without_expanding_ranges():
+    frame = pd.DataFrame(
+        {
+            "TP53": ["E746_A750del", "WT"],
+            "EGFR": ["WT", "746_750QY>HH"],
+        }
+    )
+    builder = TrainFrequencyFeatures().fit(
+        frame, gene_columns=["TP53", "EGFR"]
+    )
+
+    assert builder.position_document_count_ == {"POS__746_750": 2}
+    assert builder.position_frequency_["POS__746_750"] == 1.0
+
+
+def test_new_frequency_aggregates_are_fixed_and_finite():
+    train = pd.DataFrame(
+        {
+            "TP53": ["R175H", "R175H Q369*", "WT"],
+            "KRAS": ["WT", "WT", "G12D"],
+        }
+    )
+    builder = TrainFrequencyFeatures().fit(
+        train, gene_columns=["TP53", "KRAS"]
+    )
+    validation = pd.DataFrame(
+        {
+            "TP53": ["R175H Q369*", "WT"],
+            "KRAS": ["G13D", "WT"],
+        },
+        index=[7, 8],
+    )
+    out = builder.transform(
+        validation, gene_columns=["TP53", "KRAS"]
+    )
+
+    expected_new_columns = (
+        "mean_exact_mutation_frequency",
+        "min_exact_mutation_frequency",
+        "max_exact_mutation_frequency",
+        "mean_aa_change_frequency",
+        "min_aa_change_frequency",
+        "max_aa_change_frequency",
+        "max_gene_aa_change_frequency",
+        "mean_position_frequency",
+        "min_position_frequency",
+        "max_position_frequency",
+    )
+    assert tuple(out.columns[-10:]) == expected_new_columns
+    assert out.loc[7, "min_aa_change_frequency"] == 0.0
+    assert out.loc[7, "max_aa_change_frequency"] == pytest.approx(2 / 3)
+    assert out.loc[8, list(expected_new_columns)].sum() == 0.0
+    assert np.isfinite(
+        out[list(expected_new_columns)].to_numpy(dtype=np.float64)
+    ).all()
+
+
+def test_frequency_statistics_lists_all_new_families(frequency_train):
+    builder = TrainFrequencyFeatures().fit(
+        frequency_train, gene_columns=["TP53", "KRAS", "EGFR"]
+    )
+    stats = builder.get_frequency_statistics()
+
+    assert list(stats.columns) == [
+        "family",
+        "key",
+        "document_count",
+        "frequency",
+    ]
+    assert set(stats["family"]) == {
+        "exact_mutation",
+        "aa_change",
+        "gene_aa_change",
+        "position",
+    }
