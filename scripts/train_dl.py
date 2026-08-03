@@ -192,6 +192,7 @@ def make_loader(
 def train_one_fold(
     model: nn.Module,
     train_loader: DataLoader,
+    valid_loader: DataLoader,
     *,
     device: torch.device,
     epochs: int,
@@ -199,7 +200,8 @@ def train_one_fold(
     weight_decay: float,
     gradient_clip: float,
     weights: torch.Tensor | None,
-) -> list[float]:
+    early_stopping: dict[str, object],
+) -> dict[str, object]:
     criterion = nn.CrossEntropyLoss(
         weight=None if weights is None else weights.to(device)
     )
@@ -209,9 +211,29 @@ def train_one_fold(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(epochs, 1)
     )
-    history: list[float] = []
-    model.train()
-    for _ in range(epochs):
+    train_history: list[float] = []
+    valid_loss_history: list[float] = []
+    valid_f1_history: list[float] = []
+    enabled = bool(early_stopping.get("enabled", False))
+    monitor = str(early_stopping.get("monitor", "val_macro_f1"))
+    if monitor not in ("val_macro_f1", "val_loss"):
+        raise ValueError(f"unsupported early-stopping monitor: {monitor}")
+    patience = int(early_stopping.get("patience", 10))
+    min_epochs = int(early_stopping.get("min_epochs", 1))
+    min_delta = float(early_stopping.get("min_delta", 0.0))
+    restore_best = bool(early_stopping.get("restore_best_weights", True))
+    if patience < 1 or min_epochs < 1 or min_delta < 0:
+        raise ValueError(
+            "early stopping requires patience/min_epochs >= 1 and min_delta >= 0"
+        )
+    best_metric = float("-inf")
+    best_epoch = 0
+    best_state: dict[str, torch.Tensor] | None = None
+    stale_epochs = 0
+    stopped_epoch = epochs
+
+    for epoch in range(epochs):
+        model.train()
         total_loss = 0.0
         total_rows = 0
         for batch in train_loader:
@@ -227,8 +249,67 @@ def train_one_fold(
             total_loss += float(loss.detach()) * rows
             total_rows += rows
         scheduler.step()
-        history.append(total_loss / max(total_rows, 1))
-    return history
+        train_loss = total_loss / max(total_rows, 1)
+        train_history.append(train_loss)
+
+        if not enabled:
+            continue
+
+        model.eval()
+        valid_loss = 0.0
+        valid_rows = 0
+        valid_true: list[np.ndarray] = []
+        valid_pred: list[np.ndarray] = []
+        with torch.inference_mode():
+            for batch in valid_loader:
+                batch = move_batch(batch, device)
+                logits = model(batch)
+                loss = criterion(logits, batch["labels"])
+                rows = int(batch["labels"].shape[0])
+                valid_loss += float(loss) * rows
+                valid_rows += rows
+                valid_true.append(batch["labels"].cpu().numpy())
+                valid_pred.append(logits.argmax(dim=1).cpu().numpy())
+        valid_loss /= max(valid_rows, 1)
+        valid_f1 = macro_f1(
+            np.concatenate(valid_true), np.concatenate(valid_pred)
+        )
+        valid_loss_history.append(valid_loss)
+        valid_f1_history.append(valid_f1)
+        metric = valid_f1 if monitor == "val_macro_f1" else -valid_loss
+        if metric > best_metric + min_delta:
+            best_metric = metric
+            best_epoch = epoch + 1
+            stale_epochs = 0
+            best_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+        else:
+            stale_epochs += 1
+        print(
+            f"    epoch {epoch + 1:02d}/{epochs} train_loss={train_loss:.4f} "
+            f"val_loss={valid_loss:.4f} val_macro_f1={valid_f1:.4f}"
+        )
+        if epoch + 1 >= min_epochs and stale_epochs >= patience:
+            stopped_epoch = epoch + 1
+            break
+
+    if enabled and restore_best and best_state is not None:
+        model.load_state_dict(best_state)
+    if not enabled:
+        best_epoch = len(train_history)
+        best_metric = None
+        stopped_epoch = len(train_history)
+    return {
+        "train_loss": train_history,
+        "val_loss": valid_loss_history,
+        "val_macro_f1": valid_f1_history,
+        "best_epoch": best_epoch,
+        "best_metric": best_metric,
+        "stopped_epoch": stopped_epoch,
+        "monitor": monitor if enabled else None,
+    }
 
 
 @torch.inference_mode()
@@ -250,6 +331,7 @@ def main() -> None:
             f"CLI model {args.model!r} differs from config model {configured_model!r}"
         )
     training = dict(config.get("training", {}))
+    early_stopping = dict(training.get("early_stopping", {}))
     tokenizer_config = dict(config.get("tokenizer", {}))
     model_params = dict(config.get("model_params", {}))
     epochs = int(args.epochs or training.get("epochs", 30))
@@ -310,6 +392,7 @@ def main() -> None:
     )
     fold_scores: list[float] = []
     fold_losses: list[list[float]] = []
+    fold_training: list[dict[str, object]] = []
     started = time.perf_counter()
     fold_values = range(1) if args.dry_run else range(args.n_splits)
 
@@ -372,15 +455,17 @@ def main() -> None:
             if bool(training.get("class_weight", True))
             else None
         )
-        loss_history = train_one_fold(
+        training_result = train_one_fold(
             model,
             train_loader,
+            valid_loader,
             device=device,
             epochs=epochs,
             learning_rate=float(training.get("learning_rate", 1e-3)),
             weight_decay=float(training.get("weight_decay", 1e-4)),
             gradient_clip=float(training.get("gradient_clip", 1.0)),
             weights=weights,
+            early_stopping=early_stopping,
         )
         valid_probability = predict(model, valid_loader, device)
         oof[valid_index] = valid_probability
@@ -389,10 +474,12 @@ def main() -> None:
             labels[valid_index], valid_probability.argmax(axis=1)
         )
         fold_scores.append(score)
-        fold_losses.append(loss_history)
+        fold_losses.append(training_result["train_loss"])
+        fold_training.append(training_result)
         print(
             f"fold {fold + 1}/{len(fold_values)} "
-            f"loss={loss_history[-1]:.4f} Macro F1={score:.4f}"
+            f"best_epoch={training_result['best_epoch']} "
+            f"loss={training_result['train_loss'][-1]:.4f} Macro F1={score:.4f}"
         )
         del model
         if device.type == "cuda":
@@ -443,6 +530,8 @@ def main() -> None:
         "n_features": int(dense_bundle.train.shape[1] + 2),
         "fold_macro_f1": fold_scores,
         "fold_train_loss": fold_losses,
+        "fold_training": fold_training,
+        "early_stopping": early_stopping,
         "oof_macro_f1": summary["macro_f1"],
         "oof_macro_f1_singleton": singleton_score,
         "n_singleton": int(singleton_mask.sum()),

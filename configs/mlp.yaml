@@ -2,13 +2,20 @@ model: mlp
 
 model_params:
   hidden_dims: [512, 256]
-  dropout: 0.20
+  dropout: 0.25
 
 training:
-  epochs: 30
+  epochs: 60
   batch_size: 128
-  learning_rate: 0.001
+  learning_rate: 0.0007
   weight_decay: 0.0001
   gradient_clip: 1.0
   class_weight: true
   num_workers: 0
+  early_stopping:
+    enabled: true
+    monitor: val_macro_f1
+    patience: 8
+    min_epochs: 15
+    min_delta: 0.001
+    restore_best_weights: true
