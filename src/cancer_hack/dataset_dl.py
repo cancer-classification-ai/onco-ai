@@ -29,7 +29,20 @@ from .features_basic import (
     MUTATION_STRING_PARSED_COLUMNS,
 )
 from .features_domain import DOMAIN_PREFIXES, align_domain_columns
-from .parser import ALL_KINDS, classify_token, split_tokens, token_signature
+from .parser import (
+    ALL_KINDS,
+    DELETION,
+    DELINS,
+    FRAMESHIFT,
+    INSERTION,
+    MISSENSE,
+    NONSENSE,
+    OTHER,
+    SYNONYMOUS,
+    classify_token,
+    split_tokens,
+    token_signature,
+)
 
 
 ROBUST_ROLLUP_COLUMNS: tuple[str, ...] = (
@@ -54,9 +67,40 @@ _SUBSTITUTION_RE = re.compile(r"^([A-Z*])\d+([A-Z*])$")
 _RANGE_SUBSTITUTION_RE = re.compile(r"^\d+_\d+([A-Z*]+)>([A-Z*]+)$")
 _INSERTED_RE = re.compile(r"(?:DELINS|INS|DUP)([A-Z*]+)$")
 _FRAMESHIFT_ALT_RE = re.compile(r"^[A-Z*]+\d+([A-Z*]+)FS$")
+_PREFIX_BEFORE_POSITION_RE = re.compile(r"^([^0-9]*)\d+")
 _AMINO_ACIDS = "*-ACDEFGHIKLMNPQRSTVWXY"
 _AA_TO_ID = {aa: index + 1 for index, aa in enumerate(_AMINO_ACIDS)}
 _KIND_TO_ID = {kind: index + 1 for index, kind in enumerate(ALL_KINDS)}
+
+GENE_RULE_FEATURE_NAMES: tuple[str, ...] = (
+    "variant_count",
+    "unique_variant_count",
+    "duplicate_count",
+    "unique_position_count",
+    "missense_ratio",
+    "synonymous_ratio",
+    "nonsense_ratio",
+    "frameshift_ratio",
+    "indel_ratio",
+    "unknown_type_ratio",
+    "log1p_min_position",
+    "log1p_max_position",
+    "log1p_position_span",
+    "log1p_min_position_distance",
+    "same_position_ratio",
+    "has_multiple_variants",
+    "has_mixed_mutation_types",
+    "has_duplicate_variant",
+    "has_unknown_token",
+)
+
+GENE_RULE_FEATURE_GROUPS: dict[str, tuple[int, ...]] = {
+    "counts": (0, 1, 3),
+    "type_ratios": (4, 5, 6, 7, 8, 9),
+    "position_stats": (10, 11, 12, 13, 14),
+    "duplicate_stats": (2, 17),
+    "state_flags": (15, 16, 18),
+}
 
 
 @dataclass(frozen=True)
@@ -67,6 +111,9 @@ class MutationToken:
     alt_id: int
     position_id: int
     signature_id: int
+    position: int
+    raw_key: str
+    has_unknown: bool
 
 
 class MutationTokenizer:
@@ -117,6 +164,7 @@ class MutationTokenizer:
                 position // self.position_bin_size + 1, self.max_position_bins
             )
         else:
+            position = 0
             position_id = 0
         signature = token_signature(token, kind)
         digest = hashlib.blake2b(signature.encode("utf-8"), digest_size=8).digest()
@@ -128,6 +176,9 @@ class MutationTokenizer:
             alt_id=alt_id,
             position_id=position_id,
             signature_id=signature_id,
+            position=position,
+            raw_key=str(token).strip().upper(),
+            has_unknown=(kind == OTHER or not ref),
         )
 
     def encode_cell(
@@ -148,7 +199,9 @@ def _amino_acid_endpoints(token: str) -> tuple[str, str]:
     matched = _RANGE_SUBSTITUTION_RE.match(token)
     if matched:
         return matched.group(1)[0], matched.group(2)[0]
-    ref = token[0] if token and token[0] in _AA_TO_ID else ""
+    prefix_match = _PREFIX_BEFORE_POSITION_RE.match(token)
+    prefix = prefix_match.group(1) if prefix_match else ""
+    ref = prefix if len(prefix) == 1 and prefix in _AA_TO_ID else ""
     matched = _INSERTED_RE.search(token)
     if matched:
         return ref, matched.group(1)[0]
@@ -237,10 +290,14 @@ def collate_mutation_samples(items: Sequence[dict[str, object]]) -> dict[str, ob
     }
     token_to_gene: list[int] = []
     gene_to_sample: list[int] = []
+    gene_ids: list[int] = []
+    gene_rule_stats: list[list[float]] = []
     gene_index = 0
     for sample_index, item in enumerate(items):
         for gene_tokens in item["sample"]:
             gene_to_sample.append(sample_index)
+            gene_ids.append(gene_tokens[0].gene_id)
+            gene_rule_stats.append(_gene_rule_stats(gene_tokens))
             for token in gene_tokens:
                 for name in fields:
                     fields[name].append(getattr(token, name))
@@ -253,6 +310,11 @@ def collate_mutation_samples(items: Sequence[dict[str, object]]) -> dict[str, ob
     }
     batch["token_to_gene"] = torch.as_tensor(token_to_gene, dtype=torch.long)
     batch["gene_to_sample"] = torch.as_tensor(gene_to_sample, dtype=torch.long)
+    batch["gene_ids"] = torch.as_tensor(gene_ids, dtype=torch.long)
+    batch["gene_rule_stats"] = torch.as_tensor(
+        gene_rule_stats,
+        dtype=torch.float32,
+    ).reshape(-1, len(GENE_RULE_FEATURE_NAMES))
     batch["sample_count"] = len(items)
     batch["ids"] = [str(item["id"]) for item in items]
     labels = [item["label"] for item in items]
@@ -268,6 +330,69 @@ def collate_mutation_samples(items: Sequence[dict[str, object]]) -> dict[str, ob
         else torch.as_tensor(np.stack(dense), dtype=torch.float32)
     )
     return batch
+
+
+def _gene_rule_stats(tokens: Sequence[MutationToken]) -> list[float]:
+    """Return label-free statistics for one mutated gene.
+
+    Count columns remain raw so the model configuration can choose whether to
+    apply ``log1p``. Position columns are always ``log1p`` transformed because
+    protein lengths are unavailable.
+    """
+    count = len(tokens)
+    raw_keys = [token.raw_key for token in tokens]
+    unique_count = len(set(raw_keys))
+    duplicate_count = count - unique_count
+    positions = [token.position for token in tokens if token.position > 0]
+    unique_positions = sorted(set(positions))
+    unique_position_count = len(unique_positions)
+    kind_ids = [token.kind_id for token in tokens]
+
+    def ratio(*kinds: str) -> float:
+        wanted = {_KIND_TO_ID[kind] for kind in kinds}
+        return sum(kind_id in wanted for kind_id in kind_ids) / max(count, 1)
+
+    if unique_positions:
+        minimum = unique_positions[0]
+        maximum = unique_positions[-1]
+        span = maximum - minimum
+    else:
+        minimum = maximum = span = 0
+    if len(unique_positions) >= 2:
+        minimum_distance = min(
+            right - left
+            for left, right in zip(unique_positions, unique_positions[1:])
+        )
+    else:
+        minimum_distance = 0
+    same_position_ratio = (
+        (len(positions) - unique_position_count) / len(positions)
+        if positions
+        else 0.0
+    )
+    known_kind_count = len(set(kind_ids))
+    has_unknown = any(token.has_unknown for token in tokens)
+    return [
+        float(count),
+        float(unique_count),
+        float(duplicate_count),
+        float(unique_position_count),
+        ratio(MISSENSE),
+        ratio(SYNONYMOUS),
+        ratio(NONSENSE),
+        ratio(FRAMESHIFT),
+        ratio(DELETION, INSERTION, DELINS),
+        ratio(OTHER),
+        float(np.log1p(minimum)),
+        float(np.log1p(maximum)),
+        float(np.log1p(span)),
+        float(np.log1p(minimum_distance)),
+        float(same_position_ratio),
+        float(count > 1),
+        float(known_kind_count > 1),
+        float(duplicate_count > 0),
+        float(has_unknown),
+    ]
 
 
 @dataclass
