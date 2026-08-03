@@ -1,4 +1,4 @@
-"""모델 세팅 확인 — pull 받은 뒤 한 번 돌려서 GBDT 3종이 준비됐는지 본다.
+"""모델 세팅 확인 — pull 받은 뒤 한 번 돌려서 모델 4종이 준비됐는지 본다.
 
     python scripts/check_models.py
 
@@ -40,7 +40,9 @@ def check(name: str, X, y) -> dict:
     row = {"backend": name, "version": "-", "device": "-", "fit": "-",
            "proba": "-", "io": "-", "result": "FAIL", "error": ""}
     try:
-        mod = __import__({"xgb": "xgboost", "lgbm": "lightgbm", "catboost": "catboost"}[name])
+        mod = __import__(
+            {"xgb": "xgboost", "lgbm": "lightgbm", "catboost": "catboost", "rf": "sklearn"}[name]
+        )
         row["version"] = getattr(mod, "__version__", "?")
 
         model = create_model(name, n_estimators=20)   # 공통 이름 -> 백엔드 이름 자동 변환
@@ -74,7 +76,7 @@ def main() -> int:
     print(f"GPU     {gpu_available()}")
 
     installed = available_models()
-    missing = sorted({c.split(":")[0] for c in ("xgb", "lgbm", "catboost")} - set(installed))
+    missing = sorted({c.split(":")[0] for c in ("xgb", "lgbm", "catboost", "rf")} - set(installed))
     print(f"등록    {registered_models()}")
     print(f"설치됨  {installed}")
     if missing:
@@ -83,7 +85,7 @@ def main() -> int:
     X, y = make_data()
     print(f"\n합성 데이터 {X.shape} · 클래스 {len(set(y))}개\n")
 
-    rows = [check(n, X, y) for n in ("xgb", "lgbm", "catboost")]
+    rows = [check(n, X, y) for n in ("xgb", "lgbm", "catboost", "rf")]
 
     head = f"{'backend':<10}{'version':<10}{'device':<8}{'fit':<6}{'proba':<7}{'io':<6}결과"
     print(head)
@@ -99,7 +101,7 @@ def main() -> int:
     if failed:
         print(f"실패: {failed}")
         return 1
-    print("모델 3종 준비 완료.")
+    print("모델 4종 준비 완료.")
     return 0
 
 
