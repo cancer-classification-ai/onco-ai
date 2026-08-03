@@ -1,0 +1,42 @@
+model: set_encoder
+max_tokens_per_gene: 32
+
+tokenizer:
+  position_bin_size: 25
+  max_position_bins: 512
+  signature_buckets: 8192
+
+model_params:
+  embedding_dim: 24
+  token_dim: 96
+  gene_dim: 128
+  sample_dim: 256
+  classifier_hidden: [256]
+  dropout: 0.20
+  use_sum_sqrt_pool: true
+  explicit_gene_embedding: true
+  gene_rule_projection_dim: 16
+  gene_rule_features:
+    enabled: true
+    use_counts: true
+    use_type_ratios: true
+    use_position_stats: false
+    use_duplicate_stats: true
+    use_state_flags: false
+    log_transform_counts: true
+
+training:
+  epochs: 80
+  batch_size: 64
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  class_weight: true
+  num_workers: 0
+  early_stopping:
+    enabled: true
+    monitor: val_macro_f1
+    patience: 10
+    min_epochs: 20
+    min_delta: 0.001
+    restore_best_weights: true
