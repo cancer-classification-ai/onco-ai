@@ -445,6 +445,10 @@ MODEL_PARAMS: dict[str, dict] = {
     ),
     "lgbm": dict(n_estimators=800, learning_rate=0.05),
     "catboost": dict(iterations=1000, learning_rate=0.05, depth=6),
+    # RF 는 튜닝 이력이 없다. 값의 근거는 `models_gbdt.RFModel.default_params()` 의
+    # docstring 에 있고, 여기 다시 적는 이유는 이 dict 가 "이번 실행이 실제로 쓴 값"을
+    # 보는 자리라서다.
+    "rf": dict(n_estimators=500, max_features="sqrt"),
 }
 
 _LOGGED_PARAMS = (
@@ -467,6 +471,14 @@ _LOGGED_PARAMS = (
     "device",
     "random_seed",
     "random_state",
+    "min_samples_leaf",
+    "min_samples_split",
+    "max_features",
+    "max_samples",
+    "bootstrap",
+    "criterion",
+    "class_weight",
+    "n_jobs",
 )
 
 
@@ -494,6 +506,21 @@ def effective_params(model) -> dict[str, str]:
     return {k: str(actual[k]) for k in _LOGGED_PARAMS if actual.get(k) is not None}
 
 
+def model_params_for(name: str) -> dict:
+    """`MODEL_PARAMS` 조회 — 없으면 즉시 죽는다.
+
+    `main()` 의 config 루프가 예외를 잡아 `*_ERROR.json` 만 남기고 다음 config 로
+    넘어가기 때문에, 여기서 안 막으면 "모델 표에 항목이 없다"가 config 실패로
+    위장된다. 데이터 로딩(수십 초) 전에 죽어야 원인이 안 묻힌다.
+    """
+    if name not in MODEL_PARAMS:
+        raise SystemExit(
+            f"MODEL_PARAMS 에 {name!r} 항목이 없다. 사용 가능: {sorted(MODEL_PARAMS)} "
+            "(별칭이 아니라 대표 이름을 쓴다)"
+        )
+    return dict(MODEL_PARAMS[name])
+
+
 def fit_with_fallback(args, x_train, y_train, weight):
     """GPU 로 학습하고, 실패하면 그 fold 만 CPU 로 다시 돌린다.
 
@@ -502,7 +529,7 @@ def fit_with_fallback(args, x_train, y_train, weight):
     폴백으로 `use_gpu=False` 가 된 인스턴스를 재사용하면 이후 fold 가 전부 CPU 로
     끌려가서 비교가 깨진다.
     """
-    params = dict(MODEL_PARAMS[args.model])
+    params = model_params_for(args.model)
     params.update(args.override)
     if args.model == "catboost":
         params["gpu_ram_part"] = args.gpu_ram_part
@@ -1406,7 +1433,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--model", default="xgb", help="xgb / lgbm / catboost")
+    parser.add_argument("--model", default="xgb", help="xgb / lgbm / catboost / rf")
     parser.add_argument(
         "--configs", default="all", help=f"쉼표 구분. 사용 가능: {','.join(CONFIGS)}"
     )
@@ -1593,6 +1620,7 @@ def main() -> None:
     args = build_parser().parse_args()
     args.device = {"gpu": True, "cpu": False, "auto": "auto"}[args.device]
     args.override = _parse_override(args.overrides)
+    model_params_for(args.model)  # 조기 검증 — Dataset 생성(수십 초) 전에 죽는다
 
     configs = (
         list(CONFIGS)
