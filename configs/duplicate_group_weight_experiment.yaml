@@ -1,0 +1,106 @@
+# 중복 그룹 가중치 비교 실험(A~E) 설정
+#
+# 이 파일 자체는 개인 데이터 경로를 담지 않는다 — 실행하는 사람이 로컬 환경에
+# 맞게 `paths.raw_train_csv` 등을 직접 채워야 한다(아래 플레이스홀더 참고).
+# 자세한 배경·결론은 docs/experiments/duplicate_group_weight_experiment_20260803.md
+# 와 notebooks/08_duplicate_group_weight_experiment.ipynb를 참고한다.
+#
+# 결론 요약: B_balanced(클래스 균형 가중치만)가 채택, C/D/E(중복 그룹 가중치)는
+# 전부 기각됐다. 이 config는 재현·검증용이며 팀 기본 학습 파이프라인
+# (scripts/train_gbdt.py)의 기본 동작을 바꾸지 않는다.
+
+experiment:
+  name: "duplicate_group_weight_experiment"
+  date: "2026-08-03"
+  status: "완료 — B 채택, C/D/E 기각"
+
+paths:
+  # 사용자가 로컬 환경에 맞게 채운다. 원본 데이터는 Git에 커밋하지 않는다
+  # (대회 규정·저장소 용량 정책, AGENTS.md 4절 참고).
+  raw_train_csv: "<SET_LOCAL_PATH_TO_train.csv>"
+  # 4,411열 모델 입력 parquet(3단계 유전자 인코딩 4,384 + sample-level stateless 17
+  # + fold-safe ratio-transform 10) 생성 방법은 문서 참고 — 이 저장소에 parquet
+  # 자체는 포함하지 않는다.
+  train_feature_parquet: "<SET_LOCAL_PATH_TO_train_features.parquet>"
+
+fold:
+  n_splits: 5
+  random_state: 42
+  strategy: "StratifiedGroupKFold via cancer_hack.validation.make_profile_group_kfold"
+  group_basis: "원본 train.csv의 4,384개 변이 문자열 열로 만든 make_profile_hash — enc3 인코딩값이나 4,411 최종피처로 다시 해시하지 않는다"
+  fold_numbering: "0-based"
+  note: "팀 canonical fold 파일(scripts/make_folds.py가 만드는 fold_group5)과는 별도 파일이다 — 그 파일을 덮어쓰지 않는다."
+
+model:
+  backend: "xgb"
+  # scripts/train_gbdt.py의 기존 하이퍼파라미터를 그대로 썼다 — 이번 실험에서
+  # 튜닝하지 않는다. 값 자체는 XGBModel.default_params()를 의도적으로 덮어씀.
+  params:
+    objective: "multi:softprob"
+    n_estimators: 300
+    learning_rate: 0.1
+    max_depth: 6
+    subsample: 0.8
+    colsample_bytree: 0.5
+    min_child_weight: 1
+    reg_lambda: 1.0
+    tree_method: "hist"
+    eval_metric: "mlogloss"
+    random_state: 42
+    n_jobs: -1
+
+early_stopping:
+  used: false
+  reason: "eval_set을 쓰지 않는다 — val/test를 이른 종료 판단에 넣지 않는다(AGENTS.md 7절)"
+
+test_predictions:
+  generate: false
+  submission: false
+  reason: "이 실험은 OOF 비교 전용이다 — test 추론·제출 후보를 만들지 않는다"
+
+weight_schemes:
+  - id: "A_none"
+    formula: "sample_weight = None"
+    resolver: "cancer_hack.sample_weights.resolve_experiment_weight('A_none', y, profile_hash)"
+    role: "무가중 기준선"
+  - id: "B_balanced"
+    formula: "resolve_sample_weight('balanced', y, profile_hash)  [cancer_hack.models_gbdt, 재사용]"
+    resolver: "cancer_hack.sample_weights.resolve_experiment_weight('B_balanced', y, profile_hash)"
+    role: "채택 — 클래스 균형 가중치만"
+  - id: "C_balanced_profile"
+    formula: "resolve_sample_weight('balanced+group', y, profile_hash)  [cancer_hack.models_gbdt, 재사용 — PR #17 f4rw와 동일 정의]"
+    resolver: "cancer_hack.sample_weights.resolve_experiment_weight('C_balanced_profile', y, profile_hash)"
+    role: "기각 — B 대비 -0.0017"
+  - id: "D_balanced_same_label_naive"
+    formula: "balanced_sample_weight(y) * same_label_duplicate_weight(y, profile_hash)  [(SUBCLASS,profile_hash) 조인, Notion 원안, 단순곱]"
+    resolver: "cancer_hack.sample_weights.resolve_experiment_weight('D_balanced_same_label_naive', y, profile_hash)"
+    role: "기각 — B 대비 -0.0037, 클래스별 총weight 불균형 실측 확인(std 11.70)"
+  - id: "E_same_label_rebalanced"
+    formula: "weight_i = (N/K) / (G_c * n_cg)  [클래스별 총weight = N/K 보존 교정식]"
+    resolver: "cancer_hack.sample_weights.resolve_experiment_weight('E_same_label_rebalanced', y, profile_hash)"
+    role: "기각 — B 대비 -0.0028, D의 불균형은 고쳤으나(std 0.0000) 성능은 유지 못함"
+
+evaluation:
+  primary_metric: "oof_macro_f1 (전체 6,201행)"
+  secondary_metrics:
+    - "fold별 macro_f1, 평균±표준편차"
+    - "singleton-only macro_f1 (profile_hash 그룹 크기 1인 행) — 진단용, 주지표 대체 아님"
+    - "duplicate-only macro_f1"
+    - "클래스별 F1"
+    - "예측 불일치율(vs A_none)"
+    - "weight 분포(raw/normalized) 및 Effective Sample Size"
+    - "클래스별 총weight std(균형도)"
+
+adoption_criteria:
+  min_improvement_vs_B: 0.005
+  min_folds_improved_vs_B: 3
+  max_singleton_degradation_vs_A: 0.005
+  note: "개선폭이 기준 미만이면 '근소하거나 불확실'로 판정한다. 특정 소수 클래스만 개선되고 다수가 붕괴하면 보류한다."
+
+external_data:
+  used: false
+
+compliance:
+  test_used_in_training_or_early_stopping: false
+  test_used_in_weight_computation: false
+  dacon_submission_performed: false
