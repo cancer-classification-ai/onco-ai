@@ -10,6 +10,10 @@
     python scripts/make_features.py sample --split train --include-additional-burden --overwrite
     python scripts/make_features.py tokens --split train --overwrite
     python scripts/make_features.py sigtokens --split train --overwrite
+    python scripts/make_features.py parsed-tokens --split train --overwrite
+    python scripts/make_features.py parsed --split train --overwrite
+    python scripts/make_features.py burden-extra --split train --overwrite
+    python scripts/make_features.py amino --split train --overwrite
     python scripts/make_features.py gene   --split train --kind mutated --overwrite
     python scripts/make_features.py gene-types --split train --overwrite
     python scripts/make_features.py gene-types --split test  --overwrite
@@ -33,19 +37,28 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cancer_hack.features_basic import (  # noqa: E402
+    ADDITIONAL_BURDEN_FEATURE_COLUMNS,
     GENE_MUTATION_TYPES,
+    MUTATION_STRING_PARSED_COLUMNS,
     SAMPLE_FEATURE_COLUMNS,
     make_exact_mutation_token_parquet,
     make_gene_event_count_matrix,
     make_gene_mutation_type_matrix,
     make_gene_mutated_matrix,
+    make_mutation_encoding,
+    make_mutation_string_parsed_features,
     make_sample_mutation_features,
     make_unique_mutation_token_parquet,
+)
+from cancer_hack.features_amino_acid import (  # noqa: E402
+    AMINO_ACID_FEATURE_COLUMNS,
+    make_amino_acid_features,
 )
 from cancer_hack.features_domain import (  # noqa: E402
     ALL_DOMAIN_PREFIXES,
     make_domain_features,
 )
+from cancer_hack.features_sparse import build_parsed_token_documents  # noqa: E402
 
 RAW_DIR = PROJECT_ROOT / "data/raw"
 OUT_DIR = PROJECT_ROOT / "data/process"
@@ -81,9 +94,14 @@ def _load_split(split: str, input_path: Path | None) -> tuple[pd.DataFrame, list
 
 def cmd_sample(args: argparse.Namespace) -> dict[str, object]:
     """복합 변이 샘플 단위 피처."""
-    suffix = (
-        "_additional" if args.include_additional_burden else ""
-    )
+    if args.include_cell_rollup and args.include_additional_burden:
+        suffix = "_rollup_additional"
+    elif args.include_cell_rollup:
+        suffix = "_rollup"
+    elif args.include_additional_burden:
+        suffix = "_additional"
+    else:
+        suffix = ""
     output = _resolve_output(
         args.output,
         f"{args.split}_sample_mutation_features{suffix}.parquet",
@@ -131,6 +149,23 @@ def cmd_gene(args: argparse.Namespace) -> dict[str, object]:
         "output_path": str(output),
         "sample_count": len(matrix),
         "column_count": len(matrix.columns) - 1,
+    }
+
+
+def cmd_enc3(args: argparse.Namespace) -> dict[str, object]:
+    """WT/동의/기능성 3단계 유전자 인코딩."""
+    output = _resolve_output(
+        args.output, f"{args.split}_mutation_encoded.parquet"
+    )
+    _guard_existing(output, args.overwrite)
+    frame, genes = _load_split(args.split, args.input)
+    encoded = make_mutation_encoding(frame)
+    _write_parquet(encoded, output)
+    return {
+        "output_path": str(output),
+        "sample_count": len(encoded),
+        "gene_count": len(genes),
+        "column_count": len(encoded.columns) - (1 + int("SUBCLASS" in frame.columns)),
     }
 
 
@@ -208,6 +243,103 @@ def cmd_sigtokens(args: argparse.Namespace) -> dict[str, object]:
     )
 
 
+def _write_stateless_block(
+    frame: pd.DataFrame,
+    features: pd.DataFrame,
+    output: Path,
+) -> None:
+    """행별 독립 피처를 공용 ID/label 계약으로 저장한다."""
+    features = features.copy()
+    features.insert(0, "ID", frame["ID"].astype(str).to_numpy())
+    if "SUBCLASS" in frame.columns:
+        features.insert(1, "SUBCLASS", frame["SUBCLASS"].astype(str).to_numpy())
+    _write_parquet(features, output)
+
+
+def cmd_parsed(args: argparse.Namespace) -> dict[str, object]:
+    """Mutation 문자열 위치·파싱·유형 구조 19종."""
+    output = _resolve_output(
+        args.output, f"{args.split}_mutation_parsed_features.parquet"
+    )
+    _guard_existing(output, args.overwrite)
+    frame, genes = _load_split(args.split, args.input)
+    features = make_mutation_string_parsed_features(
+        frame,
+        gene_columns=genes,
+        position_bin_size=args.position_bin_size,
+    )
+    _write_stateless_block(frame, features, output)
+    return {
+        "output_path": str(output),
+        "sample_count": len(features),
+        "feature_count": len(MUTATION_STRING_PARSED_COLUMNS),
+        "position_bin_size": args.position_bin_size,
+    }
+
+
+def cmd_burden_extra(args: argparse.Namespace) -> dict[str, object]:
+    """기존 rollup과 분리한 추가 burden 8종 ablation 블록."""
+    output = _resolve_output(
+        args.output, f"{args.split}_additional_burden_features.parquet"
+    )
+    _guard_existing(output, args.overwrite)
+    frame, genes = _load_split(args.split, args.input)
+    all_features = make_sample_mutation_features(
+        frame,
+        gene_columns=genes,
+        include_additional_burden=True,
+    )
+    features = all_features[list(ADDITIONAL_BURDEN_FEATURE_COLUMNS)]
+    _write_stateless_block(frame, features, output)
+    return {
+        "output_path": str(output),
+        "sample_count": len(features),
+        "feature_count": len(ADDITIONAL_BURDEN_FEATURE_COLUMNS),
+    }
+
+
+def cmd_amino(args: argparse.Namespace) -> dict[str, object]:
+    """샘플 단위 아미노산 물리화학적 치환 페널티 9종."""
+    output = _resolve_output(
+        args.output, f"{args.split}_amino_acid_features.parquet"
+    )
+    _guard_existing(output, args.overwrite)
+    frame, genes = _load_split(args.split, args.input)
+    features = make_amino_acid_features(frame, gene_columns=genes)
+    _write_stateless_block(frame, features, output)
+    return {
+        "output_path": str(output),
+        "sample_count": len(features),
+        "feature_count": len(AMINO_ACID_FEATURE_COLUMNS),
+    }
+
+
+def cmd_parsed_tokens(args: argparse.Namespace) -> dict[str, object]:
+    """미등록 변이에도 부분 정보를 남기는 일반화 token 문서."""
+    output = _resolve_output(
+        args.output, f"{args.split}_parsed_mutation_tokens.parquet"
+    )
+    _guard_existing(output, args.overwrite)
+    frame, genes = _load_split(args.split, args.input)
+    documents = build_parsed_token_documents(
+        frame,
+        genes,
+        position_bin_size=args.position_bin_size,
+    )
+    out = pd.DataFrame(
+        {
+            "ID": frame["ID"].astype(str).to_numpy(),
+            "parsed_mutation_document": documents.to_numpy(dtype=object),
+        }
+    )
+    _write_parquet(out, output)
+    return {
+        "output_path": str(output),
+        "sample_count": len(out),
+        "position_bin_size": args.position_bin_size,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -240,6 +372,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_gene.add_argument("--kind", choices=["mutated", "event_count"], default="mutated")
     p_gene.set_defaults(func=cmd_gene)
 
+    p_enc3 = sub.add_parser("enc3", help="WT/동의/기능성 3단계 유전자 인코딩")
+    add_common(p_enc3)
+    p_enc3.set_defaults(func=cmd_enc3)
+
     p_domain = sub.add_parser("domain", help="도메인 지식 블록 (A/A2/B/C/D/M/N)")
     add_common(p_domain)
     p_domain.set_defaults(func=cmd_domain)
@@ -258,6 +394,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_sigtokens = sub.add_parser("sigtokens", help="서명(위치 무시) 변이 문서")
     add_common(p_sigtokens)
     p_sigtokens.set_defaults(func=cmd_sigtokens)
+
+    p_parsed = sub.add_parser("parsed", help="Mutation 문자열 구조 dense 피처 19종")
+    add_common(p_parsed)
+    p_parsed.add_argument("--position-bin-size", type=int, default=50)
+    p_parsed.set_defaults(func=cmd_parsed)
+
+    p_burden_extra = sub.add_parser(
+        "burden-extra", help="추가 burden dense 피처 8종"
+    )
+    add_common(p_burden_extra)
+    p_burden_extra.set_defaults(func=cmd_burden_extra)
+
+    p_amino = sub.add_parser("amino", help="아미노산 치환 페널티 dense 피처 9종")
+    add_common(p_amino)
+    p_amino.set_defaults(func=cmd_amino)
+
+    p_parsed_tokens = sub.add_parser(
+        "parsed-tokens", help="미등록 변이 대응 일반화 token 문서"
+    )
+    add_common(p_parsed_tokens)
+    p_parsed_tokens.add_argument("--position-bin-size", type=int, default=50)
+    p_parsed_tokens.set_defaults(func=cmd_parsed_tokens)
 
     return parser
 
