@@ -1,0 +1,7 @@
+# Legacy placeholder retained for compatibility with older notebooks.
+# The supervised DL entry points now use:
+#   configs/mlp.yaml
+#   configs/gene_set_encoder.yaml
+#   configs/hybrid_set_mlp.yaml
+deprecated: true
+replacement: configs/gene_set_encoder.yaml

@@ -7,6 +7,8 @@ scipy
 scikit-learn
 pyarrow
 joblib
+PyYAML
+torch
 
 # GBDT
 xgboost
