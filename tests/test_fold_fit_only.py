@@ -8,6 +8,10 @@ TF-IDF 의 IDF, 이 둘이 그 위험이 있는 피처다. 나머지는 행마�
 
 from __future__ import annotations
 
+import importlib.util
+import inspect
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -16,6 +20,11 @@ from scipy import sparse
 from cancer_hack.features_basic import (
     BurdenBinner,
     make_sample_mutation_features,
+)
+from cancer_hack.features_graph import (
+    build_fold_comutation_block,
+    select_comutation_pairs,
+    transform_comutation_pairs,
 )
 from cancer_hack.features_sparse import MutationTfidfBlock, build_fold_tfidf_block
 from cancer_hack.validation import Chi2TopKSelector
@@ -212,3 +221,254 @@ def test_chi2_selector_rejects_negative_sparse():
     negative = sparse.csr_matrix(np.array([[-1.0, 1.0], [0.0, 1.0]]))
     with pytest.raises(ValueError, match="음수"):
         Chi2TopKSelector(k=1).fit(negative, ["a", "b"])
+
+
+# --- 공변이 쌍 -----------------------------------------------------------
+# 유전자 6개(GA..GF), 12행. 행 0-7 이 train_index, 8-11 은 valid 전용이다.
+# GA&GB 는 train_index 안에서 클래스 X 를 가르는 진짜 신호(lift>0)다. GC&GD 는
+# valid 행에서만 완벽히 클래스 Z 를 가른다 — train_index 로는 절대 안 보여야 한다.
+# 행 8 은 GA/GB 도 같이 켜 둬서, valid 행이 transform 은 정상적으로 받는지도 같이 본다.
+_COMUT_GENES = ["GA", "GB", "GC", "GD", "GE", "GF"]
+_COMUT_MATRIX = np.array(
+    [
+        [1, 1, 0, 0, 0, 0],  # 0  X
+        [1, 1, 0, 0, 0, 0],  # 1  X
+        [1, 1, 0, 0, 0, 0],  # 2  X
+        [1, 0, 0, 0, 0, 0],  # 3  Y
+        [0, 1, 0, 0, 0, 0],  # 4  Y
+        [0, 0, 0, 0, 1, 0],  # 5  Y
+        [0, 0, 0, 0, 0, 1],  # 6  Y
+        [0, 0, 0, 0, 0, 0],  # 7  Y
+        [1, 1, 1, 1, 0, 0],  # 8  Z (valid) — GC&GD 누출 + GA&GB 도 켜짐
+        [0, 0, 1, 1, 0, 0],  # 9  Z (valid)
+        [0, 0, 1, 1, 0, 0],  # 10 Z (valid)
+        [0, 0, 1, 1, 0, 0],  # 11 Z (valid)
+    ],
+    dtype=np.float32,
+)
+_COMUT_Y = np.array(["X", "X", "X", "Y", "Y", "Y", "Y", "Y", "Z", "Z", "Z", "Z"])
+_COMUT_TRAIN_INDEX = np.arange(8)
+_COMUT_Y_FOLD = _COMUT_Y[_COMUT_TRAIN_INDEX]
+#: 리크 테스트에 쓰는 관대한 임계값 — 필터 자체가 아니라 fold 경계를 시험한다.
+_COMUT_KWARGS = dict(
+    gene_names=_COMUT_GENES,
+    pool="chi2",
+    pool_topk=10,
+    manual_pairs=(),
+    min_support=2,
+    min_class_support=1,
+    min_purity=0.5,
+    min_lift=0.2,
+    max_hyper_fraction=1.0,
+)
+
+
+def test_comutation_pair_only_in_valid_rows_is_not_selected():
+    """valid 행에만 있는 쌍이 선택되면 fold 누수다."""
+    pairs = select_comutation_pairs(
+        _COMUT_MATRIX, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    assert "GA__GB" in pairs.names
+    assert "GC__GD" not in pairs.names
+
+
+def test_comutation_returns_every_train_row():
+    """valid 행도 transform 은 받아야 OOF 예측이 나온다. fit 에만 안 들어간다."""
+    test_matrix = _COMUT_MATRIX[:3]
+    names, train_out, test_out, diagnostics = build_fold_comutation_block(
+        _COMUT_MATRIX, test_matrix, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    assert train_out.shape == (_COMUT_MATRIX.shape[0], len(names))
+    assert test_out.shape == (test_matrix.shape[0], len(names))
+    assert len(diagnostics) == len(names)
+    # 행 8 은 valid 전용인데 GA&GB 가 켜져 있다 — fit 밖 행도 값이 채워져야 한다.
+    ga_gb = names.index("comut__mut__GA__GB")
+    assert train_out[8, ga_gb] > 0
+
+
+def test_comutation_selection_unchanged_by_valid_row_content():
+    """valid 행(8-11)을 완전히 흔들어도 선택 결과가 그대로여야 한다."""
+    disturbed = _COMUT_MATRIX.copy()
+    disturbed[8:] = 1.0
+    base = select_comutation_pairs(
+        _COMUT_MATRIX, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    shaken = select_comutation_pairs(
+        disturbed, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    assert base.names == shaken.names
+    assert base.stats == shaken.stats
+    assert base.n_bar == shaken.n_bar
+    assert np.array_equal(base.burden_sorted, shaken.burden_sorted)
+
+
+def test_comutation_selection_responds_to_fit_data():
+    """3번이 공허하지 않다는 짝 — train 쪽 신호를 지우면 선택도 바뀌어야 한다."""
+    erased = _COMUT_MATRIX.copy()
+    ga, gb = _COMUT_GENES.index("GA"), _COMUT_GENES.index("GB")
+    erased[:8, [ga, gb]] = 0.0
+    base = select_comutation_pairs(
+        _COMUT_MATRIX, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    changed = select_comutation_pairs(
+        erased, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    assert "GA__GB" in base.names
+    assert "GA__GB" not in changed.names
+
+
+def test_select_comutation_pairs_takes_no_test_matrix():
+    """test 통계가 선택에 안 닿는다 — 주석이 아니라 시그니처로 보장한다."""
+    params = inspect.signature(select_comutation_pairs).parameters
+    assert not any("test" in name.lower() for name in params)
+
+
+def test_comutation_share_value_is_row_independent():
+    """행 하나만 넣어도 전체를 넣었을 때와 그 행의 값이 같아야 한다."""
+    pairs = select_comutation_pairs(
+        _COMUT_MATRIX, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    full = transform_comutation_pairs(_COMUT_MATRIX, pairs, value="share")
+    single = transform_comutation_pairs(_COMUT_MATRIX[[0]], pairs, value="share")
+    np.testing.assert_array_equal(full[[0]], single)
+
+
+def test_comutation_hyper_guard_drops_hypermutator_only_pair():
+    """동시 변이가 과변이 샘플에만 몰린 쌍은 가드가 걸러야 한다."""
+    genes = ["GA", "GB", "GH", "GI"]
+    matrix = np.array(
+        [
+            [1, 0, 0, 0],  # 0 A
+            [0, 1, 0, 0],  # 1 A
+            [1, 0, 0, 0],  # 2 B
+            [0, 1, 0, 0],  # 3 B
+            [1, 0, 0, 0],  # 4 A
+            [0, 1, 0, 0],  # 5 A
+            [1, 0, 0, 0],  # 6 B
+            [0, 1, 0, 0],  # 7 B
+            [0, 0, 0, 0],  # 8 A
+            [1, 1, 1, 1],  # 9 B — 과변이 행, GH&GI 는 여기서만 동시 변이
+        ],
+        dtype=np.float32,
+    )
+    y = np.array(["A", "A", "B", "B", "A", "A", "B", "B", "A", "B"])
+    train_index = np.arange(10)
+    kwargs = dict(
+        gene_names=genes,
+        pool="chi2",
+        pool_topk=10,
+        manual_pairs=(),
+        min_support=1,
+        min_class_support=1,
+        min_purity=0.0,
+        min_lift=0.0,
+    )
+    guarded = select_comutation_pairs(
+        matrix, train_index, y, max_hyper_fraction=0.5, **kwargs
+    )
+    unguarded = select_comutation_pairs(
+        matrix, train_index, y, max_hyper_fraction=1.0, **kwargs
+    )
+    assert "GH__GI" not in guarded.names
+    assert "GH__GI" in unguarded.names
+
+
+def test_comutation_names_are_lexicographically_ordered():
+    """A < B 로 고정해야 fold 마다 A&B/B&A 로 갈려 Jaccard 가 가짜로 안 낮아진다."""
+    pairs = select_comutation_pairs(
+        _COMUT_MATRIX, _COMUT_TRAIN_INDEX, _COMUT_Y_FOLD, **_COMUT_KWARGS
+    )
+    assert pairs.names
+    for name in pairs.names:
+        a, b = name.split("__")
+        assert a < b
+
+
+def test_comutation_width_never_exceeds_topk():
+    """차원 상한 — topk 는 자동 선별분의 진짜 상한이어야 한다."""
+    genes = ["GA", "GB", "GC", "GD"]
+    matrix = np.array(
+        [
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            [1, 1, 1, 1],
+        ],
+        dtype=np.float32,
+    )
+    y = np.array(["P", "Q", "P", "Q", "P", "Q"])
+    train_index = np.arange(6)
+    pairs = select_comutation_pairs(
+        matrix,
+        train_index,
+        y,
+        gene_names=genes,
+        pool="chi2",
+        pool_topk=10,
+        manual_pairs=(),
+        min_support=1,
+        min_class_support=1,
+        min_purity=0.0,
+        min_lift=0.0,
+        max_hyper_fraction=1.0,
+        topk=2,
+    )
+    assert len(pairs.names) <= 2
+
+
+# --- stem 슬러그 -----------------------------------------------------------
+def _load_train_gbdt():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "train_gbdt.py"
+    spec = importlib.util.spec_from_file_location("train_gbdt_for_tests", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+train_gbdt = _load_train_gbdt()
+
+
+def test_comut_slug_empty_without_pair_block():
+    """comut 블록이 없는 config 의 stem 이 디스크의 기존 로그와 바이트 동일해야 한다."""
+    assert train_gbdt._comut_slug({}, manual=True) == ""
+    assert train_gbdt._comut_slug({}, manual=False) == ""
+
+
+def test_comut_slug_distinguishes_all_params():
+    """11개 파라미터를 하나씩 바꾼 dict 가 전부 다른 슬러그를 내야 한다."""
+    base = dict(
+        pool="drivers",
+        pool_topk=300,
+        mode="mutated",
+        value="share",
+        topk=20,
+        min_support=20,
+        min_class_support=8,
+        min_purity=0.25,
+        min_lift=0.15,
+        max_hyper_fraction=0.50,
+        max_pairs_per_gene=3,
+    )
+    seen = {train_gbdt._comut_slug(base, manual=True)}
+    variants = [
+        {**base, "pool": "chi2"},
+        {**base, "pool_topk": 100},
+        {**base, "mode": "functional"},
+        {**base, "value": "and"},
+        {**base, "value": "gate"},
+        {**base, "topk": 10},
+        {**base, "min_support": 25},
+        {**base, "min_class_support": 5},
+        {**base, "min_purity": 0.3},
+        {**base, "min_lift": 0.2},
+        {**base, "max_hyper_fraction": 0.6},
+        {**base, "max_pairs_per_gene": 2},
+    ]
+    for variant in variants:
+        slug = train_gbdt._comut_slug(variant, manual=True)
+        assert slug not in seen, f"충돌: {variant}"
+        seen.add(slug)
+    manual_off = train_gbdt._comut_slug(base, manual=False)
+    assert manual_off not in seen

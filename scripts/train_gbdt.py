@@ -14,6 +14,8 @@
     gec     top-K  유전자 토큰 수, fold 안에서 chi2 선택
     sigtok  top-K  서명 문서 TF-IDF, fold 안에서 어휘·IDF·chi2 전부 fit
     exacttok top-K 원문 토큰 TF-IDF — sigtok 대조군
+    comut   ~10~20 공변이 유전자 쌍, fold 안에서 지지도·lift·과변이 가드로 선택
+            (`--comut-*` 플래그, `cancer_hack.features_graph` 참고)
 
 ## 왜 래더인가
 
@@ -52,6 +54,7 @@ stopping 을 걸면 반복수 선택이 자기 CV 로 새고, test 를 넣는 �
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -71,6 +74,10 @@ from cancer_hack.features_basic import (  # noqa: E402
 from cancer_hack.features_domain import (  # noqa: E402
     DOMAIN_PREFIXES,
     align_domain_columns,
+)
+from cancer_hack.features_graph import (  # noqa: E402
+    MANUAL_PAIRS,
+    build_fold_comutation_block,
 )
 from cancer_hack.features_sparse import build_fold_tfidf_block  # noqa: E402
 from cancer_hack.io import save_csv, write_submission  # noqa: E402
@@ -131,6 +138,12 @@ GENE_BLOCKS = ("enc3", "gec")
 #: 바뀌므로 `Dataset` 이 행렬을 미리 못 만든다. 들고 있는 건 문서 문자열이다.
 SPARSE_BLOCKS = ("sigtok", "exacttok")
 
+#: fold 안에서 쌍을 고르는 블록. 열의 정체와 **개수**가 fold 마다 바뀐다는 점은
+#: SPARSE_BLOCKS 와 같지만, 원본 유전자 행렬 자체는 고정이라 GENE_BLOCKS 처럼 미리
+#: 읽어 둘 수 있다 — 그래서 `Dataset.pairs` 는 문서 문자열이 아니라 gene 블록과 같은
+#: (열 이름, train 배열, test 배열) 모양이다.
+PAIR_BLOCKS = ("comut",)
+
 #: sparse 블록 -> (parquet 파일명 템플릿, 문서 열 이름)
 SPARSE_SOURCES = {
     "sigtok": ("{split}_signature_mutation_tokens.parquet", "unique_mutation_document"),
@@ -144,6 +157,8 @@ BLOCK_SOURCES = {
     "rollup16": "{split}_sample_mutation_features_rollup.parquet",
     "enc3": "{split}_mutation_encoded.parquet",
     "gec": "{split}_gene_event_count_matrix.parquet",
+    # enc3 와 같은 파일이다 — Dataset 이 소스 문자열 기준으로 캐시해 두 번 안 읽는다.
+    "comut": "{split}_mutation_encoded.parquet",
 }
 
 BLOCK_DESC = {
@@ -155,6 +170,7 @@ BLOCK_DESC = {
     "gec": "유전자 토큰수",
     "sigtok": "서명 TF-IDF",
     "exacttok": "원문토큰 TF-IDF (대조군)",
+    "comut": "공변이 쌍 (fold 안 선택)",
 }
 
 #: 래더. 한 번에 한 축만 바꾼다.
@@ -215,6 +231,20 @@ CONFIGS: dict[str, dict] = {
         "blocks": ("domain", "rollup16", "enc3"),
         "weight": "balanced+group_sqrt",
         "desc": "f4r + 중복 프로파일 완만 감쇠",
+    },
+    # --- 공변이 쌍 --------------------------------------------------------
+    "f4rc": {
+        "blocks": ("domain", "rollup16", "enc3", "comut"),
+        "weight": "balanced",
+        "desc": "f4r + 공변이 쌍",
+    },
+    # 중복성 대조군. enc3 없이 공변이 쌍만 얹어서, 쌍이 단독 유전자 위에 정말
+    # 추가 정보를 얹는지 본다 — 선택된 쌍의 유전자가 PMS2 하나만 빼고 전부 enc3
+    # chi2 top-500 안에 이미 있어서, `value=and` 는 depth-6 트리에게 원리상 중복이다.
+    "f2c": {
+        "blocks": ("domain", "rollup16", "comut"),
+        "weight": "balanced",
+        "desc": "도메인 + 시프트내성 rollup + 공변이 쌍 (enc3 없음, 중복성 대조군)",
     },
 }
 
@@ -339,18 +369,35 @@ class Dataset:
 
         self.dense: dict[str, tuple[list[str], np.ndarray, np.ndarray]] = {}
         self.gene: dict[str, tuple[list[str], np.ndarray, np.ndarray]] = {}
+        self.pairs: dict[str, tuple[list[str], np.ndarray, np.ndarray]] = {}
         self.docs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.rollup_train: pd.DataFrame | None = None
         self.rollup_test: pd.DataFrame | None = None
+        # comut 과 enc3 는 같은 parquet(`{split}_mutation_encoded.parquet`)을 읽어
+        # 똑같은 (열 이름, train 배열, test 배열) 을 낸다. 소스 문자열로 캐시해 두 번
+        # 안 읽는다 — 안 그러면 6,201x4,384 + 2,546x4,384 float32 를 두 벌 들고
+        # 153MB 가 306MB 가 된다. fold 루프는 항상 `.copy()`/`hstack` 사본을 쓰므로
+        # 두 블록이 같은 배열을 참조해도 안전하다.
+        self._block_cache: dict[str, tuple[list[str], np.ndarray, np.ndarray]] = {}
 
         for name in sorted(blocks):
             if name in SPARSE_BLOCKS:
                 self.docs[name] = self._load_documents(name)
                 log(f"[block] {name:9s} {'문서':>6s}  {BLOCK_DESC[name]}")
                 continue
-            train_frame, test_frame = self._load_pair(name, base, test_base)
-            columns, train_array, test_array = self._select(name, train_frame, test_frame)
-            target = self.gene if name in GENE_BLOCKS else self.dense
+            source_key = BLOCK_SOURCES.get(name, name)
+            if source_key in self._block_cache:
+                columns, train_array, test_array = self._block_cache[source_key]
+            else:
+                train_frame, test_frame = self._load_pair(name, base, test_base)
+                columns, train_array, test_array = self._select(name, train_frame, test_frame)
+                self._block_cache[source_key] = (columns, train_array, test_array)
+            if name in PAIR_BLOCKS:
+                target = self.pairs
+            elif name in GENE_BLOCKS:
+                target = self.gene
+            else:
+                target = self.dense
             target[name] = (columns, train_array, test_array)
             log(f"[block] {name:9s} {len(columns):>6,}열  {BLOCK_DESC[name]}")
 
@@ -516,7 +563,7 @@ class Dataset:
         train_parts: list[np.ndarray] = []
         test_parts: list[np.ndarray] = []
         for block in CONFIGS[config]["blocks"]:
-            if block in GENE_BLOCKS or block in SPARSE_BLOCKS:
+            if block in GENE_BLOCKS or block in SPARSE_BLOCKS or block in PAIR_BLOCKS:
                 continue
             columns, train_array, test_array = self.dense[block]
             names += columns
@@ -534,6 +581,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     spec = CONFIGS[config]
     gene_blocks = [b for b in spec["blocks"] if b in GENE_BLOCKS]
     sparse_blocks = [b for b in spec["blocks"] if b in SPARSE_BLOCKS]
+    pair_blocks = [b for b in spec["blocks"] if b in PAIR_BLOCKS]
     topk = args.topk if gene_blocks else None
     k_slug = f"k{topk}" if topk else "kall"
     # sparse 축을 stem 에 안 넣으면 --sparse-topk 를 바꿔 두 번 돌릴 때 두 번째가
@@ -542,9 +590,32 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     sparse_slug = (
         f"_sp{args.sparse_topk}m{args.tfidf_min_df}" if sparse_blocks else ""
     )
+    # 공변이 축도 같은 이유로 slug 가 필요하다. 파라미터가 11개라 전부 펴면 파일명을
+    # 못 읽으니, 사다리로 실제로 바꾸는 4축(topk·pool·value·mode)만 노출하고 나머지는
+    # digest 하나로 접는다. 전체 dict 는 결과 JSON 의 comut.params 에 그대로 남아서
+    # digest 를 로그만으로 되짚을 수 있다.
+    comut_kwargs = (
+        dict(
+            pool=args.comut_pool,
+            pool_topk=args.comut_pool_topk,
+            mode=args.comut_mode,
+            value=args.comut_value,
+            topk=args.comut_topk,
+            min_support=args.comut_min_support,
+            min_class_support=args.comut_min_class_support,
+            min_purity=args.comut_min_purity,
+            min_lift=args.comut_min_lift,
+            max_hyper_fraction=args.comut_max_hyper,
+            max_pairs_per_gene=args.comut_max_per_gene,
+        )
+        if pair_blocks
+        else {}
+    )
+    comut_manual_pairs = list(MANUAL_PAIRS) if args.comut_manual else []
+    comut_slug = _comut_slug(comut_kwargs, manual=args.comut_manual)
     stem = (
         f"{args.model}_{args.tag}_{config}_{CV_SLUG[cv]}_{k_slug}"
-        f"{sparse_slug}_s{args.seed}"
+        f"{sparse_slug}{comut_slug}_s{args.seed}"
     )
 
     names, dense_train, dense_test = data.assemble(config)
@@ -556,8 +627,11 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     test_proba = np.zeros((len(data.test_ids), len(data.classes)), dtype=np.float64)
     fold_scores: list[float] = []
     fold_seconds: list[float] = []
+    fold_widths: list[int] = []
     devices: list[str] = []
     selected: dict[str, dict[str, list[str]]] = {}
+    comut_diagnostics: dict[str, dict[str, list[dict]]] = {}
+    comut_widths: list[int] = []
     params: dict = {}
     n_features = len(names)
 
@@ -610,7 +684,38 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             x_train = np.hstack([x_train, sparse_train])
             x_test = np.hstack([x_test, sparse_test])
 
+        # 공변이 쌍 — 후보 풀·지지도·클래스별 지지도·과변이 의존도·lift 를 전부 fold
+        # 의 train 부분에서만 계산한다. test 행렬은 transform 만 받는다
+        # (features_graph.select_comutation_pairs 는 test 인자를 아예 받지 않는다).
+        for block in pair_blocks:
+            columns, pair_train, pair_test = data.pairs[block]
+            comut_names, comut_tr, comut_te, comut_diag = build_fold_comutation_block(
+                pair_train,
+                pair_test,
+                train_index,
+                data.y[train_index],
+                gene_names=columns,
+                manual_pairs=comut_manual_pairs,
+                **comut_kwargs,
+            )
+            selected.setdefault(block, {})[str(fold)] = comut_names
+            # 강제 포함 5쌍은 fold 와 무관하게 항상 들어가서 Jaccard 를 인위적으로
+            # 올린다. 선택 알고리즘의 진짜 안정성은 자동 선별분만으로 따로 잰다.
+            selected.setdefault(f"{block}_auto", {})[str(fold)] = [
+                d["name"] for d in comut_diag if not d["manual"]
+            ]
+            comut_diagnostics.setdefault(block, {})[str(fold)] = comut_diag
+            comut_widths.append(len(comut_names))
+            if len(comut_names) > 30:
+                log(
+                    f"  [{block}] 경고: fold {fold} 에서 {len(comut_names)}쌍 선택. "
+                    "차원 상한(30) 초과, 이 단은 기각 대상이다"
+                )
+            x_train = np.hstack([x_train, comut_tr])
+            x_test = np.hstack([x_test, comut_te])
+
         n_features = x_train.shape[1]
+        fold_widths.append(n_features)
 
         # 가중치도 fold 의 train 부분만 보고 만든다. 그룹 크기를 fold 밖에서 세면
         # skf5 에서 fold 를 가로지르는 그룹 364개가 기여보다 과하게 깎인다.
@@ -665,7 +770,21 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             if sparse_blocks
             else None
         ),
+        "comut": (
+            {
+                "blocks": pair_blocks,
+                "manual": args.comut_manual,
+                "params": comut_kwargs,
+                "n_pairs_per_fold": comut_widths,
+                # 쌍별 n_AB·purity·lift·hyper_fraction 과, 선택이 끝난 뒤에만 계산하는
+                # train_rate/test_rate/rate_ratio(감사 기록 — 어떤 필터도 안 읽는다).
+                "diagnostics": comut_diagnostics.get("comut", {}),
+            }
+            if pair_blocks
+            else None
+        ),
         "n_features": int(n_features),
+        "n_features_per_fold": fold_widths,
         "n_samples": len(data.y),
         "n_splits": args.n_splits,
         "seed": args.seed,
@@ -768,6 +887,27 @@ def _selection_overlap(selected: dict[str, list[str]]) -> float:
     return float(np.mean(scores))
 
 
+def _comut_slug(comut_kwargs: dict, *, manual: bool) -> str:
+    """공변이 파라미터 -> stem 슬러그. `comut_kwargs` 가 비어 있으면(블록 없음) `""`.
+
+    슬러그를 빠뜨리면 두 번째 실행이 첫 번째 로그를 조용히 덮는다 — 이 버그는
+    이미 한 번 나서 `sparse_slug` 가 생겼다. 파라미터가 11개라 전부 펴면 파일명을
+    못 읽으니, 사다리로 실제로 바꾸는 4축(topk·pool·value·mode)만 노출하고 나머지는
+    digest 하나로 접는다. 전체 dict 는 결과 JSON 의 `comut.params` 에 그대로 남아서
+    digest 를 로그만으로 되짚을 수 있다.
+    """
+    if not comut_kwargs:
+        return ""
+    digest = hashlib.blake2s(
+        json.dumps(comut_kwargs, sort_keys=True).encode("utf-8"), digest_size=3
+    ).hexdigest()
+    manual_flag = "m" if manual else "x"
+    return (
+        f"_cm{comut_kwargs['topk']}{comut_kwargs['pool'][:3]}{comut_kwargs['value'][:3]}"
+        f"{comut_kwargs['mode'][0]}{manual_flag}{digest}"
+    )
+
+
 # ---------------------------------------------------------------- CLI
 def _parse_override(items: list[str]) -> dict:
     """`--set key=value` 를 파이썬 값으로. int -> float -> 문자열 순으로 시도한다."""
@@ -824,6 +964,47 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tag", default="v2", help="파일명에 들어가는 실험 이름")
     parser.add_argument("--submission", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true", help="파일을 쓰지 않는다")
+
+    # --- 공변이 쌍 블록 (comut) ------------------------------------------
+    parser.add_argument(
+        "--comut-pool",
+        choices=["drivers", "chi2"],
+        default="drivers",
+        help="쌍 후보 유전자 풀. drivers=features_domain.DRIVERS 92개(fold 무관). "
+        "chi2 는 대조군. BRAF x passenger 축퇴를 일부러 재현한다",
+    )
+    parser.add_argument(
+        "--comut-pool-topk", type=int, default=300, help="--comut-pool chi2 전용"
+    )
+    parser.add_argument(
+        "--comut-mode", choices=["mutated", "functional"], default="mutated"
+    )
+    parser.add_argument(
+        "--comut-value",
+        choices=["and", "share", "gate"],
+        default="share",
+        help="쌍 피처 값. share/gate 는 행의 변이 유전자 수로 정규화해 시프트 내성이 있다",
+    )
+    parser.add_argument(
+        "--comut-topk", type=int, default=20, help="자동 선별 쌍 상한 (필터가 먼저 물린다)"
+    )
+    parser.add_argument("--comut-min-support", type=int, default=20)
+    parser.add_argument("--comut-min-class-support", type=int, default=8)
+    parser.add_argument("--comut-min-purity", type=float, default=0.25)
+    parser.add_argument("--comut-min-lift", type=float, default=0.15)
+    parser.add_argument(
+        "--comut-max-hyper",
+        type=float,
+        default=0.50,
+        help="쌍이 과변이 샘플에 몰린 정도의 상한. 기저율 0.05",
+    )
+    parser.add_argument("--comut-max-per-gene", type=int, default=3)
+    parser.add_argument(
+        "--comut-manual",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="§9 강제 포함 5쌍(IDH1+ATRX 등)을 필터와 무관하게 항상 넣을지",
+    )
     return parser
 
 
