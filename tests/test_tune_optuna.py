@@ -110,18 +110,22 @@ def test_objective_value_rejects_a_split_it_did_not_measure():
         _objective_value({"skf": 0.40}, "sgkf")
 
 
-def test_cross_validate_refuses_configs_it_cannot_build():
+@pytest.mark.parametrize(
+    ("config", "missing_block"),
+    [("f4rl", "lsvd"), ("f4r_freq", "freq21"), ("f4r_aatrans", "aatrans9")],
+)
+def test_cross_validate_refuses_configs_it_cannot_build(config, missing_block):
     """fold 안에서 새로 fit 하는 블록은 이 튜너가 만들지 않는다.
 
     막지 않으면 f4rl 을 튜닝했는데 lsvd 가 빠진 채 학습돼 f4r 의 점수가 나온다.
     예외가 아니라 그럴듯한 숫자로 나오는 게 문제라 가드를 테스트로 고정한다.
     `data` 를 만지기 전에 걸러야 하므로 None 을 넘겨도 통과하면 안 된다.
     """
-    with pytest.raises(ValueError, match="lsvd"):
+    with pytest.raises(ValueError, match=missing_block):
         cross_validate(
             None,
             {},
-            config="f4rl",
+            config=config,
             cv="skf",
             topk=500,
             n_splits=5,
