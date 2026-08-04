@@ -14,17 +14,26 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+import pandas as pd
 import pytest
 
 optuna = pytest.importorskip("optuna", reason="requirements.txt 의 optuna 미설치")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from train_gbdt import CONFIGS, MODEL_PARAMS  # noqa: E402
+from train_gbdt import (  # noqa: E402
+    CONFIGS,
+    MODEL_PARAMS,
+    build_parser as build_train_parser,
+)
+import tune_optuna as tune_module  # noqa: E402
 from tune_optuna import (  # noqa: E402
     BASELINE_CV,
     BASELINE_POINT,
+    FOLD_FEATURE_DEFAULTS,
     FIXED_PARAMS,
+    _build_fold_feature_matrices,
     _objective_value,
     _train_command,
     cross_validate,
@@ -111,17 +120,22 @@ def test_objective_value_rejects_a_split_it_did_not_measure():
 
 
 @pytest.mark.parametrize(
-    ("config", "missing_block"),
-    [("f4rl", "lsvd"), ("f4r_freq", "freq21"), ("f4r_aatrans", "aatrans9")],
+    "config",
+    [
+        "f4r",
+        "f4r_freq",
+        "f4r_aatrans",
+        "f5",
+        "f4rc",
+        "f4rl",
+        "f4rm",
+        "f4rsig",
+        "full_all",
+    ],
 )
-def test_cross_validate_refuses_configs_it_cannot_build(config, missing_block):
-    """fold 안에서 새로 fit 하는 블록은 이 튜너가 만들지 않는다.
-
-    막지 않으면 f4rl 을 튜닝했는데 lsvd 가 빠진 채 학습돼 f4r 의 점수가 나온다.
-    예외가 아니라 그럴듯한 숫자로 나오는 게 문제라 가드를 테스트로 고정한다.
-    `data` 를 만지기 전에 걸러야 하므로 None 을 넘겨도 통과하면 안 된다.
-    """
-    with pytest.raises(ValueError, match=missing_block):
+def test_cross_validate_accepts_every_fold_local_feature_family(config):
+    """모든 fold-local 가족이 가드를 통과해 실제 data 접근 단계까지 가야 한다."""
+    with pytest.raises(AttributeError):
         cross_validate(
             None,
             {},
@@ -134,19 +148,141 @@ def test_cross_validate_refuses_configs_it_cannot_build(config, missing_block):
         )
 
 
-def test_supported_config_is_not_rejected_before_it_touches_data():
-    """f4r 은 가드를 통과해야 한다 — 통과 후 data 를 쓰다 죽는 건 이 테스트 밖이다."""
-    with pytest.raises(AttributeError):
-        cross_validate(
-            None,
-            {},
-            config="f4r",
-            cv="skf",
-            topk=500,
-            n_splits=5,
-            seed=42,
-            use_gpu=False,
+def test_optuna_fold_feature_defaults_match_train_command_defaults():
+    """Optuna에서 고정한 feature 축과 최종 train_gbdt 재실행이 같아야 한다."""
+    train = build_train_parser().parse_args([])
+    assert FOLD_FEATURE_DEFAULTS["sparse_topk"] == train.sparse_topk
+    assert FOLD_FEATURE_DEFAULTS["tfidf_min_df"] == train.tfidf_min_df
+    assert FOLD_FEATURE_DEFAULTS["parsed_min_df"] == train.parsed_min_df
+    assert FOLD_FEATURE_DEFAULTS["comut"] == {
+        "pool": train.comut_pool,
+        "pool_topk": train.comut_pool_topk,
+        "mode": train.comut_mode,
+        "value": train.comut_value,
+        "topk": train.comut_topk,
+        "min_support": train.comut_min_support,
+        "min_class_support": train.comut_min_class_support,
+        "min_purity": train.comut_min_purity,
+        "min_lift": train.comut_min_lift,
+        "max_hyper_fraction": train.comut_max_hyper,
+        "max_pairs_per_gene": train.comut_max_per_gene,
+    }
+    assert FOLD_FEATURE_DEFAULTS["latent"] == {
+        "method": train.latent_method,
+        "n_components": train.latent_components,
+        "row_norm": train.latent_row_norm,
+        "value": train.latent_value,
+        "mode": train.latent_mode,
+        "gene_weight": train.latent_gene_weight,
+        "min_gene_support": train.latent_min_support,
+        "random_state": train.latent_random_state,
+    }
+    assert FOLD_FEATURE_DEFAULTS["module"] == {
+        "value": train.module_value,
+        "n_modules": train.module_n,
+        "svd_components": train.module_svd_components,
+        "mode": train.module_mode,
+        "min_gene_support": train.module_min_support,
+        "random_state": train.module_random_state,
+    }
+    assert FOLD_FEATURE_DEFAULTS["signature"] == {
+        "value": train.signature_value,
+        "topk": train.signature_topk,
+        "mode": train.signature_mode,
+        "min_class_support": train.signature_min_class_support,
+        "min_lift": train.signature_min_lift,
+        "max_hyper_fraction": train.signature_max_hyper,
+    }
+
+
+def test_full_all_optuna_builder_appends_every_fold_local_family(monkeypatch):
+    """full_all이 실제 Optuna 행렬에서 어느 가족도 조용히 빠뜨리지 않는다."""
+
+    class FakeData:
+        y = np.array(["A", "B", "A", "B"])
+        classes = np.array(["A", "B"])
+        folds = pd.DataFrame({"fold_skf2": [0, 0, 1, 1]})
+        rollup_train = None
+        gene = {
+            block: (
+                ["G1", "G2"],
+                np.array([[1, 0], [0, 1], [1, 1], [0, 0]], dtype=np.float32),
+                np.empty((0, 2), dtype=np.float32),
+            )
+            for block in ("enc3", "gtype")
+        }
+        docs = {
+            block: (
+                np.array(["a", "b", "a b", ""], dtype=object),
+                np.empty(0, dtype=object),
+            )
+            for block in ("sigtok", "ptok")
+        }
+        raw_train = pd.DataFrame(
+            {"ID": ["0", "1", "2", "3"], "G1": ["WT", "A1C", "WT", "A1C"]}
         )
+        raw_gene_columns = ["G1"]
+        pairs = {
+            block: (
+                ["G1", "G2"],
+                np.array([[1, 0], [0, 1], [1, 1], [0, 0]], dtype=np.float32),
+                np.empty((0, 2), dtype=np.float32),
+            )
+            for block in ("comut", "lsvd", "gmod", "csig")
+        }
+
+        @staticmethod
+        def assemble(config):
+            assert config == "full_all"
+            return (
+                ["dense"],
+                np.ones((4, 1), dtype=np.float32),
+                np.empty((0, 1), dtype=np.float32),
+            )
+
+    def sparse_stub(train, test, *args, **kwargs):
+        return (
+            ["s0", "s1"],
+            np.ones((len(train), 2), np.float32),
+            np.ones((len(test), 2), np.float32),
+        )
+
+    def frequency_stub(train, test, *args, **kwargs):
+        return (
+            ["f0", "f1", "f2"],
+            np.ones((len(train), 3), np.float32),
+            np.ones((len(test), 3), np.float32),
+        )
+
+    def four_output_stub(train, test, *args, **kwargs):
+        return (
+            ["x0", "x1"],
+            np.ones((len(train), 2), np.float32),
+            np.ones((len(test), 2), np.float32),
+            [],
+        )
+
+    def five_output_stub(train, test, *args, **kwargs):
+        return (*four_output_stub(train, test, *args, **kwargs), object())
+
+    monkeypatch.setattr(tune_module, "build_fold_tfidf_block", sparse_stub)
+    monkeypatch.setattr(tune_module, "build_fold_parsed_token_block", sparse_stub)
+    monkeypatch.setattr(tune_module, "build_fold_frequency_blocks", frequency_stub)
+    monkeypatch.setattr(tune_module, "build_fold_comutation_block", four_output_stub)
+    monkeypatch.setattr(tune_module, "build_fold_latent_block", five_output_stub)
+    monkeypatch.setattr(tune_module, "build_fold_module_block", five_output_stub)
+    monkeypatch.setattr(tune_module, "build_fold_signature_block", four_output_stub)
+
+    data = FakeData()
+    first = _build_fold_feature_matrices(
+        data, config="full_all", cv="skf", topk=2, n_splits=2
+    )
+    second = _build_fold_feature_matrices(
+        data, config="full_all", cv="skf", topk=2, n_splits=2
+    )
+
+    assert [matrix.shape for matrix in first] == [(4, 20), (4, 20)]
+    assert second is first
 
 
 def test_baseline_cv_names_are_the_ones_the_cli_accepts():

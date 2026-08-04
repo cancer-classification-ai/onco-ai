@@ -28,7 +28,11 @@ from .features_basic import (
     ADDITIONAL_BURDEN_FEATURE_COLUMNS,
     MUTATION_STRING_PARSED_COLUMNS,
 )
-from .features_domain import DOMAIN_PREFIXES, align_domain_columns
+from .features_domain import (
+    ALL_DOMAIN_PREFIXES,
+    DOMAIN_PREFIXES,
+    align_domain_columns,
+)
 from .parser import (
     ALL_KINDS,
     DELETION,
@@ -407,6 +411,21 @@ class DenseFeatureBundle:
     rollup_test: pd.DataFrame
 
 
+def resolve_domain_prefixes(domain_feature_set: str) -> tuple[str, ...]:
+    """Resolve the configured domain block without silently falling back."""
+    domain_prefixes_by_set = {
+        "default": DOMAIN_PREFIXES,
+        "all": ALL_DOMAIN_PREFIXES,
+    }
+    try:
+        return domain_prefixes_by_set[domain_feature_set]
+    except KeyError as error:
+        choices = ", ".join(sorted(domain_prefixes_by_set))
+        raise ValueError(
+            f"unknown domain_feature_set={domain_feature_set!r}; choose {choices}"
+        ) from error
+
+
 def _checked_pair(
     process_dir: Path,
     stem: str,
@@ -424,13 +443,23 @@ def _checked_pair(
     return train, test
 
 
-def load_dense_feature_bundle(process_dir: str | Path) -> DenseFeatureBundle:
+def load_dense_feature_bundle(
+    process_dir: str | Path,
+    *,
+    domain_feature_set: str = "default",
+) -> DenseFeatureBundle:
     """Load domain + rollup14 + parsed19 + burden8 + aa9.
 
     The remaining two rollup16 columns are fold-dependent and are appended by
     ``train_dl.py`` after fitting :class:`BurdenBinner` on the fold's train rows.
+
+    ``domain_feature_set="default"`` uses the ablation-selected domain blocks.
+    ``domain_feature_set="all"`` additionally includes the ``M_`` block from
+    :mod:`cancer_hack.features_domain`.
     """
     process_dir = Path(process_dir)
+    domain_prefixes = resolve_domain_prefixes(domain_feature_set)
+
     domain_train = pd.read_parquet(process_dir / "train_domain_features.parquet")
     domain_test = pd.read_parquet(process_dir / "test_domain_features.parquet")
     train_ids = domain_train["ID"].astype(str).to_numpy()
@@ -438,7 +467,7 @@ def load_dense_feature_bundle(process_dir: str | Path) -> DenseFeatureBundle:
     labels = domain_train["SUBCLASS"].astype(str).to_numpy()
 
     domain_columns = [
-        column for column in domain_train.columns if column.startswith(DOMAIN_PREFIXES)
+        column for column in domain_train.columns if column.startswith(domain_prefixes)
     ]
     aligned_domain, _, _ = align_domain_columns(domain_test, domain_columns)
     train_parts = [domain_train[domain_columns].to_numpy(np.float32)]
