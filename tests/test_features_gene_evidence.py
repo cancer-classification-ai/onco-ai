@@ -94,6 +94,23 @@ def test_train_gbdt_registers_evidence_as_explicit_fold_only_blocks() -> None:
     assert train_gbdt.BLOCK_SOURCES["ebovr"].endswith(
         "gene_mutated_matrix.parquet"
     )
+    assert train_gbdt.CONFIGS["r16_base"]["blocks"] == ("domain", "rollup16")
+    assert train_gbdt.CONFIGS["r16_ebovr"]["blocks"] == (
+        "domain",
+        "rollup16",
+        "ebovr",
+    )
+    assert train_gbdt.CONFIGS["r16_ebbnb"]["blocks"] == (
+        "domain",
+        "rollup16",
+        "ebbnb",
+    )
+    assert train_gbdt.CONFIGS["r16_ebboth"]["blocks"] == (
+        "domain",
+        "rollup16",
+        "ebovr",
+        "ebbnb",
+    )
     assert train_gbdt.CONFIGS["f4r_ebovr"]["blocks"][-1] == "ebovr"
     assert train_gbdt.CONFIGS["f4r_ebbnb"]["blocks"][-1] == "ebbnb"
     assert train_gbdt.CONFIGS["f4r_ebboth"]["blocks"][-2:] == (
@@ -104,6 +121,32 @@ def test_train_gbdt_registers_evidence_as_explicit_fold_only_blocks() -> None:
         set(train_gbdt.CONFIGS["full_all"]["blocks"])
         & set(train_gbdt.EVIDENCE_BLOCKS)
     )
+    assert train_gbdt.CONFIGS["full_all"]["blocks"] == train_gbdt.FULL_ALL_BLOCKS
+    assert train_gbdt.CONFIGS["full_all_ebbnb"]["blocks"] == (
+        *train_gbdt.FULL_ALL_BLOCKS,
+        "ebbnb",
+    )
+    assert train_gbdt.CONFIGS["full_all_ebovr"]["blocks"] == (
+        *train_gbdt.FULL_ALL_BLOCKS,
+        "ebovr",
+    )
+
+
+def test_candidate_combinations_are_explicit_only_and_keep_f4r_fixed() -> None:
+    train_gbdt = _load_train_gbdt()
+    candidates = set(train_gbdt.EXPERIMENTAL_COMBINATION_CONFIGS)
+    assert candidates == {
+        "f4r_gtype_csig",
+        "f4r_gtype_ebbnb",
+        "f4r_gtype_ebovr",
+        "f4r_compact",
+        "full_all_ebbnb",
+        "full_all_ebovr",
+        "f4r_gtype_csig_ebbnb",
+        "f4r_compact_ebbnb",
+    }
+    common = {"domain", "rollup16", "enc3"}
+    assert all(common <= set(train_gbdt.CONFIGS[name]["blocks"]) for name in candidates)
 
 
 def test_evidence_slug_changes_with_every_training_parameter() -> None:

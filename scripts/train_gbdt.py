@@ -311,6 +311,25 @@ BLOCK_DESC = {
     "ebbnb": "EB shrinkage 기반 Bernoulli supervised gene evidence 26종",
 }
 
+#: canonical full 구성. evidence 조합 config도 정확히 이 튜플을 재사용한다.
+FULL_ALL_BLOCKS = (
+    "domain",
+    "rollup16",
+    "enc3",
+    "gtype",
+    "parsed19",
+    "burden8",
+    "aa9",
+    "freq21",
+    "aatrans9",
+    "sigtok",
+    "ptok",
+    "comut",
+    "lsvd",
+    "gmod",
+    "csig",
+)
+
 #: 래더. 한 번에 한 축만 바꾼다.
 CONFIGS: dict[str, dict] = {
     "f0": {
@@ -343,6 +362,30 @@ CONFIGS: dict[str, dict] = {
         "blocks": ("domain", "rollup16", "enc3"),
         "weight": "balanced",
         "desc": "도메인 + 시프트내성 rollup + 유전자",
+    },
+    # --- enc3 × supervised evidence 2×4 factorial ------------------------
+    # f4r 계열과 정확히 같은 domain + rollup16을 공통 기반으로 두고 enc3만 뺀
+    # 대조군이다. 기존 f2는 rollup(46열)을 사용하므로 이 실험에 섞으면 rollup 정의까지
+    # 함께 바뀌는 confound가 생긴다.
+    "r16_base": {
+        "blocks": ("domain", "rollup16"),
+        "weight": "balanced",
+        "desc": "도메인 + 시프트내성 rollup (enc3/evidence 없음)",
+    },
+    "r16_ebovr": {
+        "blocks": ("domain", "rollup16", "ebovr"),
+        "weight": "balanced",
+        "desc": "r16 + EB-OVR supervised gene evidence encoding 26종",
+    },
+    "r16_ebbnb": {
+        "blocks": ("domain", "rollup16", "ebbnb"),
+        "weight": "balanced",
+        "desc": "r16 + EB-Bernoulli supervised gene evidence encoding 26종",
+    },
+    "r16_ebboth": {
+        "blocks": ("domain", "rollup16", "ebovr", "ebbnb"),
+        "weight": "balanced",
+        "desc": "r16 + EB-OVR + EB-Bernoulli encoding",
     },
     # --- 지도형 gene evidence encoding ----------------------------------
     # 일반 block과 달리 outer-train 행도 inner cross-fitting으로 만든다. v018b에서
@@ -409,25 +452,76 @@ CONFIGS: dict[str, dict] = {
     # 전부 합치면 "정보 추가"가 아니라 같은 정보를 여러 번 가중하는 구성이 된다.
     # 외부 pathway 파일은 저장소에 없으므로 포함하지 않는다.
     "full_all": {
+        "blocks": FULL_ALL_BLOCKS,
+        "weight": "balanced",
+        "desc": "외부데이터 없이 생성 가능한 비중복 full feature 기준선",
+    },
+    # --- 강한 block 조합 탐색 --------------------------------------------
+    # 단일 block ladder 뒤의 두 번째 단계다. 여러 축을 한꺼번에 바꾼 조합은 아래의
+    # reference(f4r/f4r_gtype/f4rsig/full_all)와 같은 CV·seed에서만 비교한다.
+    "f4r_gtype_csig": {
+        "blocks": ("domain", "rollup16", "enc3", "gtype", "csig"),
+        "weight": "balanced",
+        "desc": "f4r + gtype + 클래스 서명",
+    },
+    "f4r_gtype_ebbnb": {
+        "blocks": ("domain", "rollup16", "enc3", "gtype", "ebbnb"),
+        "weight": "balanced",
+        "desc": "f4r + gtype + EB-Bernoulli evidence",
+    },
+    "f4r_gtype_ebovr": {
+        "blocks": ("domain", "rollup16", "enc3", "gtype", "ebovr"),
+        "weight": "balanced",
+        "desc": "f4r + gtype + EB-OVR evidence",
+    },
+    "f4r_compact": {
         "blocks": (
             "domain",
             "rollup16",
             "enc3",
             "gtype",
-            "parsed19",
-            "burden8",
-            "aa9",
-            "freq21",
-            "aatrans9",
-            "sigtok",
-            "ptok",
-            "comut",
-            "lsvd",
-            "gmod",
             "csig",
+            "lsvd",
+            "aatrans9",
         ),
         "weight": "balanced",
-        "desc": "외부데이터 없이 생성 가능한 비중복 full feature 기준선",
+        "desc": "f4r + gtype + csig + SVD + AA transition compact full",
+    },
+    "full_all_ebbnb": {
+        "blocks": (*FULL_ALL_BLOCKS, "ebbnb"),
+        "weight": "balanced",
+        "desc": "canonical full_all + EB-Bernoulli evidence",
+    },
+    "full_all_ebovr": {
+        "blocks": (*FULL_ALL_BLOCKS, "ebovr"),
+        "weight": "balanced",
+        "desc": "canonical full_all + EB-OVR evidence",
+    },
+    "f4r_gtype_csig_ebbnb": {
+        "blocks": (
+            "domain",
+            "rollup16",
+            "enc3",
+            "gtype",
+            "csig",
+            "ebbnb",
+        ),
+        "weight": "balanced",
+        "desc": "f4r + gtype + csig + EB-Bernoulli evidence",
+    },
+    "f4r_compact_ebbnb": {
+        "blocks": (
+            "domain",
+            "rollup16",
+            "enc3",
+            "gtype",
+            "csig",
+            "lsvd",
+            "aatrans9",
+            "ebbnb",
+        ),
+        "weight": "balanced",
+        "desc": "compact full + EB-Bernoulli evidence",
     },
     # --- 중복 처리 전략 --------------------------------------------------
     # 서명 TF-IDF 축. f5x 를 대조군으로 함께 둔다 — "서명이 원문 문자열보다 낫다"는
@@ -522,7 +616,33 @@ CONFIGS: dict[str, dict] = {
 
 # `--configs all`은 기존 ladder의 의미와 실행 시간을 유지한다. 지도 evidence는
 # 계산비가 크고 아직 experimental이므로 config 이름을 명시해야만 실행한다.
-EXPERIMENTAL_EVIDENCE_CONFIGS = ("f4r_ebovr", "f4r_ebbnb", "f4r_ebboth")
+EXPERIMENTAL_EVIDENCE_CONFIGS = (
+    "r16_ebovr",
+    "r16_ebbnb",
+    "r16_ebboth",
+    "f4r_ebovr",
+    "f4r_ebbnb",
+    "f4r_ebboth",
+    "f4r_gtype_ebbnb",
+    "f4r_gtype_ebovr",
+    "full_all_ebbnb",
+    "full_all_ebovr",
+    "f4r_gtype_csig_ebbnb",
+    "f4r_compact_ebbnb",
+)
+
+# 조합 탐색은 비용이 크고 단일 축 ladder가 아니므로 `--configs all`에 자동 포함하지
+# 않는다. 이름을 명시한 실행기에서 reference와 함께 돌려야 해석 가능한 결과가 된다.
+EXPERIMENTAL_COMBINATION_CONFIGS = (
+    "f4r_gtype_csig",
+    "f4r_gtype_ebbnb",
+    "f4r_gtype_ebovr",
+    "f4r_compact",
+    "full_all_ebbnb",
+    "full_all_ebovr",
+    "f4r_gtype_csig_ebbnb",
+    "f4r_compact_ebbnb",
+)
 
 #: 모델별 기본 하이퍼파라미터.
 #:
@@ -1922,7 +2042,12 @@ def main() -> None:
     args.override = _parse_override(args.overrides)
 
     configs = (
-        [c for c in CONFIGS if c not in EXPERIMENTAL_EVIDENCE_CONFIGS]
+        [
+            c
+            for c in CONFIGS
+            if c not in EXPERIMENTAL_EVIDENCE_CONFIGS
+            and c not in EXPERIMENTAL_COMBINATION_CONFIGS
+        ]
         if args.configs == "all"
         else [c.strip() for c in args.configs.split(",") if c.strip()]
     )
