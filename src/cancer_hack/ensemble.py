@@ -141,3 +141,133 @@ class MacroF1Blender:
     def predict(self, probabilities: Sequence[np.ndarray]) -> np.ndarray:
         mixed = self.predict_proba(probabilities)
         return self.classes_[mixed.argmax(axis=1)]
+
+
+class GreedyEnsembleSelector:
+    """Caruana 방식 그리디 선택 — 라이브러리에서 멤버를 **복원 허용**으로 하나씩 담는다.
+
+    매 라운드마다 "지금 담긴 것들의 평균에 이 멤버를 하나 더 넣으면 macro F1 이 가장
+    오르는가" 를 보고 하나를 담는다. 같은 멤버를 여러 번 담을 수 있고, **담긴 횟수가 곧
+    가중치**가 된다. 그래서 멤버 선택과 가중 최적화가 한 번에 끝난다.
+
+    `MacroF1Blender` 와 무엇이 다른가
+    ---------------------------------
+    `MacroF1Blender` 는 멤버 수만큼의 연속 가중치를 좌표하강으로 찾는다. 멤버가 3~4개일
+    때는 그걸로 충분하지만, 라이브러리가 100개를 넘으면 파라미터가 100개가 되어 OOF 에
+    과적합한다. 그리디는 라운드 수(`n_rounds`)가 곧 복잡도 상한이라 멤버가 몇 개든
+    파라미터가 그만큼 늘지 않는다 — Caruana 가 복원을 허용한 이유도 같다.
+
+    과적합 방지
+    -----------
+    이 클래스가 내는 `train_macro_f1_` 은 **선택에 쓴 바로 그 행에서 잰 값이라 낙관적이다.**
+    라이브러리가 클수록 심해진다. 정직한 점수는 반드시 held-out fold 에서 따로 재야 한다
+    (`scripts/greedy_blend.py` 가 교차적합으로 그렇게 한다).
+
+    `bag_fraction` 은 Caruana 의 bagging 이다. 라운드마다 라이브러리의 일부만 후보로 두면
+    "우연히 이 fold 에서 좋아 보이는 멤버" 가 매번 뽑히는 걸 막는다. 1.0 이면 끄는 것.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_rounds: int = 30,
+        bag_fraction: float = 1.0,
+        bag_rounds: int = 1,
+        random_state: int = 0,
+        init_top_k: int = 1,
+    ) -> None:
+        if n_rounds < 1:
+            raise ValueError("n_rounds 는 1 이상이어야 한다")
+        if not 0 < bag_fraction <= 1:
+            raise ValueError("bag_fraction 은 0 초과 1 이하여야 한다")
+        if bag_rounds < 1:
+            raise ValueError("bag_rounds 는 1 이상이어야 한다")
+        if init_top_k < 0:
+            raise ValueError("init_top_k 는 0 이상이어야 한다")
+        self.n_rounds = int(n_rounds)
+        self.bag_fraction = float(bag_fraction)
+        self.bag_rounds = int(bag_rounds)
+        self.random_state = int(random_state)
+        self.init_top_k = int(init_top_k)
+
+    def fit(
+        self,
+        probabilities: Sequence[np.ndarray],
+        y_true: Sequence,
+        classes: Sequence[str],
+    ) -> "GreedyEnsembleSelector":
+        stack = _probability_stack(probabilities)
+        classes = np.asarray(classes, dtype=str)
+        y_true = np.asarray(y_true, dtype=str)
+        if y_true.shape != (stack.shape[1],):
+            raise ValueError(f"y_true 형상 {y_true.shape}, 기대 {(stack.shape[1],)}")
+        if stack.shape[2] != len(classes):
+            raise ValueError("확률 열 수와 classes 길이가 다르다")
+
+        lookup = {label: index for index, label in enumerate(classes)}
+        unknown = sorted(set(y_true.tolist()) - set(lookup))
+        if unknown:
+            raise ValueError(f"classes 에 없는 y_true: {unknown[:5]}")
+        target = np.asarray([lookup[label] for label in y_true], dtype=np.int64)
+        labels = np.arange(len(classes))
+
+        def score_of(total: np.ndarray, count: int) -> float:
+            return float(
+                f1_score(target, (total / count).argmax(axis=1),
+                         labels=labels, average="macro", zero_division=0)
+            )
+
+        n_members = len(stack)
+        rng = np.random.default_rng(self.random_state)
+        counts = np.zeros(n_members, dtype=np.int64)
+
+        # 라운드마다 후보를 새로 뽑으므로 bag 별로 독립 실행한 뒤 횟수를 합친다.
+        for _ in range(self.bag_rounds):
+            bag_counts = np.zeros(n_members, dtype=np.int64)
+            total = np.zeros(stack.shape[1:], dtype=np.float64)
+            picked = 0
+
+            # 시작점 — 단독 최고 몇 개를 먼저 담는다. 빈 상태에서 시작하면 1라운드가
+            # 사실상 "단독 최고 고르기" 라 같은 일을 두 번 하게 된다.
+            if self.init_top_k:
+                solo = np.asarray([score_of(stack[i], 1) for i in range(n_members)])
+                for index in np.argsort(-solo)[: self.init_top_k]:
+                    total += stack[index]
+                    bag_counts[index] += 1
+                    picked += 1
+
+            history: list[dict] = []
+            for _round in range(self.n_rounds):
+                if self.bag_fraction >= 1.0:
+                    candidates = np.arange(n_members)
+                else:
+                    size = max(1, int(round(n_members * self.bag_fraction)))
+                    candidates = rng.choice(n_members, size=size, replace=False)
+
+                best_index, best_score = -1, -np.inf
+                for index in candidates:
+                    candidate = score_of(total + stack[index], picked + 1)
+                    if candidate > best_score + 1e-12:
+                        best_index, best_score = int(index), candidate
+                if best_index < 0:
+                    break
+                total += stack[best_index]
+                bag_counts[best_index] += 1
+                picked += 1
+                history.append({"round": _round, "picked": best_index, "macro_f1": best_score})
+
+            counts += bag_counts
+            self.history_ = history
+
+        self.counts_ = counts
+        self.weights_ = counts / counts.sum()
+        self.train_macro_f1_ = score_of(
+            np.tensordot(self.weights_, stack, axes=(0, 0)), 1
+        )
+        return self
+
+    def predict_proba(self, probabilities: Sequence[np.ndarray]) -> np.ndarray:
+        return weighted_average(probabilities, self.weights_)
+
+    def predict(self, probabilities: Sequence[np.ndarray]) -> np.ndarray:
+        raise NotImplementedError("클래스 이름이 필요하다 — predict_proba 의 argmax 를 쓴다")

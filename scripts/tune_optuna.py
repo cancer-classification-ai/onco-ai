@@ -242,7 +242,7 @@ BASELINE_POINT = BASELINE_POINTS["xgb"]
 # ---------------------------------------------------------------- CV
 def _cross_validate_via_run_config(
     data, params, *, config, cv, topk, n_splits, seed, use_gpu, model_name,
-    track_train, verbose,
+    track_train, verbose, threads=None,
 ) -> dict:
     """`train_gbdt.run_config` 에 위임하고 결과를 이 모듈의 계약으로 옮긴다.
 
@@ -263,6 +263,7 @@ def _cross_validate_via_run_config(
     ns.n_splits = n_splits
     ns.seed = seed
     ns.device = use_gpu             # main 의 문자열->bool 변환을 이미 거친 값이 온다
+    ns.threads = threads            # None 이면 train_gbdt 기본값(전 코어)
     ns.override = dict(params)      # ← Optuna 가 고른 하이퍼파라미터가 여기로 들어간다
     ns.dry_run = True               # ← OOF·test·제출 csv 를 하나도 쓰지 않는다
     ns.track_train = track_train
@@ -302,6 +303,7 @@ def cross_validate(
     trial: optuna.Trial | None = None,
     verbose: bool = False,
     prune_state: dict | None = None,
+    threads: int | None = None,
 ) -> dict:
     """f4r 의 fold 루프. `train_gbdt.run_config` 와 학습 경로가 같다.
 
@@ -335,7 +337,7 @@ def cross_validate(
         return _cross_validate_via_run_config(
             data, params, config=config, cv=cv, topk=topk, n_splits=n_splits,
             seed=seed, use_gpu=use_gpu, model_name=model_name,
-            track_train=track_train, verbose=verbose,
+            track_train=track_train, verbose=verbose, threads=threads,
         )
     gene_blocks = [b for b in spec["blocks"] if b in GENE_BLOCKS]
     names, dense_train, _ = data.assemble(config)
@@ -378,7 +380,7 @@ def cross_validate(
             spec["weight"], data.y[train_index], group_keys[train_index]
         )
         model = _fit(params, x_train[train_index], data.y[train_index], weight, seed, use_gpu,
-                     model_name=model_name)
+                     model_name=model_name, threads=threads)
 
         if list(model.classes_) != list(data.classes):
             raise RuntimeError(f"fold {fold} 의 클래스 순서가 전체와 다르다")
@@ -460,6 +462,7 @@ def evaluate(data: Dataset, params: dict, args, *, trial=None, verbose=False) ->
             trial=trial,
             verbose=verbose,
             prune_state=prune_state,
+            threads=getattr(args, "threads", None),
         )
         per_cv[cv] = result
         for key, value in result.items():
@@ -514,9 +517,11 @@ def _objective_value(scores: dict[str, float], objective: str) -> float:
     return float(scores[objective])
 
 
-def _fit(params, x, y, weight, seed, use_gpu, model_name="xgb"):
+def _fit(params, x, y, weight, seed, use_gpu, model_name="xgb", threads=None):
     """GPU 로 학습하고 실패하면 CPU 로 재시도. `train_gbdt.fit_with_fallback` 과 같다."""
     full = {**FIXED_PARAMS_BY_MODEL.get(model_name, {}), **params}
+    if threads is not None:
+        full.setdefault("n_jobs", threads)   # catboost 는 _normalize 가 thread_count 로 바꾼다
     if use_gpu is not False:
         try:
             model = create_model(model_name, use_gpu=use_gpu, random_state=seed, **full)
@@ -808,6 +813,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-trials", type=int, default=60)
     parser.add_argument("--study", default="f4r_xgb_both", help="study 이름 = db 파일명")
     parser.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
+    parser.add_argument(
+        "--threads", type=int, default=None, metavar="N",
+        help="CPU 스레드 수 (기본 전 코어). GPU 잡과 CPU 잡을 동시에 돌릴 때 나눠 쓴다",
+    )
     parser.add_argument("--no-track-train", action="store_true",
                         help="train 점수를 안 잰다. 빨라지지만 격차를 못 본다")
     parser.add_argument("--verify", action="store_true",

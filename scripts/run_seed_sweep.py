@@ -62,7 +62,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 ARTIFACTS = PROJECT_ROOT / "artifacts"
-PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+#: 서브프로세스로 부를 파이썬. **`sys.executable` 이 먼저다** — Colab·Linux 에는
+#: `.venv/Scripts/python.exe` 가 없고, 있더라도 지금 이 스크립트를 돌리는 인터프리터와
+#: 다른 것을 부르면 라이브러리 버전이 갈려 OOF 가 조용히 어긋난다(requirements.txt
+#: 맨 위 주석의 이유 그대로). venv 경로는 그게 실제로 존재할 때만 쓴다.
+def _python_executable() -> str:
+    candidate = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"   # Windows
+    if candidate.exists():
+        return str(candidate)
+    candidate = PROJECT_ROOT / ".venv" / "bin" / "python"           # Linux/macOS
+    if candidate.exists():
+        return str(candidate)
+    return sys.executable
+
+
+PYTHON = _python_executable()
 
 # --- v002 를 재현하는 설정. `--config` 로 고르는 축 말고는 바꾸지 않는다 -----------
 #: 기본은 v002 의 피처 구성. `--config f16n` 이면 tag 도 같이 바뀐다(TAG_BY_CONFIG).
@@ -142,7 +156,7 @@ def train_missing(missing: list, args) -> None:
     if args.dry_run:
         for (model, seed), cvs in sorted(grouped.items()):
             cv_arg = "all" if len(cvs) == 2 else CV_KEYS[cvs[0]]
-            log(f"  --model {model} --cv {cv_arg} --seed {seed}")
+            log(f"  --model {model} --cv {cv_arg} --seed {seed} --device {args.device}")
         return
 
     for (model, seed), cvs in sorted(grouped.items()):
@@ -151,7 +165,10 @@ def train_missing(missing: list, args) -> None:
             str(PYTHON), str(PROJECT_ROOT / "scripts" / "train_gbdt.py"),
             "--model", model, "--configs", CONFIG, "--cv", cv_arg,
             "--topk", str(TOPK), "--tag", TAG, "--seed", str(seed), "--no-submission",
+            "--device", args.device,
         ]
+        if args.threads is not None:
+            command += ["--threads", str(args.threads)]
         log(f"\n=== {model} seed {seed} · cv {cv_arg} ===")
         started = time.perf_counter()
         result = subprocess.run(command, cwd=PROJECT_ROOT)
@@ -224,6 +241,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--only-cv", choices=sorted(CV_KEYS), default=None,
         help="한 분할만 채운다. 쓸 수 있는 베이스라인을 먼저 만들 때 group5 만 돌리면 절반이다",
     )
+    parser.add_argument(
+        "--device", choices=["auto", "gpu", "cpu"], default="auto",
+        help="train_gbdt.py 에 그대로 넘긴다. GPU 를 다른 실험이 쓰고 있으면 cpu 로 비켜준다",
+    )
+    parser.add_argument(
+        "--threads", type=int, default=None, metavar="N",
+        help="CPU 스레드 수 (기본 전 코어). GPU 잡과 CPU 잡을 동시에 돌릴 때 나눠 쓴다",
+    )
     parser.add_argument("--dry-run", action="store_true", help="계획만 찍고 끝낸다")
     parser.add_argument("--blend-only", action="store_true",
                         help="학습을 건너뛰고 이미 있는 파일로 12 조합만 비교한다")
@@ -244,7 +269,7 @@ def main() -> None:
     if args.only_cv:
         globals()["CV_KEYS"] = {args.only_cv: CV_KEYS[args.only_cv]}
     log(f"설정 — config {CONFIG} · tag {TAG} · topk {TOPK} · "
-        f"n_splits {N_SPLITS} · weight balanced · folds {FOLDS_FILE.name}")
+        f"n_splits {N_SPLITS} · weight balanced · folds {FOLDS_FILE.name} · device {args.device}")
     log(f"seed {SEEDS} × 모델 {MODELS} × 분할 {list(CV_KEYS)}")
 
     have, missing = inventory()

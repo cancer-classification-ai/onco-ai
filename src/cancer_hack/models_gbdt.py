@@ -314,6 +314,15 @@ class XGBModel(BaseGBDT):
             "tree_method": "hist",
             "eval_metric": "mlogloss",
             "verbosity": 0,
+            # -1 = 전 코어. CPU 잡을 GPU 잡과 같이 돌릴 때만 줄인다.
+            #
+            # 주의: xgboost 는 **스레드 수가 바뀌면 예측이 바뀐다.** hist 가 히스토그램을
+            # 스레드로 나눠 더하는데 그 합산 순서가 스레드 수를 따라가서, 부동소수점
+            # 차이가 분할 선택까지 번진다. 실측(합성 3000×600, 26클래스, n_est=120):
+            # 같은 스레드 수로 두 번 = 완전 동일, 16 -> 4 로 바꾸면 확률 최대차 0.156.
+            # 그래서 스레드 수는 device·라이브러리 버전과 같은 재현성 축이다 —
+            # 섞을 OOF 끼리는 같은 값을 써야 한다. (lgbm·catboost·rf 는 영향 없음)
+            "n_jobs": -1,
         }
 
     @classmethod
@@ -408,6 +417,7 @@ class CatBoostModel(BaseGBDT):
         "reg_lambda": "l2_leaf_reg",
         "min_child_samples": "min_data_in_leaf",
         "random_state": "random_seed",
+        "n_jobs": "thread_count",
     }
 
     @classmethod
@@ -423,6 +433,10 @@ class CatBoostModel(BaseGBDT):
             "bootstrap_type": "Bernoulli",
             "subsample": 0.8,
             "allow_writing_files": False,
+            # -1 = 전 코어. CPU 학습에서만 속도에 영향을 주고 결과는 바뀌지 않는다.
+            # task_type=GPU 면 데이터 읽기에만 쓰이고 학습은 메인 스레드 1개 +
+            # GPU 1개로 도므로, CatBoost-GPU 잡은 코어를 거의 안 물고 있는다.
+            "thread_count": -1,
         }
 
     @classmethod

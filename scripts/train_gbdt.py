@@ -62,6 +62,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 import traceback
@@ -572,6 +573,7 @@ _LOGGED_PARAMS = (
     "criterion",
     "class_weight",
     "n_jobs",
+    "thread_count",   # catboost 쪽 이름. 스레드 수도 재현성 축이라 로그에 남긴다
 )
 
 
@@ -624,6 +626,10 @@ def fit_with_fallback(args, x_train, y_train, weight):
     """
     params = model_params_for(args.model)
     params.update(args.override)
+    if args.threads is not None:
+        # 공통 이름 -> 백엔드 이름은 `BaseGBDT._normalize` 가 한다 (catboost 는 thread_count).
+        # `--set n_jobs=..` 를 직접 준 경우엔 그쪽을 존중한다.
+        params.setdefault("n_jobs", args.threads)
     if args.model == "catboost":
         params["gpu_ram_part"] = args.gpu_ram_part
 
@@ -1612,6 +1618,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="모델 하이퍼파라미터 덮어쓰기 (여러 번 지정 가능)",
     )
     parser.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
+    parser.add_argument(
+        "--threads", type=int, default=None, metavar="N",
+        help=f"CPU 스레드 수 (기본 전 코어 {os.cpu_count()}개). GPU 잡과 CPU 잡을 동시에 "
+             "돌릴 때 둘의 합이 코어 수를 넘지 않게 나눈다. 주의: xgb 는 스레드 수가 "
+             "바뀌면 트리도 바뀐다 — 섞을 OOF 끼리는 같은 값을 쓴다",
+    )
     parser.add_argument("--gpu-ram-part", type=float, default=0.4, help="CatBoost 전용")
     parser.add_argument("--tag", default="v2", help="파일명에 들어가는 실험 이름")
     parser.add_argument("--submission", action=argparse.BooleanOptionalAction, default=True)
@@ -1779,7 +1791,8 @@ def main() -> None:
         raise SystemExit(f"알 수 없는 config {unknown}. 사용 가능: {list(CONFIGS)}")
     cvs = ["skf", "sgkf"] if args.cv == "all" else [c.strip() for c in args.cv.split(",")]
 
-    log(f"gpu_available() = {gpu_available()}  ·  요청 device = {args.device}")
+    log(f"gpu_available() = {gpu_available()}  ·  요청 device = {args.device}"
+        f"  ·  threads = {args.threads if args.threads is not None else f'전부({os.cpu_count()})'}")
     log(f"model = {args.model} · config {configs} · cv {cvs} · seed {args.seed}")
     if args.override:
         log(f"파라미터 덮어쓰기: {args.override}")

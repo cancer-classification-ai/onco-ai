@@ -68,13 +68,32 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 TUNING_DIR = PROJECT_ROOT / "artifacts" / "tuning"
-PYTHON = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+#: 서브프로세스로 부를 파이썬. **`sys.executable` 이 먼저다** — Colab·Linux 에는
+#: `.venv/Scripts/python.exe` 가 없고, 있더라도 지금 이 스크립트를 돌리는 인터프리터와
+#: 다른 것을 부르면 라이브러리 버전이 갈려 OOF 가 조용히 어긋난다(requirements.txt
+#: 맨 위 주석의 이유 그대로). venv 경로는 그게 실제로 존재할 때만 쓴다.
+def _python_executable() -> str:
+    candidate = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"   # Windows
+    if candidate.exists():
+        return str(candidate)
+    candidate = PROJECT_ROOT / ".venv" / "bin" / "python"           # Linux/macOS
+    if candidate.exists():
+        return str(candidate)
+    return sys.executable
+
+
+PYTHON = _python_executable()
 
 #: 모델별 trial 당 대략 시간(초). f16 실측 fold 시간 × 분할 2개 + 여유.
 #: `--dry-run` 이 이 값으로 예상 시간을 낸다. 정확할 필요는 없고 자릿수만 맞으면 된다.
 SECONDS_PER_TRIAL = {"xgb": 540, "catboost": 620, "rf": 190}
 
 DEFAULT_MODELS = ["rf", "catboost", "xgb"]  # 싼 것부터 — 중간에 멈춰도 뭔가는 남는다
+
+#: `--device` 문자열 -> `create_model(use_gpu=...)` 값. 서브프로세스로 넘길 때는 문자열
+#: 그대로 넘기지만, `revalidate` 는 `tune_optuna.evaluate` 를 직접 부르므로 변환이 필요하다
+#: (`tune_optuna.main` 이 하던 변환을 여기서 대신 한다).
+DEVICE_VALUE = {"gpu": True, "cpu": False, "auto": "auto"}
 
 
 def log(message: str) -> None:
@@ -100,7 +119,10 @@ def run_study(model: str, args) -> Path:
         "--seed", str(args.seed),
         "--gap-penalty", str(args.gap_penalty),
         "--gap-floor", str(args.gap_floor),
+        "--device", args.device,
     ]
+    if args.threads is not None:
+        command += ["--threads", str(args.threads)]
     log(f"\n{'=' * 100}\n[{model}] 탐색 시작 — {args.n_trials} trial\n  {' '.join(command[1:])}\n{'=' * 100}")
     if args.dry_run:
         return TUNING_DIR / f"{study}_summary.json"
@@ -144,7 +166,8 @@ def revalidate(model: str, trials: list[dict], args) -> list[dict]:
             sub = argparse.Namespace(
                 model=model, config=args.config, cv_list=["skf", "sgkf"],
                 topk=args.topk, n_splits=args.n_splits, seed=seed,
-                device="auto", no_track_train=False, objective=args.objective,
+                device=DEVICE_VALUE[args.device], threads=args.threads,
+                no_track_train=False, objective=args.objective,
                 gap_penalty=0.0, gap_floor=args.gap_floor,
             )
             result = tu.evaluate(data, trial["params"], sub)
@@ -219,6 +242,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-k-revalidate", type=int, default=3)
     parser.add_argument("--revalidate-seeds", type=int, nargs="+", default=[42, 7, 2024])
     parser.add_argument("--skip-revalidate", action="store_true")
+    parser.add_argument(
+        "--device", choices=["auto", "gpu", "cpu"], default="auto",
+        help="탐색(tune_optuna 서브프로세스)과 재검증에 함께 적용된다. "
+             "GPU 를 다른 실험이 쓰고 있으면 cpu 로 비켜준다",
+    )
+    parser.add_argument(
+        "--threads", type=int, default=None, metavar="N",
+        help="CPU 스레드 수 (기본 전 코어). GPU 잡과 CPU 잡을 동시에 돌릴 때 나눠 쓴다",
+    )
     parser.add_argument("--dry-run", action="store_true",
                         help="명령과 예상 시간만 찍고 끝낸다")
     return parser
@@ -234,7 +266,8 @@ def main() -> None:
         SECONDS_PER_TRIAL[m] * (args.top_k_revalidate + 1) * len(args.revalidate_seeds)
         for m in args.models
     )
-    log(f"모델 {args.models} · config {args.config} · trial {args.n_trials} · 목적 {args.objective}")
+    log(f"모델 {args.models} · config {args.config} · trial {args.n_trials} · "
+        f"목적 {args.objective} · device {args.device}")
     log(f"과적합 페널티 {args.gap_penalty} (floor {args.gap_floor})")
     log(f"예상 시간 — 탐색 {search/3600:.1f}h + 재검증 {reval/3600:.1f}h = **{(search+reval)/3600:.1f}h**")
     log("※ pruner 가 가망 없는 trial 을 끊으므로 실제로는 이보다 짧다 (기존 study 는 60 중 23 pruned)")
