@@ -8,6 +8,10 @@
 블렌딩만 다시 해 볼 수 있게 `train_gbdt.py` 와 분리해 뒀다. 실제 로직은 두 진입점이
 `cancer_hack.io` 의 같은 함수를 쓴다.
 
+`--pair-rule` 을 주면 argmax 결과에 exact-match 짝 라벨 규칙을 얹는다(LB +0.0829,
+`docs/pair_rule.md`). 이미 만들어 둔 제출 csv 에 나중에 얹으려면
+`scripts/apply_pair_rule.py` 쪽을 쓴다.
+
 제출 파일은 `sample_submission.csv` 와 **ID 로 병합**해 만든다. 두 파일의 행 순서가
 같은 건 확인됐지만 순서 가정에 기대면 어느 한쪽 생성 경로가 바뀔 때 조용히 어긋난다.
 
@@ -29,6 +33,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cancer_hack.io import average_probabilities, write_submission  # noqa: E402
 from cancer_hack.metrics import build_prediction_frame, read_prediction_frame  # noqa: E402
+from cancer_hack.pair_rule import DEFAULT_MIN_MUT, build_pair_rule  # noqa: E402
 
 RAW_DIR = PROJECT_ROOT / "data/raw"
 SUBMISSION_DIR = PROJECT_ROOT / "artifacts/submissions"
@@ -50,6 +55,14 @@ def parse_args() -> argparse.Namespace:
         "--sample-submission", type=Path, default=RAW_DIR / "sample_submission.csv"
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--pair-rule",
+        action="store_true",
+        help="argmax 결과에 짝 라벨 규칙을 얹는다 (docs/pair_rule.md)",
+    )
+    parser.add_argument("--pair-rule-min-mut", type=int, default=DEFAULT_MIN_MUT)
+    parser.add_argument("--train", type=Path, default=RAW_DIR / "train.csv")
+    parser.add_argument("--test", type=Path, default=RAW_DIR / "test.csv")
     return parser.parse_args()
 
 
@@ -85,10 +98,24 @@ def main() -> None:
     if output.exists() and not args.overwrite:
         raise FileExistsError(f"이미 있다: {output}. --overwrite 를 준다.")
 
+    n_flipped = 0
+    if args.pair_rule:
+        rule = build_pair_rule(args.train, args.test, args.pair_rule_min_mut)
+        reasons = rule.verify_premises()
+        if reasons:
+            raise SystemExit(
+                "짝 규칙 전제 검사 실패 — 제출을 만들지 않았다:\n  - " + "\n  - ".join(reasons)
+            )
+        before = merged["y_pred"].to_numpy().copy()
+        merged["y_pred"] = rule.relabel(merged["ID"].astype(str), merged["y_pred"])
+        n_flipped = int((merged["y_pred"].to_numpy() != before).sum())
+
     info = write_submission(merged, args.sample_submission, output)
     for key, value in info.items():
         print(f"{key}: {value}")
     print(f"sources: {len(args.predictions)}개")
+    if args.pair_rule:
+        print(f"pair_rule: 변이 {args.pair_rule_min_mut}개 이상 · {n_flipped}행 변경")
     print("\n로컬 파일만 만들었다. DACON 업로드는 직접 한다.")
 
 
