@@ -1005,9 +1005,58 @@ def test_every_config_block_belongs_to_a_known_family():
     known = (
         set(train_gbdt.BLOCK_SOURCES)
         | set(train_gbdt.SPARSE_SOURCES)
+        | set(train_gbdt.FREQUENCY_BLOCKS)
         | {"domain"}
     )
     for config, spec in train_gbdt.CONFIGS.items():
         for block in spec["blocks"]:
             assert block in known, f"{config} 의 {block} 이 소스 표에 없다"
             assert block in train_gbdt.BLOCK_DESC, f"{block} 설명이 없다"
+
+
+def test_frequency_configs_are_wired_as_fold_only_blocks():
+    assert train_gbdt.CONFIGS["f4r_freq"]["blocks"][-1] == "freq21"
+    assert train_gbdt.CONFIGS["f4r_aatrans"]["blocks"][-1] == "aatrans9"
+    assert train_gbdt.CONFIGS["f4r_freqaa"]["blocks"][-2:] == (
+        "freq21",
+        "aatrans9",
+    )
+    assert set(train_gbdt.FREQUENCY_BLOCKS).isdisjoint(train_gbdt.BLOCK_SOURCES)
+
+
+def test_frequency_fold_builder_does_not_fit_valid_or_test_rows():
+    raw_train = pd.DataFrame(
+        {
+            "ID": ["s0", "s1", "s2", "s3", "valid"],
+            "SUBCLASS": ["A", "A", "B", "B", "A"],
+            "TP53": ["V600E", "V600E", "WT", "WT", "A123W"],
+            "KRAS": ["WT", "G12D", "G12D", "WT", "WT"],
+        }
+    )
+    raw_test = pd.DataFrame(
+        {
+            "ID": ["test"],
+            "TP53": ["C456Y"],
+            "KRAS": ["WT"],
+        }
+    )
+    names, train_out, test_out = train_gbdt.build_fold_frequency_blocks(
+        raw_train,
+        raw_test,
+        np.array([0, 1, 2, 3]),
+        gene_columns=["TP53", "KRAS"],
+        blocks=["freq21", "aatrans9"],
+    )
+
+    assert len(names) == 30
+    assert train_out.shape == (5, 30)
+    assert test_out.shape == (1, 30)
+    assert np.isfinite(train_out).all()
+    assert np.isfinite(test_out).all()
+
+    unseen_token = names.index("unseen_token_count")
+    unseen_transition = names.index("aa_unseen_transition_count")
+    assert train_out[4, unseen_token] == 1
+    assert test_out[0, unseen_token] == 1
+    assert train_out[4, unseen_transition] == 1
+    assert test_out[0, unseen_transition] == 1

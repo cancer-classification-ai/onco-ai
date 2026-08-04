@@ -14,6 +14,8 @@
     gec     top-K  유전자 토큰 수, fold 안에서 chi2 선택
     sigtok  top-K  서명 문서 TF-IDF, fold 안에서 어휘·IDF·chi2 전부 fit
     exacttok top-K 원문 토큰 TF-IDF — sigtok 대조군
+    freq21      21  fold-train 빈도·IDF·희귀도 집계
+    aatrans9     9  fold-train 아미노산 치환 빈도·희귀도·log-odds
     comut   ~10~20 공변이 유전자 쌍, fold 안에서 지지도·lift·과변이 가드로 선택
             (`--comut-*` 플래그, `cancer_hack.features_graph` 참고)
     lsvd       64  잠재 SVD 성분 — 행을 L2 정규화하고 fold 안에서 기저를 fit
@@ -98,6 +100,12 @@ from cancer_hack.features_graph import (  # noqa: E402
     MANUAL_PAIRS,
     build_fold_comutation_block,
 )
+from cancer_hack.features_frequency import (  # noqa: E402
+    AA_TRANSITION_FEATURE_COLUMNS,
+    FREQUENCY_RARITY_FEATURE_COLUMNS,
+    TrainAATransitionFeatures,
+    TrainFrequencyFeatures,
+)
 from cancer_hack.features_latent import (  # noqa: E402
     MODULE_VALUES,
     SHIFT_EXPOSED_VALUES,
@@ -168,6 +176,11 @@ GENE_BLOCKS = ("enc3", "gec", "gtype")
 #: fold 안에서 어휘째 다시 만드는 블록. gene 블록과 달리 열의 *정체* 가 fold 마다
 #: 바뀌므로 `Dataset` 이 행렬을 미리 못 만든다. 들고 있는 건 문서 문자열이다.
 SPARSE_BLOCKS = ("sigtok", "exacttok", "ptok")
+
+#: 원본 mutation 문자열을 들고 있다가 fold-train 통계로 만드는 블록.
+#: Parquet으로 미리 만들면 validation 분포가 fit에 섞이므로 Dataset은 raw frame만
+#: 보관하고 run_config의 fold 루프에서 fit/transform한다.
+FREQUENCY_BLOCKS = ("freq21", "aatrans9")
 
 #: fold 안에서 쌍을 고르는 블록. 열의 정체와 **개수**가 fold 마다 바뀐다는 점은
 #: SPARSE_BLOCKS 와 같지만, 원본 유전자 행렬 자체는 고정이라 GENE_BLOCKS 처럼 미리
@@ -271,6 +284,8 @@ BLOCK_DESC = {
     "parsed19": "Mutation 문자열 구조 19종",
     "burden8": "추가 burden 8종",
     "aa9": "아미노산 치환 페널티 9종",
+    "freq21": "fold-train 빈도·IDF·희귀도 21종",
+    "aatrans9": "fold-train AA 치환 빈도·희귀도·log-odds 9종",
     "comut": "공변이 쌍 (fold 안 선택)",
     "lsvd": "잠재 SVD (fold 안 fit)",
     "lnmf": "잠재 NMF (fold 안 fit)",
@@ -336,6 +351,21 @@ CONFIGS: dict[str, dict] = {
         "blocks": ("domain", "rollup16", "enc3", "aa9"),
         "weight": "balanced",
         "desc": "f4r + 아미노산 치환 페널티 9종",
+    },
+    "f4r_freq": {
+        "blocks": ("domain", "rollup16", "enc3", "freq21"),
+        "weight": "balanced",
+        "desc": "f4r + fold-train 빈도·IDF·희귀도 21종",
+    },
+    "f4r_aatrans": {
+        "blocks": ("domain", "rollup16", "enc3", "aatrans9"),
+        "weight": "balanced",
+        "desc": "f4r + fold-train AA 치환 통계 9종",
+    },
+    "f4r_freqaa": {
+        "blocks": ("domain", "rollup16", "enc3", "freq21", "aatrans9"),
+        "weight": "balanced",
+        "desc": "f4r + fold-train 빈도·희귀도 21종 + AA 치환 통계 9종",
     },
     # --- 중복 처리 전략 --------------------------------------------------
     # 서명 TF-IDF 축. f5x 를 대조군으로 함께 둔다 — "서명이 원문 문자열보다 낫다"는
@@ -553,6 +583,11 @@ class Dataset:
         self.docs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.rollup_train: pd.DataFrame | None = None
         self.rollup_test: pd.DataFrame | None = None
+        self.raw_train: pd.DataFrame | None = None
+        self.raw_test: pd.DataFrame | None = None
+        self.raw_gene_columns: list[str] | None = None
+        if set(blocks) & set(FREQUENCY_BLOCKS):
+            self._load_frequency_raw_frames()
         # comut 과 enc3 는 같은 parquet(`{split}_mutation_encoded.parquet`)을 읽어
         # 똑같은 (열 이름, train 배열, test 배열) 을 낸다. `block_cache_key` 로 캐시해
         # 두 번 안 읽는다 — 안 그러면 6,201x4,384 + 2,546x4,384 float32 를 두 벌 들고
@@ -564,6 +599,9 @@ class Dataset:
         ] = {}
 
         for name in sorted(blocks):
+            if name in FREQUENCY_BLOCKS:
+                log(f"[block] {name:9s} {'fold':>6s}  {BLOCK_DESC[name]}")
+                continue
             if name in SPARSE_BLOCKS:
                 self.docs[name] = self._load_documents(name)
                 log(f"[block] {name:9s} {'문서':>6s}  {BLOCK_DESC[name]}")
@@ -600,6 +638,40 @@ class Dataset:
         )
 
     # -- 로딩 -------------------------------------------------------------
+    def _load_frequency_raw_frames(self) -> None:
+        """빈도 블록이 필요할 때만 raw mutation 문자열을 메모리에 올린다."""
+        frames = []
+        for split in ("train", "test"):
+            path = RAW_DIR / f"{split}.csv"
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"{path} 가 없다. {FREQUENCY_BLOCKS} 는 fold-train 통계를 "
+                    "fit하므로 원본 mutation 문자열이 필요하다."
+                )
+            frames.append(pd.read_csv(path, dtype=str, na_filter=False))
+
+        train_frame, test_frame = frames
+        train_genes = [
+            column for column in train_frame.columns if column not in ("ID", "SUBCLASS")
+        ]
+        test_genes = [
+            column for column in test_frame.columns if column not in ("ID", "SUBCLASS")
+        ]
+        if train_genes != test_genes:
+            raise ValueError("frequency train/test 유전자 열 또는 순서가 다르다")
+        if not np.array_equal(
+            train_frame["ID"].astype(str).to_numpy(), self.train_ids
+        ):
+            raise ValueError("frequency raw train ID 순서가 도메인 블록과 다르다")
+        if not np.array_equal(
+            test_frame["ID"].astype(str).to_numpy(), self.test_ids
+        ):
+            raise ValueError("frequency raw test ID 순서가 도메인 블록과 다르다")
+
+        self.raw_train = train_frame
+        self.raw_test = test_frame
+        self.raw_gene_columns = train_genes
+
     def _load_pair(self, name, base, test_base):
         if name == "domain":
             return base, test_base
@@ -768,6 +840,7 @@ class Dataset:
                 block in GENE_BLOCKS
                 or block in SPARSE_BLOCKS
                 or block in FOLD_MATRIX_BLOCKS
+                or block in FREQUENCY_BLOCKS
             ):
                 continue
             columns, train_array, test_array = self.dense[block]
@@ -782,10 +855,63 @@ class Dataset:
 
 
 # ---------------------------------------------------------------- 학습
+def build_fold_frequency_blocks(
+    raw_train: pd.DataFrame,
+    raw_test: pd.DataFrame,
+    train_index: np.ndarray,
+    *,
+    gene_columns: list[str],
+    blocks: list[str],
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """fold-train에서만 빈도 통계를 fit해 전체 train/test를 transform한다."""
+    unknown = sorted(set(blocks) - set(FREQUENCY_BLOCKS))
+    if unknown:
+        raise ValueError(f"모르는 frequency 블록: {unknown}")
+
+    names: list[str] = []
+    train_parts: list[np.ndarray] = []
+    test_parts: list[np.ndarray] = []
+    fit_frame = raw_train.iloc[np.asarray(train_index)]
+
+    for block in blocks:
+        if block == "freq21":
+            builder = TrainFrequencyFeatures(rare_df_threshold=2)
+            columns = list(FREQUENCY_RARITY_FEATURE_COLUMNS)
+        else:
+            builder = TrainAATransitionFeatures(
+                alpha=1.0,
+                unique_transitions_per_sample=True,
+            )
+            columns = list(AA_TRANSITION_FEATURE_COLUMNS)
+
+        builder.fit(fit_frame, gene_columns=gene_columns)
+        train_features = builder.transform(raw_train, gene_columns=gene_columns)
+        test_features = builder.transform(raw_test, gene_columns=gene_columns)
+        if list(train_features.columns) != columns or list(test_features.columns) != columns:
+            raise RuntimeError(f"{block} 출력 스키마가 상수 정의와 다르다")
+
+        names.extend(columns)
+        train_parts.append(train_features.to_numpy(np.float32))
+        test_parts.append(test_features.to_numpy(np.float32))
+
+    if not train_parts:
+        return (
+            [],
+            np.empty((len(raw_train), 0), dtype=np.float32),
+            np.empty((len(raw_test), 0), dtype=np.float32),
+        )
+    return (
+        names,
+        np.hstack(train_parts).astype(np.float32, copy=False),
+        np.hstack(test_parts).astype(np.float32, copy=False),
+    )
+
+
 def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     spec = CONFIGS[config]
     gene_blocks = [b for b in spec["blocks"] if b in GENE_BLOCKS]
     sparse_blocks = [b for b in spec["blocks"] if b in SPARSE_BLOCKS]
+    frequency_blocks = [b for b in spec["blocks"] if b in FREQUENCY_BLOCKS]
     pair_blocks = [b for b in spec["blocks"] if b in PAIR_BLOCKS]
     latent_blocks = [b for b in spec["blocks"] if b in LATENT_BLOCKS]
     module_blocks = [b for b in spec["blocks"] if b in MODULE_BLOCKS]
@@ -984,6 +1110,38 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             x_train = np.hstack([x_train, sparse_train])
             x_test = np.hstack([x_test, sparse_test])
 
+        # 빈도·희귀도 블록 — raw mutation 문자열의 document frequency를 fold의
+        # train 부분에서만 fit한다. validation/test는 같은 lookup으로 transform만
+        # 받는다. 전체 train에 한 번 fit하면 outer-valid 분포가 새므로 금지한다.
+        if frequency_blocks:
+            if (
+                data.raw_train is None
+                or data.raw_test is None
+                or data.raw_gene_columns is None
+            ):
+                raise RuntimeError("frequency raw frame이 로드되지 않았다")
+            frequency_names, frequency_train, frequency_test = (
+                build_fold_frequency_blocks(
+                    data.raw_train,
+                    data.raw_test,
+                    train_index,
+                    gene_columns=data.raw_gene_columns,
+                    blocks=frequency_blocks,
+                )
+            )
+            expected_width = sum(
+                len(FREQUENCY_RARITY_FEATURE_COLUMNS)
+                if block == "freq21"
+                else len(AA_TRANSITION_FEATURE_COLUMNS)
+                for block in frequency_blocks
+            )
+            if len(frequency_names) != expected_width:
+                raise RuntimeError(
+                    f"frequency 열 수 {len(frequency_names)}, 기대 {expected_width}"
+                )
+            x_train = np.hstack([x_train, frequency_train])
+            x_test = np.hstack([x_test, frequency_test])
+
         # 공변이 쌍 — 후보 풀·지지도·클래스별 지지도·과변이 의존도·lift 를 전부 fold
         # 의 train 부분에서만 계산한다. test 행렬은 transform 만 받는다
         # (features_graph.select_comutation_pairs 는 test 인자를 아예 받지 않는다).
@@ -1134,6 +1292,27 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
                 "topk": args.sparse_topk,
             }
             if sparse_blocks
+            else None
+        ),
+        "frequency": (
+            {
+                "blocks": frequency_blocks,
+                "frequency_columns": (
+                    list(FREQUENCY_RARITY_FEATURE_COLUMNS)
+                    if "freq21" in frequency_blocks
+                    else []
+                ),
+                "aa_transition_columns": (
+                    list(AA_TRANSITION_FEATURE_COLUMNS)
+                    if "aatrans9" in frequency_blocks
+                    else []
+                ),
+                "rare_df_threshold": 2,
+                "aa_transition_alpha": 1.0,
+                "unique_transitions_per_sample": True,
+                "fit_scope": "fold_train_only",
+            }
+            if frequency_blocks
             else None
         ),
         "comut": (
