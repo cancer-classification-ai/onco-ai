@@ -17,19 +17,24 @@ def _load_train_dl_module():
     return module
 
 
-def test_full_feature_configs_enable_frequency_and_latent() -> None:
+def test_full_feature_configs_enable_frequency_and_expected_latent_methods() -> None:
     root = Path(__file__).resolve().parents[1]
-    for name in (
-        "mlp_full_features.yaml",
-        "hybrid_set_mlp_v2_full_features.yaml",
-    ):
+    expected = {
+        "mlp_full_features_svd.yaml": ["svd"],
+        "mlp_full_features_nmf.yaml": ["nmf"],
+        "mlp_full_features.yaml": ["svd", "nmf"],
+        "hybrid_set_mlp_v2_full_features_svd.yaml": ["svd"],
+        "hybrid_set_mlp_v2_full_features_nmf.yaml": ["nmf"],
+        "hybrid_set_mlp_v2_full_features.yaml": ["svd", "nmf"],
+    }
+    for name, methods in expected.items():
         with (root / "configs" / name).open(encoding="utf-8") as handle:
             config = yaml.safe_load(handle)
         dense = config["dense_features"]
         assert dense["domain_feature_set"] == "all"
         assert dense["frequency_blocks"] == ["freq21", "aatrans9"]
         assert dense["latent"]["enabled"] is True
-        assert dense["latent"]["methods"] == ["svd", "nmf"]
+        assert dense["latent"]["methods"] == methods
 
 
 def test_fold_engineered_features_append_frequency_and_latent() -> None:

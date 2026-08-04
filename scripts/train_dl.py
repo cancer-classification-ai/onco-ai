@@ -22,6 +22,7 @@ import torch
 import yaml
 from sklearn.preprocessing import StandardScaler
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -307,10 +308,93 @@ def move_batch(
     }
 
 
-def class_weights(labels: np.ndarray, num_classes: int) -> torch.Tensor:
+def resolve_loss_config(training: dict[str, object]) -> dict[str, object]:
+    """Resolve the new loss mapping while preserving legacy class_weight configs."""
+    configured = dict(training.get("loss", {}))
+    default_weight = "balanced" if bool(training.get("class_weight", True)) else "none"
+    resolved = {
+        "name": str(configured.get("name", "cross_entropy")),
+        "class_weight": str(configured.get("class_weight", default_weight)),
+        "label_smoothing": float(configured.get("label_smoothing", 0.0)),
+        "focal_gamma": float(configured.get("focal_gamma", 2.0)),
+    }
+    if resolved["name"] not in ("cross_entropy", "focal"):
+        raise ValueError(f"unsupported loss name: {resolved['name']}")
+    if resolved["class_weight"] not in ("balanced", "sqrt_balanced", "none"):
+        raise ValueError(
+            f"unsupported loss class_weight: {resolved['class_weight']}"
+        )
+    if not 0.0 <= resolved["label_smoothing"] < 1.0:
+        raise ValueError("label_smoothing must be in [0, 1)")
+    if resolved["focal_gamma"] < 0.0:
+        raise ValueError("focal_gamma must be >= 0")
+    return resolved
+
+
+def class_weights(
+    labels: np.ndarray,
+    num_classes: int,
+    *,
+    mode: str = "balanced",
+) -> torch.Tensor | None:
+    if mode == "none":
+        return None
+    if mode not in ("balanced", "sqrt_balanced"):
+        raise ValueError(f"unsupported class-weight mode: {mode}")
     counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
     weights = len(labels) / (num_classes * np.maximum(counts, 1.0))
+    if mode == "sqrt_balanced":
+        weights = np.sqrt(weights)
     return torch.as_tensor(weights, dtype=torch.float32)
+
+
+class FocalCrossEntropy(nn.Module):
+    """Multiclass focal loss with optional smoothing and one class-weight factor."""
+
+    def __init__(
+        self,
+        *,
+        gamma: float,
+        weight: torch.Tensor | None,
+        label_smoothing: float,
+    ) -> None:
+        super().__init__()
+        self.gamma = float(gamma)
+        self.label_smoothing = float(label_smoothing)
+        self.register_buffer("weight", weight)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        cross_entropy = F.cross_entropy(
+            logits,
+            targets,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
+        probability = torch.softmax(logits, dim=1)
+        true_probability = probability.gather(1, targets[:, None]).squeeze(1)
+        losses = (1.0 - true_probability).pow(self.gamma) * cross_entropy
+        if self.weight is None:
+            return losses.mean()
+        sample_weight = self.weight[targets]
+        return (losses * sample_weight).sum() / sample_weight.sum().clamp_min(1e-12)
+
+
+def build_classification_loss(
+    loss_config: dict[str, object],
+    weights: torch.Tensor | None,
+    device: torch.device,
+) -> nn.Module:
+    weight = None if weights is None else weights.to(device)
+    if loss_config["name"] == "cross_entropy":
+        return nn.CrossEntropyLoss(
+            weight=weight,
+            label_smoothing=float(loss_config["label_smoothing"]),
+        )
+    return FocalCrossEntropy(
+        gamma=float(loss_config["focal_gamma"]),
+        weight=weight,
+        label_smoothing=float(loss_config["label_smoothing"]),
+    ).to(device)
 
 
 def make_loader(
@@ -356,11 +440,10 @@ def train_one_fold(
     weight_decay: float,
     gradient_clip: float,
     weights: torch.Tensor | None,
+    loss_config: dict[str, object],
     early_stopping: dict[str, object],
 ) -> dict[str, object]:
-    criterion = nn.CrossEntropyLoss(
-        weight=None if weights is None else weights.to(device)
-    )
+    criterion = build_classification_loss(loss_config, weights, device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
@@ -487,6 +570,7 @@ def main() -> None:
             f"CLI model {args.model!r} differs from config model {configured_model!r}"
         )
     training = dict(config.get("training", {}))
+    loss_config = resolve_loss_config(training)
     dense_features = dict(config.get("dense_features", {}))
     frequency_blocks = list(dense_features.get("frequency_blocks", []))
     unknown_frequency = sorted(set(frequency_blocks) - set(FREQUENCY_BLOCKS))
@@ -681,10 +765,10 @@ def main() -> None:
             vocab_sizes=vocab_sizes,
             model_params=model_params,
         ).to(device)
-        weights = (
-            class_weights(labels[train_index], len(classes))
-            if bool(training.get("class_weight", True))
-            else None
+        weights = class_weights(
+            labels[train_index],
+            len(classes),
+            mode=str(loss_config["class_weight"]),
         )
         training_result = train_one_fold(
             model,
@@ -696,6 +780,7 @@ def main() -> None:
             weight_decay=float(training.get("weight_decay", 1e-4)),
             gradient_clip=float(training.get("gradient_clip", 1.0)),
             weights=weights,
+            loss_config=loss_config,
             early_stopping=early_stopping,
         )
         valid_probability = predict(model, valid_loader, device)
@@ -773,6 +858,7 @@ def main() -> None:
         "fold_train_loss": fold_losses,
         "fold_training": fold_training,
         "early_stopping": early_stopping,
+        "loss": loss_config,
         "oof_macro_f1": summary["macro_f1"],
         "oof_macro_f1_singleton": singleton_score,
         "n_singleton": int(singleton_mask.sum()),

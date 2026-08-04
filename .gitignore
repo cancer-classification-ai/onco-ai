@@ -60,6 +60,10 @@ artifacts/logs/*
 !artifacts/logs/.gitkeep
 artifacts/metrics/*
 !artifacts/metrics/.gitkeep
+artifacts/configs/*
+!artifacts/configs/.gitkeep
+artifacts/comparisons/*
+!artifacts/comparisons/.gitkeep
 
 # ==================== Local experiment outputs ====================
 v018b_gene_evidence_ablation/
