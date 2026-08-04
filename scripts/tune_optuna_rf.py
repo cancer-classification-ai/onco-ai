@@ -867,7 +867,8 @@ def main(argv: list[str] | None = None) -> dict:
     )
     classes = f4r["classes"]
 
-    fold_ids, fold_col = train_rf.load_folds(
+    # smoke study 는 OOF artifact 를 저장·검증하지 않는다 — group_key_by_id 는 여기서 쓰지 않는다.
+    fold_ids, fold_col, _group_key_by_id = train_rf.load_folds(
         args.folds_path, cv="sgkf", n_splits=args.n_splits, train_ids=f4r["dataset"].train_ids
     )
 

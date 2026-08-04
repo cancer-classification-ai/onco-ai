@@ -272,7 +272,14 @@ def build_f4r_fold_matrices(f4r: dict, train_index: np.ndarray):
 
 # ---------------------------------------------------------------- fold(사전계산본만 읽음)
 def load_folds(path: Path, *, cv: str, n_splits: int, train_ids: np.ndarray):
-    """미리 만든 fold 파일을 **읽기만** 한다 — 이 스크립트는 fold 를 만들지 않는다."""
+    """미리 만든 fold 파일을 **읽기만** 한다 — 이 스크립트는 fold 를 만들지 않는다.
+
+    `group_key` 열이 있으면 `{ID: group_key}` 매핑도 함께 돌려준다(동일 group 이
+    fold 를 넘는지는 `validate_oof_frame(group_key_by_id=...)` 가 검사한다 — 여기서는
+    매핑만 만든다, 재정의하지 않는다). `cv="sgkf"`(Group5) 는 `group_key` 열이
+    없으면 조용히 넘어가지 않고 즉시 에러를 낸다 — Group5 는 정의상 group-safe
+    분할이라 이 검사 없이는 leakage 를 잡을 수단이 없다.
+    """
     if not path.exists():
         raise SystemExit(
             f"fold 파일이 없다: {path.name}. scripts/make_folds.py 로 먼저 만든다 — "
@@ -305,7 +312,18 @@ def load_folds(path: Path, *, cv: str, n_splits: int, train_ids: np.ndarray):
             f"{path.name} 의 {column} 값 범위 이탈: [{fold_ids.min()}, {fold_ids.max()}], "
             f"기대 [0, {n_splits - 1}]"
         )
-    return fold_ids, column
+
+    group_key_by_id: dict[str, object] | None = None
+    if "group_key" in ordered.columns:
+        group_key_by_id = dict(zip(train_id_strs, ordered["group_key"].tolist()))
+    elif cv == "sgkf":
+        raise ValueError(
+            f"{path.name} 에 group_key 열이 없다 — sgkf(Group5) 는 동일 group(profile_hash) 이 "
+            "fold 를 넘는 사례를 검사하는 데 group_key 가 필요하다. scripts/make_folds.py 로 "
+            "다시 만든다(FOLD_META_COLUMNS = ID, group_key)."
+        )
+
+    return fold_ids, column, group_key_by_id
 
 
 # ---------------------------------------------------------------- 산출물 경로
@@ -438,7 +456,7 @@ def main(argv: list[str] | None = None) -> dict:
         classes = np.unique(y)
         n_features_for_log = len(feature_columns)
 
-    fold_ids, fold_col = load_folds(
+    fold_ids, fold_col, group_key_by_id = load_folds(
         args.folds_path, cv=args.cv, n_splits=args.n_splits, train_ids=train_ids
     )
 
@@ -527,6 +545,7 @@ def main(argv: list[str] | None = None) -> dict:
         class_order=classes,
         train_ids=train_ids,
         n_splits=args.n_splits,
+        group_key_by_id=group_key_by_id,
         expected_macro_f1=oof_macro_f1,
     )
     validate_test_probability_frame(test_frame, class_order=classes, sample_submission_ids=sample_ids)

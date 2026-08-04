@@ -25,6 +25,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import optuna
@@ -77,6 +78,108 @@ SEARCH_SPACE_BOUNDARIES: dict[str, list] = {
 
 def log(message: str) -> None:
     print(message, flush=True)
+
+
+# ---------------------------------------------------------------- trial 0 캐시 provenance
+#: `rf_b_trial0_reproduction_check.json` 을 무조건 재사용하지 않기 위한 context 계약.
+#: 이 중 하나라도 저장된 값과 다르면 stale 로 보고 재계산한다(§3). 필드가 하나라도
+#: 없는 구버전 캐시(schema 이전)도 재사용하지 않는다.
+TRIAL0_CACHE_SCHEMA_VERSION = 1
+TRIAL0_CACHE_CONTEXT_KEYS = (
+    "schema_version",
+    "git_commit",
+    "data_files",
+    "fold_hash",
+    "folds_file",
+    "rf_a_oof_sha256",
+    "rf_a_log_sha256",
+    "class_order",
+    "seed",
+    "n_splits",
+    "rf_a_baseline_params",
+)
+
+
+def build_trial0_cache_context(
+    *,
+    git_commit: str | None,
+    data_hashes: dict[str, str],
+    fold_hash: str,
+    folds_path: Path,
+    rf_a_oof_path: Path,
+    rf_a_log_path: Path,
+    classes: np.ndarray,
+    seed: int,
+    n_splits: int,
+) -> dict:
+    """trial0 재현검증 캐시가 유효하기 위한 provenance. 비밀정보·절대경로는 담지
+    않는다 — 커밋 해시/파일명+SHA-256/설정값뿐이다(`folds_path`/`rf_a_oof_path`/
+    `rf_a_log_path` 자체는 해시만 계산하는 데 쓰고 경로 문자열은 기록하지 않는다).
+    """
+    return {
+        "schema_version": TRIAL0_CACHE_SCHEMA_VERSION,
+        "git_commit": git_commit,
+        "data_files": dict(data_hashes),
+        "fold_hash": fold_hash,
+        "folds_file": {"name": folds_path.name, "sha256": train_rf._sha256(folds_path)},
+        "rf_a_oof_sha256": train_rf._sha256(rf_a_oof_path),
+        "rf_a_log_sha256": train_rf._sha256(rf_a_log_path),
+        "class_order": [str(c) for c in classes],
+        "seed": seed,
+        "n_splits": n_splits,
+        "rf_a_baseline_params": tune_rf._resolve_baseline_point(tune_rf.RF_A_BASELINE_POINT),
+    }
+
+
+def trial0_cache_is_reusable(cached: dict, current_context: dict) -> bool:
+    """저장된 캐시가 `current_context` 와 완전히 같고 `passed=True` 일 때만 재사용된다.
+
+    context 필드가 하나라도 없는 구버전 캐시, 또는 `passed=False` 로 저장된
+    실패 기록은 절대 재사용하지 않는다(정상 통과로 취급 금지).
+    """
+    if not isinstance(cached, dict) or cached.get("passed") is not True:
+        return False
+    cached_context = cached.get("context")
+    if not isinstance(cached_context, dict):
+        return False
+    if any(key not in cached_context for key in TRIAL0_CACHE_CONTEXT_KEYS):
+        return False
+    return cached_context == current_context
+
+
+def resolve_trial0_check(
+    verification_path: Path, context: dict, *, compute: Callable[[], dict]
+) -> dict:
+    """캐시 재사용/무효화 정책(§3). `compute()` 는 실제 재현 계산(RF-A 재학습)을
+    수행하는 콜백이다 — 캐시가 유효하면 아예 호출되지 않는다.
+
+    반환값에는 항상 `context` 가 채워져 있다(재사용된 캐시든 새로 계산한 값이든
+    동일한 provenance 를 담는다).
+    """
+    cached_check = None
+    if verification_path.exists():
+        with open(verification_path, encoding="utf-8") as handle:
+            cached_check = json.load(handle)
+
+    if cached_check is not None and trial0_cache_is_reusable(cached_check, context):
+        log(f"trial 0 RF-A 재현 검증: cache reused: exact context match (passed={cached_check['passed']})")
+        return cached_check
+
+    if cached_check is not None:
+        log("trial 0 RF-A 재현 검증: cache stale: context mismatch, recomputing")
+    else:
+        log("trial 0 RF-A 재현 검증: cache missing: computing")
+
+    trial0_check = compute()
+    trial0_check["context"] = context
+    with open(verification_path, "w", encoding="utf-8") as handle:
+        json.dump(trial0_check, handle, ensure_ascii=False, indent=2)
+    log(
+        f"trial 0 RF-A 재현 검증: passed={trial0_check['passed']}  "
+        f"max|Δproba|={trial0_check['max_abs_proba_diff']:.2e}  "
+        f"ΔOOF={trial0_check['oof_macro_f1_diff']:.2e}"
+    )
+    return trial0_check
 
 
 # ---------------------------------------------------------------- trial 0 재현 검증
@@ -286,11 +389,14 @@ def re_validate_rf_b_artifacts(
     n_splits: int,
     sample_ids: list[str],
     expected_macro_f1: float,
+    group_key_by_id: dict[str, object] | None = None,
 ) -> None:
     """저장된 파일을 다시 읽어 strict validator 를 재실행한다(spec Ticket 3 §8).
 
     `train_rf.main()` 이 저장 **전에** 이미 같은 validator 를 한 번 돌렸다 —
     여기서는 저장·재읽기 왕복 후에도 스키마·값이 그대로인지 독립적으로 다시 본다.
+    `group_key_by_id` 를 주면 group leakage 도 이 재읽기 경로에서 다시 검사한다
+    (train_rf.main() 내부 검사와 별개의 독립 재확인).
     """
     oof = pd.read_csv(paths["oof"], dtype={"ID": str})
     test_pred = pd.read_csv(paths["test"], dtype={"ID": str})
@@ -298,7 +404,7 @@ def re_validate_rf_b_artifacts(
 
     validate_oof_frame(
         oof, class_order=classes, train_ids=train_ids, n_splits=n_splits,
-        expected_macro_f1=expected_macro_f1,
+        group_key_by_id=group_key_by_id, expected_macro_f1=expected_macro_f1,
     )
     validate_test_probability_frame(test_pred, class_order=classes, sample_submission_ids=sample_ids)
     validate_submission_frame(
@@ -467,7 +573,7 @@ def main(argv: list[str] | None = None) -> dict:
     classes = f4r["classes"]
     train_ids = f4r["dataset"].train_ids
 
-    fold_ids, fold_col = train_rf.load_folds(
+    fold_ids, fold_col, group_key_by_id = train_rf.load_folds(
         args.folds_path, cv="sgkf", n_splits=args.n_splits, train_ids=train_ids
     )
     n_jobs = args.n_jobs if args.n_jobs is not None else default_n_jobs()
@@ -481,23 +587,28 @@ def main(argv: list[str] | None = None) -> dict:
     tuning_dir = args.out_dir / "tuning"
     tuning_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- 1) trial 0 RF-A 재현 검증(멱등 — 이미 통과 기록이 있으면 재사용) ----
+    # ---- 1) trial 0 RF-A 재현 검증(context 가 완전히 같고 passed=True 일 때만 재사용) ----
     verification_path = tuning_dir / "rf_b_trial0_reproduction_check.json"
-    if verification_path.exists():
-        with open(verification_path, encoding="utf-8") as handle:
-            trial0_check = json.load(handle)
-        log(f"trial 0 RF-A 재현 검증: 기존 기록 재사용 (passed={trial0_check['passed']})")
-    else:
-        trial0_check = verify_trial0_reproduces_rf_a(
+    trial0_context = build_trial0_cache_context(
+        git_commit=train_rf._git_commit_sha(),
+        data_hashes=data_hashes,
+        fold_hash=fold_hash,
+        folds_path=args.folds_path,
+        rf_a_oof_path=args.rf_a_oof_path,
+        rf_a_log_path=args.rf_a_log_path,
+        classes=classes,
+        seed=args.seed,
+        n_splits=args.n_splits,
+    )
+    trial0_check = resolve_trial0_check(
+        verification_path,
+        trial0_context,
+        compute=lambda: verify_trial0_reproduces_rf_a(
             fold_cache, classes, train_ids, fold_ids,
             seed=args.seed, n_jobs=n_jobs,
             rf_a_oof_path=args.rf_a_oof_path, rf_a_log_path=args.rf_a_log_path,
-        )
-        with open(verification_path, "w", encoding="utf-8") as handle:
-            json.dump(trial0_check, handle, ensure_ascii=False, indent=2)
-        log(f"trial 0 RF-A 재현 검증: passed={trial0_check['passed']}  "
-            f"max|Δproba|={trial0_check['max_abs_proba_diff']:.2e}  "
-            f"ΔOOF={trial0_check['oof_macro_f1_diff']:.2e}")
+        ),
+    )
 
     if not trial0_check["passed"]:
         raise SystemExit(
@@ -592,6 +703,7 @@ def main(argv: list[str] | None = None) -> dict:
     re_validate_rf_b_artifacts(
         paths, classes=classes, train_ids=train_ids, n_splits=args.n_splits,
         sample_ids=sample_ids, expected_macro_f1=rf_b_provenance["oof_macro_f1"],
+        group_key_by_id=group_key_by_id,
     )
     log("저장된 OOF/test/submission 재읽기 재검증 통과.")
 

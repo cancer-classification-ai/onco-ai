@@ -89,9 +89,9 @@ def build_data_dir(tmp_path: Path, *, n_estimators: int = 25, test_random_state:
         y, kind="sgkf", n_splits=N_SPLITS, seed=42, groups=group_keys
     )
     folds_path = tmp_path / "train_folds.parquet"
-    pd.DataFrame({"ID": train_frame["ID"], "fold_group5": fold_values}).to_parquet(
-        folds_path, index=False
-    )
+    pd.DataFrame(
+        {"ID": train_frame["ID"], "group_key": group_keys, "fold_group5": fold_values}
+    ).to_parquet(folds_path, index=False)
 
     config_path = tmp_path / "rf_config.json"
     with open(config_path, "w", encoding="utf-8") as handle:
@@ -103,6 +103,7 @@ def build_data_dir(tmp_path: Path, *, n_estimators: int = 25, test_random_state:
         "config_path": config_path,
         "train_ids": train_frame["ID"].tolist(),
         "test_ids": test_frame["ID"].tolist(),
+        "group_keys": group_keys,
     }
 
 
@@ -181,10 +182,36 @@ def test_load_folds_missing_file_raises(tmp_path):
 def test_load_folds_uses_fold_group5_for_sgkf(tmp_path):
     ids = np.array(["a", "b", "c", "d", "e"])
     path = tmp_path / "folds.parquet"
-    pd.DataFrame({"ID": ids, "fold_group5": [0, 1, 2, 3, 4]}).to_parquet(path, index=False)
-    fold_ids, column = train_rf.load_folds(path, cv="sgkf", n_splits=5, train_ids=ids)
+    pd.DataFrame(
+        {"ID": ids, "group_key": [10, 11, 12, 13, 14], "fold_group5": [0, 1, 2, 3, 4]}
+    ).to_parquet(path, index=False)
+    fold_ids, column, group_key_by_id = train_rf.load_folds(
+        path, cv="sgkf", n_splits=5, train_ids=ids
+    )
     assert column == "fold_group5"
     assert fold_ids.tolist() == [0, 1, 2, 3, 4]
+    assert group_key_by_id == {"a": 10, "b": 11, "c": 12, "d": 13, "e": 14}
+
+
+def test_load_folds_sgkf_without_group_key_column_raises(tmp_path):
+    """Group5 는 group leakage 검사에 group_key 가 필요하다 — 없으면 조용히 넘어가지 않는다."""
+    ids = np.array(["a", "b", "c", "d", "e"])
+    path = tmp_path / "folds.parquet"
+    pd.DataFrame({"ID": ids, "fold_group5": [0, 1, 2, 3, 4]}).to_parquet(path, index=False)
+    with pytest.raises(ValueError, match="group_key"):
+        train_rf.load_folds(path, cv="sgkf", n_splits=5, train_ids=ids)
+
+
+def test_load_folds_skf_without_group_key_column_is_allowed(tmp_path):
+    """skf 는 group 구조를 가정하지 않는 CV 라 group_key 가 선택적이다."""
+    ids = np.array(["a", "b", "c", "d", "e"])
+    path = tmp_path / "folds.parquet"
+    pd.DataFrame({"ID": ids, "fold_skf5": [0, 1, 2, 3, 4]}).to_parquet(path, index=False)
+    fold_ids, column, group_key_by_id = train_rf.load_folds(
+        path, cv="skf", n_splits=5, train_ids=ids
+    )
+    assert column == "fold_skf5"
+    assert group_key_by_id is None
 
 
 # ---------------------------------------------------------------- 덮어쓰기 방지
@@ -376,3 +403,50 @@ def test_fold_train_partition_missing_class_raises(tmp_path):
     out_dir = tmp_path / "artifacts"
     with pytest.raises(ValueError, match="fold train 에 없는 클래스"):
         run_cli(tmp_path, ctx, out_dir)
+
+
+# ---------------------------------------------------------------- group leakage guard(실제 실행 경로)
+
+
+def test_group_leakage_guard_passes_with_consistent_group_fold_file(tmp_path):
+    """정상 fold 파일(group_key 포함, 동일 group 이 항상 같은 fold)은 그대로 통과한다."""
+    ctx = build_data_dir(tmp_path)
+    out_dir = tmp_path / "artifacts"
+    run_cli(tmp_path, ctx, out_dir)  # 예외 없이 끝나야 한다
+
+    folds = pd.read_parquet(ctx["folds_path"])
+    oof = pd.read_csv(out_dir / "oof" / "oof_rf_test_group5_s42.csv", dtype={"ID": str})
+    merged = oof.merge(folds[["ID", "group_key"]], on="ID", how="left")
+
+    # build_data_dir 가 3쌍(0,1)/(10,11)/(50,51)을 중복 profile 로 만들어 뒀다 —
+    # 실제로 group_key 가 겹치는 group 이 있는지, 그리고 전부 같은 fold 인지 확인한다.
+    duplicated = merged["group_key"].value_counts()
+    duplicated_groups = duplicated[duplicated > 1].index
+    assert len(duplicated_groups) == 3
+    crossing = merged.groupby("group_key")["fold"].nunique()
+    assert (crossing.loc[duplicated_groups] == 1).all()
+
+
+def test_group_leakage_guard_stops_before_saving_any_artifact_on_corrupted_fold_file(tmp_path):
+    """같은 group_key 가 서로 다른 fold 에 배치된 손상된 fold 파일은 저장 전에 명확히 중단한다."""
+    ctx = build_data_dir(tmp_path)
+    folds = pd.read_parquet(ctx["folds_path"])
+
+    # (0,1) 쌍은 group_key 가 같다 — 한쪽 fold 만 인위적으로 옮겨 손상시킨다.
+    pair_a_id, pair_b_id = ctx["train_ids"][0], ctx["train_ids"][1]
+    row_a = folds.index[folds["ID"] == pair_a_id][0]
+    row_b = folds.index[folds["ID"] == pair_b_id][0]
+    assert folds.loc[row_a, "group_key"] == folds.loc[row_b, "group_key"]
+    original_fold = folds.loc[row_a, "fold_group5"]
+    folds.loc[row_b, "fold_group5"] = (original_fold + 1) % N_SPLITS
+    assert folds.loc[row_a, "fold_group5"] != folds.loc[row_b, "fold_group5"]
+    folds.to_parquet(ctx["folds_path"], index=False)
+
+    out_dir = tmp_path / "artifacts"
+    with pytest.raises(ValueError, match="group"):
+        run_cli(tmp_path, ctx, out_dir)
+
+    # 검증 실패는 어떤 산출물도 저장되기 전에 일어나야 한다.
+    paths = train_rf.output_paths(out_dir, "rf_test_group5_s42")
+    for path in paths.values():
+        assert not path.exists(), f"{path} 가 검증 실패에도 저장됐다"

@@ -172,6 +172,180 @@ def test_trial0_verification_detects_class_order_mismatch(tmp_path):
     assert checks["class_order_matches"] is False
 
 
+# ---------------------------------------------------------------- trial 0 캐시 provenance
+#
+# 실제 RF-A 재현(모델 학습)은 이 섹션에서 돌리지 않는다 — `build_trial0_cache_context`/
+# `trial0_cache_is_reusable`/`resolve_trial0_check` 는 순수 캐시 정책 함수라 합성
+# fixture(작은 임시 파일)와 mock `compute` 콜백만으로 검증한다(tickets Ticket 3 §3).
+
+
+def _sample_trial0_context(**overrides) -> dict:
+    base = {
+        "schema_version": r.TRIAL0_CACHE_SCHEMA_VERSION,
+        "git_commit": "abc123",
+        "data_files": {"train.csv": "h1", "test.csv": "h2", "sample_submission.csv": "h3"},
+        "fold_hash": "fh1",
+        "folds_file": {"name": "train_folds.parquet", "sha256": "fs1"},
+        "rf_a_oof_sha256": "oof1",
+        "rf_a_log_sha256": "log1",
+        "class_order": ["C00", "C01"],
+        "seed": 42,
+        "n_splits": 5,
+        "rf_a_baseline_params": {"n_estimators": 500, "max_features": "sqrt"},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_build_trial0_cache_context_hashes_files_and_omits_paths(tmp_path):
+    folds_path = tmp_path / "train_folds.parquet"
+    folds_path.write_bytes(b"fold-bytes")
+    rf_a_oof_path = tmp_path / "oof_rf_a.csv"
+    rf_a_oof_path.write_text("ID,fold\n1,0\n", encoding="utf-8")
+    rf_a_log_path = tmp_path / "rf_a_log.json"
+    rf_a_log_path.write_text("{}", encoding="utf-8")
+
+    context = r.build_trial0_cache_context(
+        git_commit="deadbeef",
+        data_hashes={"train.csv": "h1", "test.csv": "h2", "sample_submission.csv": "h3"},
+        fold_hash="fh1",
+        folds_path=folds_path,
+        rf_a_oof_path=rf_a_oof_path,
+        rf_a_log_path=rf_a_log_path,
+        classes=np.array(["C01", "C00"]),
+        seed=42,
+        n_splits=5,
+    )
+    for key in r.TRIAL0_CACHE_CONTEXT_KEYS:
+        assert key in context
+    assert context["folds_file"] == {
+        "name": "train_folds.parquet", "sha256": r.train_rf._sha256(folds_path)
+    }
+    assert context["class_order"] == ["C01", "C00"]
+    assert context["seed"] == 42
+    assert context["n_splits"] == 5
+    # 비밀정보·절대경로는 담지 않는다.
+    assert str(tmp_path) not in json.dumps(context)
+
+
+def test_trial0_cache_reused_when_context_matches_exactly():
+    context = _sample_trial0_context()
+    cached = {"passed": True, "context": dict(context)}
+    assert r.trial0_cache_is_reusable(cached, context) is True
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"git_commit": "different-commit"},
+        {"data_files": {"train.csv": "changed", "test.csv": "h2", "sample_submission.csv": "h3"}},
+        {"fold_hash": "different-fold-hash"},
+        {"folds_file": {"name": "train_folds.parquet", "sha256": "different-sha"}},
+        {"rf_a_oof_sha256": "different-oof-sha"},
+        {"rf_a_log_sha256": "different-log-sha"},
+        {"class_order": ["C01", "C00"]},
+        {"seed": 1},
+        {"n_splits": 10},
+        {"rf_a_baseline_params": {"n_estimators": 999}},
+    ],
+)
+def test_trial0_cache_stale_when_any_provenance_field_differs(override):
+    current = _sample_trial0_context()
+    cached = {"passed": True, "context": _sample_trial0_context(**override)}
+    assert r.trial0_cache_is_reusable(cached, current) is False
+
+
+def test_trial0_cache_not_reused_when_legacy_cache_has_no_context():
+    current = _sample_trial0_context()
+    assert r.trial0_cache_is_reusable({"passed": True}, current) is False
+
+
+def test_trial0_cache_not_reused_when_legacy_context_missing_fields():
+    current = _sample_trial0_context()
+    partial = _sample_trial0_context()
+    del partial["fold_hash"]
+    assert r.trial0_cache_is_reusable({"passed": True, "context": partial}, current) is False
+
+
+def test_trial0_cache_never_reused_when_cached_passed_is_false():
+    current = _sample_trial0_context()
+    cached = {"passed": False, "context": dict(current)}
+    assert r.trial0_cache_is_reusable(cached, current) is False
+
+
+def test_resolve_trial0_check_computes_and_persists_context_when_cache_missing(tmp_path, capsys):
+    context = _sample_trial0_context()
+    verification_path = tmp_path / "check.json"
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return {"passed": True, "max_abs_proba_diff": 1e-9, "oof_macro_f1_diff": 0.0}
+
+    result = r.resolve_trial0_check(verification_path, context, compute=compute)
+    assert calls == [1]
+    assert result["passed"] is True
+    saved = json.loads(verification_path.read_text(encoding="utf-8"))
+    assert saved["context"] == context
+    assert "cache missing: computing" in capsys.readouterr().out
+
+
+def test_resolve_trial0_check_reuses_cache_without_recomputing_on_exact_match(tmp_path, capsys):
+    context = _sample_trial0_context()
+    verification_path = tmp_path / "check.json"
+    verification_path.write_text(
+        json.dumps({"passed": True, "max_abs_proba_diff": 0.0, "oof_macro_f1_diff": 0.0, "context": context}),
+        encoding="utf-8",
+    )
+
+    def compute():
+        raise AssertionError("context 가 일치하면 재계산이 호출되면 안 된다")
+
+    result = r.resolve_trial0_check(verification_path, context, compute=compute)
+    assert result["passed"] is True
+    assert "cache reused: exact context match" in capsys.readouterr().out
+
+
+def test_resolve_trial0_check_recomputes_and_overwrites_when_context_stale(tmp_path, capsys):
+    stale_context = _sample_trial0_context(git_commit="old-commit")
+    fresh_context = _sample_trial0_context(git_commit="new-commit")
+    verification_path = tmp_path / "check.json"
+    verification_path.write_text(
+        json.dumps({"passed": True, "max_abs_proba_diff": 0.0, "oof_macro_f1_diff": 0.0, "context": stale_context}),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return {"passed": True, "max_abs_proba_diff": 2e-9, "oof_macro_f1_diff": 0.0}
+
+    result = r.resolve_trial0_check(verification_path, fresh_context, compute=compute)
+    assert calls == [1]
+    assert result["passed"] is True
+    saved = json.loads(verification_path.read_text(encoding="utf-8"))
+    assert saved["context"] == fresh_context
+    assert "cache stale: context mismatch, recomputing" in capsys.readouterr().out
+
+
+def test_resolve_trial0_check_recomputes_when_cached_passed_is_false(tmp_path, capsys):
+    context = _sample_trial0_context()
+    verification_path = tmp_path / "check.json"
+    verification_path.write_text(
+        json.dumps({"passed": False, "context": context}), encoding="utf-8"
+    )
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return {"passed": True, "max_abs_proba_diff": 0.0, "oof_macro_f1_diff": 0.0}
+
+    result = r.resolve_trial0_check(verification_path, context, compute=compute)
+    assert calls == [1]
+    assert result["passed"] is True
+    assert "cache stale: context mismatch, recomputing" in capsys.readouterr().out
+
+
 # ---------------------------------------------------------------- 탐색 요약
 
 
