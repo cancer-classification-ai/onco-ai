@@ -39,6 +39,67 @@ def weighted_average(
     return np.tensordot(weights, stack, axes=(0, 0))
 
 
+def crossfit_calibrated_blend(
+    oof_arrays: Sequence[np.ndarray],
+    y_true: np.ndarray,
+    classes: Sequence[str],
+    fold_values: np.ndarray,
+    weights: Sequence[float],
+):
+    """고정 가중 블렌드에 로짓 보정을 **교차적합**으로 얹는다.
+
+    fold 를 뺀 나머지에서 클래스별 바이어스를 찾고 그 fold 에만 적용한다. 전체 OOF 에
+    한 번에 맞추면 fit 과 evaluate 가 같은 행을 보게 돼 점수가 부풀고, 그 값으로는
+    구성을 고를 수 없다(실측으로 0.5210 -> 0.5438 만큼 부푼다).
+
+    `(raw_blend, calibrated, fold_results)` 를 낸다. 앞의 둘은 OOF 행 순서 그대로다.
+
+    `scripts/calibrate_ensemble.py` 와 재현 노트북이 **같은 이 함수를 부른다.**
+    로직이 두 벌이면 노트북이 제출본을 재현하지 못하는 순간이 오는데, 그때는 대회
+    심사에서 코드와 제출물이 어긋난 것으로 보인다.
+    """
+    from .calibration import MacroF1LogitBias  # 순환 import 회피
+    from .metrics import macro_f1
+
+    oof_arrays = [np.asarray(values, dtype=np.float64) for values in oof_arrays]
+    weights = np.asarray(weights, dtype=np.float64)
+    class_array = np.asarray(classes)
+
+    raw_blend = np.zeros_like(oof_arrays[0])
+    calibrated = np.zeros_like(oof_arrays[0])
+    fold_results = []
+
+    for fold in sorted(np.unique(fold_values).tolist()):
+        train_mask = fold_values != fold
+        valid_mask = ~train_mask
+
+        train_blend = weighted_average([v[train_mask] for v in oof_arrays], weights)
+        calibrator = MacroF1LogitBias().fit(train_blend, y_true[train_mask], classes)
+
+        valid_blend = weighted_average([v[valid_mask] for v in oof_arrays], weights)
+        valid_adjusted = calibrator.predict_proba(valid_blend)
+        raw_blend[valid_mask] = valid_blend
+        calibrated[valid_mask] = valid_adjusted
+
+        fold_results.append(
+            {
+                "fold": int(fold),
+                "n_train": int(train_mask.sum()),
+                "n_valid": int(valid_mask.sum()),
+                "weights": [float(w) for w in weights],
+                "bias": calibrator.bias_by_class(),
+                "raw_blend_macro_f1": macro_f1(
+                    y_true[valid_mask], class_array[valid_blend.argmax(axis=1)]
+                ),
+                "calibrated_macro_f1": macro_f1(
+                    y_true[valid_mask], class_array[valid_adjusted.argmax(axis=1)]
+                ),
+            }
+        )
+
+    return raw_blend, calibrated, fold_results
+
+
 class MacroF1Blender:
     """Macro F1을 기준으로 비음수 확률 혼합 가중치를 찾는다.
 

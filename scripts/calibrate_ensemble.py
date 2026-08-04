@@ -29,7 +29,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from cancer_hack.calibration import MacroF1LogitBias  # noqa: E402
-from cancer_hack.ensemble import MacroF1Blender, weighted_average  # noqa: E402
+from cancer_hack.ensemble import (  # noqa: E402
+    MacroF1Blender,
+    crossfit_calibrated_blend,
+    weighted_average,
+)
 from cancer_hack.io import save_csv, write_submission  # noqa: E402
 from cancer_hack.metrics import (  # noqa: E402
     build_prediction_frame,
@@ -175,44 +179,46 @@ def main() -> None:
         if abs(total - 1.0) > 1e-9:
             print(f"가중치 합 {total:g} -> 1 로 정규화: {fixed_weights.round(4).tolist()}")
 
-    crossfit_raw_blend = np.zeros_like(oof_arrays[0], dtype=np.float64)
-    crossfit_proba = np.zeros_like(oof_arrays[0], dtype=np.float64)
-    fold_results = []
-    for fold in sorted(np.unique(fold_values).tolist()):
-        train_mask = fold_values != fold
-        valid_mask = ~train_mask
-        if fixed_weights is None:
+    if fixed_weights is not None:
+        # 고정 가중이면 fold 밖에서 학습할 게 없다 — 보정만 fold 의 train 부분에서 fit 한다.
+        # 재현 노트북이 부르는 것도 같은 함수다(`cancer_hack.ensemble`).
+        crossfit_raw_blend, crossfit_proba, fold_results = crossfit_calibrated_blend(
+            oof_arrays, y_true, classes, fold_values, fixed_weights
+        )
+    else:
+        crossfit_raw_blend = np.zeros_like(oof_arrays[0], dtype=np.float64)
+        crossfit_proba = np.zeros_like(oof_arrays[0], dtype=np.float64)
+        fold_results = []
+        for fold in sorted(np.unique(fold_values).tolist()):
+            train_mask = fold_values != fold
+            valid_mask = ~train_mask
             blender = MacroF1Blender().fit(
                 [values[train_mask] for values in oof_arrays], y_true[train_mask], classes
             )
             fold_weights = blender.weights_
             blend = blender.predict_proba
-        else:
-            # fold 밖에서 학습할 게 없다. 보정만 이 fold 의 train 부분에서 fit 한다.
-            fold_weights = fixed_weights
-            blend = lambda values: weighted_average(values, fixed_weights)  # noqa: E731
 
-        train_blend = blend([values[train_mask] for values in oof_arrays])
-        calibrator = MacroF1LogitBias().fit(train_blend, y_true[train_mask], classes)
-        valid_blend = blend([values[valid_mask] for values in oof_arrays])
-        crossfit_raw_blend[valid_mask] = valid_blend
-        valid_adjusted = calibrator.predict_proba(valid_blend)
-        crossfit_proba[valid_mask] = valid_adjusted
-        valid_pred = np.asarray(classes)[valid_adjusted.argmax(axis=1)]
-        fold_results.append(
-            {
-                "fold": int(fold),
-                "n_train": int(train_mask.sum()),
-                "n_valid": int(valid_mask.sum()),
-                "weights": [float(w) for w in fold_weights],
-                "bias": calibrator.bias_by_class(),
-                "raw_blend_macro_f1": macro_f1(
-                    y_true[valid_mask],
-                    np.asarray(classes)[valid_blend.argmax(axis=1)],
-                ),
-                "calibrated_macro_f1": macro_f1(y_true[valid_mask], valid_pred),
-            }
-        )
+            train_blend = blend([values[train_mask] for values in oof_arrays])
+            calibrator = MacroF1LogitBias().fit(train_blend, y_true[train_mask], classes)
+            valid_blend = blend([values[valid_mask] for values in oof_arrays])
+            crossfit_raw_blend[valid_mask] = valid_blend
+            valid_adjusted = calibrator.predict_proba(valid_blend)
+            crossfit_proba[valid_mask] = valid_adjusted
+            valid_pred = np.asarray(classes)[valid_adjusted.argmax(axis=1)]
+            fold_results.append(
+                {
+                    "fold": int(fold),
+                    "n_train": int(train_mask.sum()),
+                    "n_valid": int(valid_mask.sum()),
+                    "weights": [float(w) for w in fold_weights],
+                    "bias": calibrator.bias_by_class(),
+                    "raw_blend_macro_f1": macro_f1(
+                        y_true[valid_mask],
+                        np.asarray(classes)[valid_blend.argmax(axis=1)],
+                    ),
+                    "calibrated_macro_f1": macro_f1(y_true[valid_mask], valid_pred),
+                }
+            )
 
     source_scores = {
         path.stem: macro_f1(y_true, np.asarray(classes)[values.argmax(axis=1)])

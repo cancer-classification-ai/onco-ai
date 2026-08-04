@@ -546,6 +546,33 @@ MODEL_PARAMS: dict[str, dict] = {
     "rf": dict(n_estimators=500, max_features="sqrt"),
 }
 
+#: 이름 붙인 하이퍼파라미터 프리셋. `--params <이름>` 으로 고른다.
+#:
+#: LB 를 받은 구성을 `--set` 나열로만 재현하면, 그 명령줄이 셸 히스토리에서 사라지는
+#: 순간 재현이 불가능해진다. 실제로 `cbopt10` 은 EXP_041 제출본(LB 0.4725)의 CatBoost
+#: 파라미터인데 저장소 어디에도 없어서 학습 로그의 `model_params` 에서 되찾았다.
+#:
+#: **여기 있다고 쓰라는 뜻이 아니다.** 아래 프리셋은 실측으로 기각된 것도 있고,
+#: `desc` 에 그 판정을 같이 적어 둔다.
+PARAM_PRESETS: dict[str, dict] = {
+    # EXP_039 의 Optuna 탐색 trial 10. OOF 는 CatBoost 기본값보다 세 seed 모두에서
+    # 1.6%p 높은데(0.4932 -> 0.5089) LB 는 -0.0084 였고, 짝 규칙을 얹은 뒤에도
+    # -0.0093 으로 크기가 같았다(EXP_041). 튜닝 이득이 train 분포에 붙어 있다는 뜻이다.
+    # **채택하지 않는다.** 등록해 두는 이유는 그 제출본을 재현할 수 있게 하기 위해서다.
+    "cbopt10": {
+        "model": "catboost",
+        "params": dict(
+            iterations=1600,
+            learning_rate=0.1002086028456688,
+            depth=6,
+            l2_leaf_reg=1.0629966259002686,
+            subsample=0.510491669178009,
+            rsm=1,
+        ),
+        "desc": "EXP_039 Optuna trial10 — OOF +0.016 / LB -0.0084. 기각됨, 재현 전용",
+    },
+}
+
 _LOGGED_PARAMS = (
     "task_type",
     "loss_function",
@@ -656,6 +683,39 @@ def model_params_for(name: str) -> dict:
     return dict(MODEL_PARAMS[name])
 
 
+def preset_params_for(name: str | None, model: str) -> dict:
+    """`--params` 프리셋 조회. 이름이 없으면 빈 dict.
+
+    프리셋마다 어느 모델용인지 박아 두고 안 맞으면 죽는다. CatBoost 파라미터를
+    XGBoost 에 넘기면 백엔드가 조용히 무시하는 게 아니라 fold 한복판에서 터지는데,
+    그때는 이미 Dataset 준비에 수십 초를 쓴 뒤다.
+    """
+    if not name:
+        return {}
+    if name not in PARAM_PRESETS:
+        raise SystemExit(
+            f"PARAM_PRESETS 에 {name!r} 이 없다. 사용 가능: {sorted(PARAM_PRESETS)}"
+        )
+    entry = PARAM_PRESETS[name]
+    if entry["model"] != model:
+        raise SystemExit(
+            f"프리셋 {name!r} 은 {entry['model']} 용인데 --model 이 {model} 이다"
+        )
+    return dict(entry["params"])
+
+
+def resolve_model_params(args) -> dict:
+    """기본값 -> `--params` 프리셋 -> `--set` 순으로 겹쳐 실제 쓸 파라미터를 만든다.
+
+    `--set` 이 프리셋을 이긴다. 프리셋 한 축만 바꿔 보는 게 흔한 사용이라서다.
+    `args` 에 `params_preset` 이 없어도(예전 호출자·노트북) 동작한다.
+    """
+    params = model_params_for(args.model)
+    params.update(preset_params_for(getattr(args, "params_preset", None), args.model))
+    params.update(args.override)
+    return params
+
+
 def fit_with_fallback(args, x_train, y_train, weight):
     """GPU 로 학습하고, 실패하면 그 fold 만 CPU 로 다시 돌린다.
 
@@ -664,8 +724,7 @@ def fit_with_fallback(args, x_train, y_train, weight):
     폴백으로 `use_gpu=False` 가 된 인스턴스를 재사용하면 이후 fold 가 전부 CPU 로
     끌려가서 비교가 깨진다.
     """
-    params = model_params_for(args.model)
-    params.update(args.override)
+    params = resolve_model_params(args)
     if args.threads is not None:
         # 공통 이름 -> 백엔드 이름은 `BaseGBDT._normalize` 가 한다 (catboost 는 thread_count).
         # `--set n_jobs=..` 를 직접 준 경우엔 그쪽을 존중한다.
@@ -1650,6 +1709,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--seed", type=int, default=42, help="모델 시드. fold 분할과는 무관하다."
     )
     parser.add_argument(
+        "--params",
+        dest="params_preset",
+        default=None,
+        help="이름 붙인 하이퍼파라미터 프리셋. 사용 가능: "
+        + ", ".join(f"{k} ({v['desc']})" for k, v in PARAM_PRESETS.items()),
+    )
+    parser.add_argument(
         "--set",
         dest="overrides",
         action="append",
@@ -1825,7 +1891,7 @@ def main() -> None:
     args.device = {"gpu": True, "cpu": False, "auto": "auto"}[args.device]
     args.override = _parse_override(args.overrides)
     args.gpu_ram_part = resolve_gpu_ram_part(args.gpu_ram_part)
-    model_params_for(args.model)  # 조기 검증 — Dataset 생성(수십 초) 전에 죽는다
+    resolve_model_params(args)  # 조기 검증 — Dataset 생성(수십 초) 전에 죽는다
 
     configs = (
         list(CONFIGS)
