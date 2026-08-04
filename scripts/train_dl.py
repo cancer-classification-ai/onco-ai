@@ -217,6 +217,7 @@ def append_fold_engineered_features(
     raw_gene_columns: list[str] | None,
     latent_source: tuple[list[str], np.ndarray, np.ndarray] | None,
     latent_config: dict[str, object],
+    latent_metadata: list[dict[str, object]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Append every configured fold-fitted dense block without data leakage."""
     names: list[str] = []
@@ -253,7 +254,7 @@ def append_fold_engineered_features(
             if key not in ("method", "methods")
         }
         for method in methods:
-            latent_names, fold_latent_train, fold_latent_test, _, _ = (
+            latent_names, fold_latent_train, fold_latent_test, _, basis = (
                 build_fold_latent_block(
                     latent_train,
                     latent_test,
@@ -264,6 +265,15 @@ def append_fold_engineered_features(
                     **shared_config,
                 )
             )
+            if latent_metadata is not None:
+                latent_metadata.append(
+                    {
+                        "method": method,
+                        "dimension": int(basis.n_components),
+                        "fit_row_count": int(len(train_index)),
+                        "support_gene_count": int(len(basis.gene_index)),
+                    }
+                )
             train_dense = np.hstack([train_dense, fold_latent_train])
             test_dense = np.hstack([test_dense, fold_latent_test])
             names.extend(latent_names)
@@ -571,6 +581,10 @@ def main() -> None:
     fold_training: list[dict[str, object]] = []
     fold_dense_dimensions: list[int] = []
     fold_feature_columns: list[list[str]] = []
+    latent_dimensions: list[int] = []
+    latent_methods: list[list[str]] = []
+    latent_fit_row_counts: list[int] = []
+    latent_support_gene_counts: list[list[int]] = []
     started = time.perf_counter()
     fold_values = range(1) if args.dry_run else range(args.n_splits)
 
@@ -586,6 +600,7 @@ def main() -> None:
             train_index,
         )
         feature_columns = [*dense_bundle.columns, *BURDEN_COLUMNS]
+        fold_latent_metadata: list[dict[str, object]] = []
         dense_train, dense_test, engineered_names = append_fold_engineered_features(
             dense_train,
             dense_test,
@@ -597,6 +612,7 @@ def main() -> None:
             raw_gene_columns=raw_gene_columns,
             latent_source=latent_source,
             latent_config=latent_config,
+            latent_metadata=fold_latent_metadata,
         )
         feature_columns.extend(engineered_names)
         dense_train, dense_test = scale_fold_dense(
@@ -606,6 +622,27 @@ def main() -> None:
         dense_dim = dense_train.shape[1]
         fold_dense_dimensions.append(int(dense_dim))
         fold_feature_columns.append(feature_columns)
+        latent_dimensions.append(
+            sum(int(item["dimension"]) for item in fold_latent_metadata)
+        )
+        latent_methods.append(
+            [str(item["method"]) for item in fold_latent_metadata]
+        )
+        latent_fit_row_counts.append(
+            int(fold_latent_metadata[0]["fit_row_count"])
+            if fold_latent_metadata
+            else 0
+        )
+        latent_support_gene_counts.append(
+            [int(item["support_gene_count"]) for item in fold_latent_metadata]
+        )
+        print(
+            f"fold {fold + 1} dense_dim={dense_dim} "
+            f"latent_dim={latent_dimensions[-1]} "
+            f"latent_methods={latent_methods[-1]} "
+            f"latent_fit_rows={latent_fit_row_counts[-1]} "
+            f"latent_support_genes={latent_support_gene_counts[-1]}"
+        )
         common = dict(
             samples=train_samples,
             ids=dense_bundle.train_ids,
@@ -726,6 +763,11 @@ def main() -> None:
         "latent": {"enabled": latent_enabled, **latent_config},
         "n_features": fold_dense_dimensions[0],
         "fold_n_features": fold_dense_dimensions,
+        "fold_dense_dimensions": fold_dense_dimensions,
+        "latent_dimensions": latent_dimensions,
+        "latent_methods": latent_methods,
+        "latent_fit_row_counts": latent_fit_row_counts,
+        "latent_support_gene_counts": latent_support_gene_counts,
         "feature_columns": fold_feature_columns[0],
         "fold_macro_f1": fold_scores,
         "fold_train_loss": fold_losses,
