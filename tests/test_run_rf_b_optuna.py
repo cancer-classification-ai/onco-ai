@@ -501,3 +501,43 @@ def test_cli_rejects_target_trials_above_40(tmp_path, monkeypatch):
     monkeypatch.setenv("RF_DATA_DIR", str(tmp_path))  # main() 이 이 인자보다 먼저 죽어야 한다
     with pytest.raises(SystemExit, match="40"):
         r.main(["--target-trials", "41"])
+
+
+# ---------------------------------------------------------------- 저장 후 재검증 — group leakage 배선
+
+
+def test_re_validate_rf_b_artifacts_catches_group_crossing_via_passed_mapping(tmp_path):
+    """`group_key_by_id` 가 `re_validate_rf_b_artifacts` 안에서 실제로
+    `validate_oof_frame` 에 전달되는지 확인한다. 이 배선이 제거되면(인자를 받고도
+    버리면) 아래 손상된 OOF 가 통과해버려 이 테스트가 실패한다."""
+    classes = np.array(["C00", "C01"])
+    ids = ["tr0", "tr1", "tr2", "tr3"]
+    # tr0/tr1 은 같은 group("g0")인데 서로 다른 fold(0, 1)에 있다 — 손상된 OOF.
+    oof = pd.DataFrame({
+        "ID": ids,
+        "fold": [0, 1, 0, 1],
+        "y_true": ["C00", "C00", "C01", "C01"],
+        "y_pred": ["C00", "C00", "C01", "C01"],
+        "p_C00": [0.9, 0.9, 0.1, 0.1],
+        "p_C01": [0.1, 0.1, 0.9, 0.9],
+    })
+    test_pred = pd.DataFrame({"ID": ["te0", "te1"], "p_C00": [0.5, 0.5], "p_C01": [0.5, 0.5]})
+    submission = pd.DataFrame({"ID": ["te0", "te1"], "SUBCLASS": ["C00", "C01"]})
+
+    paths = {
+        "oof": tmp_path / "oof.csv",
+        "test": tmp_path / "test.csv",
+        "submission": tmp_path / "submission.csv",
+    }
+    oof.to_csv(paths["oof"], index=False)
+    test_pred.to_csv(paths["test"], index=False)
+    submission.to_csv(paths["submission"], index=False, encoding="utf-8-sig")
+
+    expected_macro_f1 = r.macro_f1_with_labels(oof["y_true"], oof["y_pred"], classes)
+
+    with pytest.raises(ValueError, match="동일 group 이 fold 를 넘는 사례"):
+        r.re_validate_rf_b_artifacts(
+            paths, classes=classes, train_ids=np.array(ids), n_splits=2,
+            sample_ids=["te0", "te1"], expected_macro_f1=expected_macro_f1,
+            group_key_by_id={"tr0": "g0", "tr1": "g0", "tr2": "g1", "tr3": "g2"},
+        )

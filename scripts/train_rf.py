@@ -274,11 +274,18 @@ def build_f4r_fold_matrices(f4r: dict, train_index: np.ndarray):
 def load_folds(path: Path, *, cv: str, n_splits: int, train_ids: np.ndarray):
     """미리 만든 fold 파일을 **읽기만** 한다 — 이 스크립트는 fold 를 만들지 않는다.
 
-    `group_key` 열이 있으면 `{ID: group_key}` 매핑도 함께 돌려준다(동일 group 이
-    fold 를 넘는지는 `validate_oof_frame(group_key_by_id=...)` 가 검사한다 — 여기서는
-    매핑만 만든다, 재정의하지 않는다). `cv="sgkf"`(Group5) 는 `group_key` 열이
-    없으면 조용히 넘어가지 않고 즉시 에러를 낸다 — Group5 는 정의상 group-safe
-    분할이라 이 검사 없이는 leakage 를 잡을 수단이 없다.
+    `cv="sgkf"`(Group5) 일 때만 `group_key` 열을 읽어 `{ID: group_key}` 매핑을
+    함께 돌려준다(동일 group 이 fold 를 넘는지는 `validate_oof_frame(
+    group_key_by_id=...)` 가 검사한다 — 여기서는 매핑만 만든다, 재정의하지
+    않는다). `group_key` 열이 없으면 조용히 넘어가지 않고 즉시 에러를 낸다 —
+    Group5 는 정의상 group-safe 분할이라 이 검사 없이는 leakage 를 잡을 수단이
+    없다.
+
+    `cv="skf"`(plain StratifiedKFold) 는 group 을 고려하지 않는 분할이라 동일
+    group 이 fold 를 넘는 것이 정상이다. canonical fold 파일은 `ID, group_key,
+    fold_group5, fold_skf5` 를 전부 담고 있으므로, `group_key` 열이 있어도
+    `cv="skf"` 에서는 **무시**한다 — 열이 있다고 검사를 켜면 정상적인 skf 분할을
+    누수로 오판한다. 항상 `group_key_by_id=None` 을 돌려준다.
     """
     if not path.exists():
         raise SystemExit(
@@ -314,14 +321,16 @@ def load_folds(path: Path, *, cv: str, n_splits: int, train_ids: np.ndarray):
         )
 
     group_key_by_id: dict[str, object] | None = None
-    if "group_key" in ordered.columns:
+    if cv == "sgkf":
+        if "group_key" not in ordered.columns:
+            raise ValueError(
+                f"{path.name} 에 group_key 열이 없다 — sgkf(Group5) 는 동일 group(profile_hash) 이 "
+                "fold 를 넘는 사례를 검사하는 데 group_key 가 필요하다. scripts/make_folds.py 로 "
+                "다시 만든다(FOLD_META_COLUMNS = ID, group_key)."
+            )
         group_key_by_id = dict(zip(train_id_strs, ordered["group_key"].tolist()))
-    elif cv == "sgkf":
-        raise ValueError(
-            f"{path.name} 에 group_key 열이 없다 — sgkf(Group5) 는 동일 group(profile_hash) 이 "
-            "fold 를 넘는 사례를 검사하는 데 group_key 가 필요하다. scripts/make_folds.py 로 "
-            "다시 만든다(FOLD_META_COLUMNS = ID, group_key)."
-        )
+    # cv != "sgkf"(예: skf) 는 group_key 열이 있어도 무시한다 — group 을 고려하지
+    # 않는 분할에 group leakage 검사를 걸면 정상적인 group crossing 을 오판한다.
 
     return fold_ids, column, group_key_by_id
 

@@ -214,6 +214,52 @@ def test_load_folds_skf_without_group_key_column_is_allowed(tmp_path):
     assert group_key_by_id is None
 
 
+def test_load_folds_skf_ignores_group_key_even_when_canonical_file_has_it(tmp_path):
+    """회귀 재현: canonical fold 파일(ID, group_key, fold_group5, fold_skf5 전부 존재)에서
+    skf 는 group_key 열이 있어도 무시해야 한다 — 있다고 검사를 켜면, group 을 고려하지
+    않는 plain SKF 의 정상적인 group crossing 을 누수로 오판한다."""
+    ids = np.array(["a", "b", "c", "d", "e"])
+    path = tmp_path / "folds.parquet"
+    # a/b 는 같은 group_key(중복 profile) — fold_group5 에서는 같은 fold(0),
+    # fold_skf5 에서는 서로 다른 fold(0 vs 3) — plain SKF 에서는 정상이다.
+    pd.DataFrame(
+        {
+            "ID": ids,
+            "group_key": [100, 100, 101, 102, 103],
+            "fold_group5": [0, 0, 1, 2, 3],
+            "fold_skf5": [0, 3, 1, 2, 4],
+        }
+    ).to_parquet(path, index=False)
+
+    fold_ids, column, group_key_by_id = train_rf.load_folds(
+        path, cv="skf", n_splits=5, train_ids=ids
+    )
+    assert column == "fold_skf5"
+    assert fold_ids.tolist() == [0, 3, 1, 2, 4]
+    assert group_key_by_id is None  # group leakage validator 가 비활성화돼야 한다
+
+
+def test_load_folds_sgkf_still_reads_group_key_from_the_same_canonical_file(tmp_path):
+    """같은 canonical 파일을 sgkf 로 읽으면 group_key 매핑이 여전히 정확히 나온다."""
+    ids = np.array(["a", "b", "c", "d", "e"])
+    path = tmp_path / "folds.parquet"
+    pd.DataFrame(
+        {
+            "ID": ids,
+            "group_key": [100, 100, 101, 102, 103],
+            "fold_group5": [0, 0, 1, 2, 3],
+            "fold_skf5": [0, 3, 1, 2, 4],
+        }
+    ).to_parquet(path, index=False)
+
+    fold_ids, column, group_key_by_id = train_rf.load_folds(
+        path, cv="sgkf", n_splits=5, train_ids=ids
+    )
+    assert column == "fold_group5"
+    assert fold_ids.tolist() == [0, 0, 1, 2, 3]
+    assert group_key_by_id == {"a": 100, "b": 100, "c": 101, "d": 102, "e": 103}
+
+
 # ---------------------------------------------------------------- 덮어쓰기 방지
 
 
@@ -443,10 +489,49 @@ def test_group_leakage_guard_stops_before_saving_any_artifact_on_corrupted_fold_
     folds.to_parquet(ctx["folds_path"], index=False)
 
     out_dir = tmp_path / "artifacts"
-    with pytest.raises(ValueError, match="group"):
+    with pytest.raises(ValueError, match="동일 group 이 fold 를 넘는 사례"):
         run_cli(tmp_path, ctx, out_dir)
 
     # 검증 실패는 어떤 산출물도 저장되기 전에 일어나야 한다.
     paths = train_rf.output_paths(out_dir, "rf_test_group5_s42")
     for path in paths.values():
         assert not path.exists(), f"{path} 가 검증 실패에도 저장됐다"
+
+
+def test_group_leakage_guard_does_not_block_plain_skf_with_canonical_group_fold_file(tmp_path):
+    """회귀 재현(실제 CLI 경로): canonical fold 파일(group_key 포함)로 --cv skf 를
+    실행해도 group crossing 이 정상적으로 허용돼야 한다 — guard 는 sgkf 전용이다.
+    (fixup 0efe4eb 가 도입한 회귀: group_key 열이 있으면 cv 와 무관하게 검사를
+    켰고, plain SKF 의 정상적인 group crossing 을 누수로 오판했다.)"""
+    ctx = build_data_dir(tmp_path)
+    folds = pd.read_parquet(ctx["folds_path"])
+
+    # fold_skf5: group 을 무시하는 배정 — 위치 기반으로 순환시켜 (0,1) 쌍(같은
+    # group_key)이 서로 다른 fold 에 놓이도록 확정적으로 만든다.
+    folds["fold_skf5"] = np.arange(len(folds)) % N_SPLITS
+    folds.to_parquet(ctx["folds_path"], index=False)
+
+    pair_a_id, pair_b_id = ctx["train_ids"][0], ctx["train_ids"][1]
+    fold_by_id = dict(zip(folds["ID"].astype(str), folds["fold_skf5"]))
+    assert folds.loc[folds["ID"] == pair_a_id, "group_key"].item() == (
+        folds.loc[folds["ID"] == pair_b_id, "group_key"].item()
+    )
+    assert fold_by_id[pair_a_id] != fold_by_id[pair_b_id], "테스트 전제(fold 교차)가 깨졌다"
+
+    out_dir = tmp_path / "artifacts"
+    run_cli(tmp_path, ctx, out_dir, extra_args=["--cv", "skf"])  # 예외 없이 끝나야 한다
+
+    oof = pd.read_csv(out_dir / "oof" / "oof_rf_test_skf5_s42.csv", dtype={"ID": str})
+    test_pred = pd.read_csv(out_dir / "test_predictions" / "test_rf_test_skf5_s42.csv")
+    submission = pd.read_csv(
+        out_dir / "submissions" / "submission_rf_test_skf5_s42.csv",
+        encoding="utf-8-sig", dtype=str,
+    )
+    classes = np.array(sorted(set(pd.read_csv(ctx["data_dir"] / "train.csv")["SUBCLASS"])))
+    sample_ids = pd.read_csv(ctx["data_dir"] / "sample_submission.csv", dtype=str)["ID"].tolist()
+
+    validate_oof_frame(oof, class_order=classes, train_ids=ctx["train_ids"], n_splits=N_SPLITS)
+    validate_test_probability_frame(test_pred, class_order=classes, sample_submission_ids=sample_ids)
+    validate_submission_frame(
+        submission, class_order=classes, sample_submission_ids=sample_ids, test_proba_frame=test_pred
+    )
