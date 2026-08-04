@@ -92,7 +92,7 @@ def run_study(model: str, args) -> Path:
         str(PYTHON), str(PROJECT_ROOT / "scripts" / "tune_optuna.py"),
         "--model", model,
         "--config", args.config,
-        "--cv", "both",
+        "--cv", args.search_cv,
         "--objective", args.objective,
         "--n-trials", str(args.n_trials),
         "--study", study,
@@ -207,6 +207,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--topk", type=int, default=500)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42, help="탐색 중 쓰는 모델 시드")
+    parser.add_argument(
+        "--search-cv", default="sgkf",
+        help="탐색 중 잴 분할. 기본 sgkf 단독 — `both` 는 trial 당 시간이 두 배다. "
+        "재검증 단계는 어차피 두 분할을 다 재므로, 상위 후보의 skf 는 거기서 나온다",
+    )
     parser.add_argument("--objective", default="sgkf",
                         help="sgkf 가 기본이다 — v002 가 group5 로 선택됐다. §목적함수 참고")
     parser.add_argument("--gap-penalty", type=float, default=0.5)
@@ -223,7 +228,8 @@ def main() -> None:
     args = build_parser().parse_args()
     TUNING_DIR.mkdir(parents=True, exist_ok=True)
 
-    search = sum(SECONDS_PER_TRIAL[m] * args.n_trials for m in args.models)
+    axes = 2 if args.search_cv == 'both' else 1
+    search = sum(SECONDS_PER_TRIAL[m] * args.n_trials for m in args.models) * axes // 2
     reval = 0 if args.skip_revalidate else sum(
         SECONDS_PER_TRIAL[m] * (args.top_k_revalidate + 1) * len(args.revalidate_seeds)
         for m in args.models

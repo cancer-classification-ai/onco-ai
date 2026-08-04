@@ -20,6 +20,7 @@ optuna = pytest.importorskip("optuna", reason="requirements.txt 의 optuna 미�
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
+import tune_optuna  # noqa: E402
 from train_gbdt import CONFIGS, MODEL_PARAMS  # noqa: E402
 from tune_optuna import (  # noqa: E402
     BASELINE_CV,
@@ -110,24 +111,54 @@ def test_objective_value_rejects_a_split_it_did_not_measure():
         _objective_value({"skf": 0.40}, "sgkf")
 
 
-def test_cross_validate_refuses_configs_it_cannot_build():
-    """fold 안에서 새로 fit 하는 블록은 이 튜너가 만들지 않는다.
+def test_cross_validate_delegates_configs_it_cannot_build():
+    """fold 안에서 새로 fit 하는 블록이 있으면 `train_gbdt.run_config` 로 넘긴다.
 
-    막지 않으면 f4rl 을 튜닝했는데 lsvd 가 빠진 채 학습돼 f4r 의 점수가 나온다.
-    예외가 아니라 그럴듯한 숫자로 나오는 게 문제라 가드를 테스트로 고정한다.
-    `data` 를 만지기 전에 걸러야 하므로 None 을 넘겨도 통과하면 안 된다.
+    예전에는 여기서 ValueError 를 던졌다. 그 가드의 목적은 "lsvd 가 빠진 채 학습돼
+    f4r 의 점수가 그럴듯하게 나오는 것" 을 막는 거였는데, 위임하면 그 블록들이 실제로
+    붙으므로 목적이 그대로 달성되면서 튜닝도 가능해진다.
+
+    **복제가 아니라 위임이어야 한다.** fold 스탠자를 이쪽으로 베끼면 leakage 방지
+    코드가 두 벌이 되어 `tests/test_fold_fit_only.py` 가 지키는 쪽과 언젠가 어긋난다.
+    그래서 위임 경로를 탄다는 것 자체를 고정한다.
     """
-    with pytest.raises(ValueError, match="lsvd"):
-        cross_validate(
-            None,
-            {},
-            config="f4rl",
-            cv="skf",
-            topk=500,
-            n_splits=5,
-            seed=42,
-            use_gpu=False,
+    called = {}
+
+    def fake_delegate(data, params, **kwargs):
+        called.update(kwargs)
+        return {"oof_macro_f1": 0.5, "via": "train_gbdt.run_config"}
+
+    original = tune_optuna._cross_validate_via_run_config
+    tune_optuna._cross_validate_via_run_config = fake_delegate
+    try:
+        result = cross_validate(
+            None, {}, config="f4rl", cv="skf", topk=500,
+            n_splits=5, seed=42, use_gpu=False,
         )
+    finally:
+        tune_optuna._cross_validate_via_run_config = original
+
+    assert result["via"] == "train_gbdt.run_config"
+    assert called["config"] == "f4rl"
+    assert called["cv"] == "skf"
+
+
+def test_delegation_marks_its_results():
+    """위임 경로로 나온 점수는 `via` 로 구별돼야 한다 — 두 경로가 섞이면 추적이 안 된다."""
+    import inspect
+
+    source = inspect.getsource(tune_optuna._cross_validate_via_run_config)
+    assert '"via": "train_gbdt.run_config"' in source
+    # 파일을 쓰면 안 된다. 탐색은 trial 마다 도는데 OOF csv 가 쌓이면 디스크가 찬다.
+    assert "dry_run = True" in source
+
+
+def test_delegation_takes_feature_defaults_from_train_gbdt():
+    """피처 축 30여 개를 손으로 옮겨 적으면 v002 학습 설정과 어긋난다."""
+    import inspect
+
+    source = inspect.getsource(tune_optuna._cross_validate_via_run_config)
+    assert "parse_args([])" in source, "train_gbdt 파서 기본값을 그대로 받아야 한다"
 
 
 def test_supported_config_is_not_rejected_before_it_touches_data():

@@ -240,6 +240,53 @@ BASELINE_POINT = BASELINE_POINTS["xgb"]
 
 
 # ---------------------------------------------------------------- CV
+def _cross_validate_via_run_config(
+    data, params, *, config, cv, topk, n_splits, seed, use_gpu, model_name,
+    track_train, verbose,
+) -> dict:
+    """`train_gbdt.run_config` 에 위임하고 결과를 이 모듈의 계약으로 옮긴다.
+
+    fold 안에서 새로 fit 하는 블록(TF-IDF·공변이·잠재·모듈·서명)이 있는 config 는
+    이 경로로만 정확하게 잴 수 있다. `run_config` 는 `Dataset` 을 다시 만들지 않고
+    넘겨받은 것을 쓰므로 trial 마다 드는 비용은 fold 학습뿐이다.
+
+    `dry_run=True` 라 OOF·test·제출 csv 를 하나도 쓰지 않는다.
+    """
+    from train_gbdt import build_parser as _tg_parser, run_config
+
+    # 피처 축(TF-IDF·공변이·잠재·모듈·서명 파라미터 30여 개)을 손으로 옮겨 적으면
+    # v002 가 학습된 설정과 어긋날 위험이 있다. train_gbdt 파서의 기본값을 그대로
+    # 받아 쓰고 필요한 것만 덮는다 — 그쪽에 옵션이 늘어도 여기가 안 깨진다.
+    ns = _tg_parser().parse_args([])
+    ns.model = model_name
+    ns.topk = topk
+    ns.n_splits = n_splits
+    ns.seed = seed
+    ns.device = use_gpu             # main 의 문자열->bool 변환을 이미 거친 값이 온다
+    ns.override = dict(params)      # ← Optuna 가 고른 하이퍼파라미터가 여기로 들어간다
+    ns.dry_run = True               # ← OOF·test·제출 csv 를 하나도 쓰지 않는다
+    ns.track_train = track_train
+    result = run_config(data, config=config, cv=cv, args=ns)
+
+    out = {
+        "oof_macro_f1": result["oof_macro_f1"],
+        "fold_macro_f1": result["fold_macro_f1"],
+        "n_features": result["n_features"],
+        "elapsed_seconds": result["elapsed_seconds"],
+        "device": result["device"],
+        "device_mixed": result["device_mixed"],
+        "via": "train_gbdt.run_config",
+    }
+    if "generalization_gap" in result:
+        out["train_macro_f1"] = result["train_macro_f1"]
+        out["generalization_gap"] = result["generalization_gap"]
+        out["fold_train_macro_f1"] = result["fold_train_macro_f1"]
+    if verbose:
+        log(f"    [{config}/{cv}] OOF {result['oof_macro_f1']:.4f} "
+            f"· {result['n_features']:,}열 · {result['elapsed_seconds']:.0f}s (run_config 경유)")
+    return out
+
+
 def cross_validate(
     data: Dataset,
     params: dict,
@@ -275,10 +322,20 @@ def cross_validate(
         if b in SPARSE_BLOCKS or b in PAIR_BLOCKS or b in LATENT_BLOCKS or b in MODULE_BLOCKS
     ]
     if unsupported:
-        raise ValueError(
-            f"config {config} 의 블록 {unsupported} 은 이 튜너가 만들지 않는다. "
-            "그대로 돌리면 그 블록이 빠진 채 학습돼 다른 config 의 점수가 나온다. "
-            "scripts/train_gbdt.py 로 돌리거나, cross_validate 에 fold 스탠자를 옮겨 온다."
+        # 예전에는 여기서 멈췄다. fold 스탠자를 이쪽으로 **복제**하는 건 위험하다 —
+        # 그 코드가 정확히 leakage 방지의 핵심부(fold 의 train 부분에서만 fit)이고
+        # `tests/test_fold_fit_only.py` 67개가 지키는 자리라, 두 벌이 되면 언젠가 어긋난다.
+        #
+        # 대신 `train_gbdt.run_config` 를 그대로 부른다. 거기엔 모든 블록의 fold 스탠자가
+        # 이미 있고, `args.override` 로 하이퍼파라미터를 주입할 수 있으며 `args.dry_run`
+        # 이 파일 쓰기 전에 반환한다. 복제가 없으니 어긋날 수가 없다.
+        #
+        # 대가는 pruning 이다. `run_config` 는 fold 를 다 돌고 한 번에 반환해서 중간
+        # 보고를 못 한다. trial 당 시간이 그만큼 늘어난다.
+        return _cross_validate_via_run_config(
+            data, params, config=config, cv=cv, topk=topk, n_splits=n_splits,
+            seed=seed, use_gpu=use_gpu, model_name=model_name,
+            track_train=track_train, verbose=verbose,
         )
     gene_blocks = [b for b in spec["blocks"] if b in GENE_BLOCKS]
     names, dense_train, _ = data.assemble(config)

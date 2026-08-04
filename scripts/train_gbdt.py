@@ -1031,6 +1031,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     oof = np.zeros((len(data.y), len(data.classes)), dtype=np.float64)
     test_proba = np.zeros((len(data.test_ids), len(data.classes)), dtype=np.float64)
     fold_scores: list[float] = []
+    fold_train_scores: list[float] = []
     fold_seconds: list[float] = []
     fold_widths: list[int] = []
     devices: list[str] = []
@@ -1228,6 +1229,16 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             data.y[valid_index], data.classes[oof[valid_index].argmax(axis=1)]
         )
         fold_scores.append(score)
+        # 일반화 격차(train − valid)용. 기본은 끈다 — 켜면 fold 마다 train 행 전체를
+        # 한 번 더 예측해야 해서 느려지고, 기존 로그 129개와 키 구성이 달라진다.
+        # `--track-train` 을 준 실행에만 붙는다.
+        if getattr(args, "track_train", False):
+            fold_train_scores.append(
+                macro_f1(
+                    data.y[train_index],
+                    data.classes[model.predict_proba(x_train[train_index]).argmax(axis=1)],
+                )
+            )
         fold_seconds.append(time.perf_counter() - t0)
         log(
             f"  [{stem}] fold {fold + 1}/{args.n_splits}  dim={n_features:,}  "
@@ -1318,6 +1329,16 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         "seed": args.seed,
         "fold_macro_f1": fold_scores,
         "fold_seconds": fold_seconds,
+        # `--track-train` 없이는 빈 리스트 -> 아래에서 통째로 빠져 기존 로그와 같아진다.
+        **(
+            {
+                "fold_train_macro_f1": fold_train_scores,
+                "train_macro_f1": float(np.mean(fold_train_scores)),
+                "generalization_gap": float(np.mean(fold_train_scores) - summary["macro_f1"]),
+            }
+            if fold_train_scores
+            else {}
+        ),
         "oof_macro_f1": summary["macro_f1"],
         "oof_macro_f1_singleton": singleton,
         "n_singleton": int(mask.sum()),
@@ -1595,6 +1616,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tag", default="v2", help="파일명에 들어가는 실험 이름")
     parser.add_argument("--submission", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true", help="파일을 쓰지 않는다")
+    parser.add_argument(
+        "--track-train", action="store_true",
+        help="fold 마다 train 점수도 재서 일반화 격차를 남긴다. fold 당 train 행 전체를 "
+        "한 번 더 예측하므로 느려진다. 끄면 기존 로그와 키 구성이 같다",
+    )
 
     # --- 공변이 쌍 블록 (comut) ------------------------------------------
     parser.add_argument(
