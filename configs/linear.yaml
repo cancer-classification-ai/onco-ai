@@ -1,0 +1,25 @@
+model:
+  solver: lbfgs
+  scaler: standard
+  max_iter: 1000
+  tol: 0.0001
+
+# C is selected independently inside each outer fold using only its training
+# rows. The selected fold-specific C is reused for every requested config.
+calibration:
+  config: f4r
+  c_grid:
+    - 0.001
+    - 0.003
+    - 0.01
+    - 0.03
+    - 0.1
+  inner_valid_fraction: 0.15
+
+experiment:
+  configs:
+    - f4r
+    - full_all
+  cv: skf
+  n_splits: 5
+  seed: 42
