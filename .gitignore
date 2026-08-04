@@ -61,5 +61,8 @@ artifacts/logs/*
 artifacts/metrics/*
 !artifacts/metrics/.gitkeep
 
+# ==================== Local experiment outputs ====================
+v018b_gene_evidence_ablation/
+
 # ==================== macOS ====================
 .DS_Store

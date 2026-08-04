@@ -24,6 +24,9 @@
             (`--latent-*`/`--module-*` 플래그, `cancer_hack.features_latent` 참고)
     csig       26  클래스 서명 몫 — fold 안에서 라벨로 클래스별 유전자 집합을 고른다
             (`--signature-*` 플래그, `cancer_hack.features_signature` 참고)
+    ebovr      26  EB-OVR supervised gene evidence — outer-train은 inner cross-fit
+    ebbnb      26  EB-Bernoulli likelihood — 같은 누수 방지 계약
+            (`--evidence-*` 플래그, `cancer_hack.features_gene_evidence` 참고)
 
 ## 왜 래더인가
 
@@ -106,6 +109,7 @@ from cancer_hack.features_frequency import (  # noqa: E402
     TrainAATransitionFeatures,
     TrainFrequencyFeatures,
 )
+from cancer_hack.features_gene_evidence import build_fold_gene_evidence_block  # noqa: E402
 from cancer_hack.features_latent import (  # noqa: E402
     MODULE_VALUES,
     SHIFT_EXPOSED_VALUES,
@@ -205,11 +209,21 @@ MODULE_BLOCKS = ("gmod",)
 #: 흐려진다. 지도 블록이라 `selected` 등록도 의미가 있다(고른 유전자가 fold 마다 바뀐다).
 SIGNATURE_BLOCKS = ("csig",)
 
+#: gene->class score를 직접 학습하는 지도 인코딩. XGBoost training row가 자기
+#: label을 되읽지 않도록 outer-train 내부에서 한 번 더 cross-fitting한다.
+EVIDENCE_BLOCKS = ("ebovr", "ebbnb")
+
 #: 원본 유전자 행렬을 그대로 들고 있다가 **fold 안에서** 열을 만드는 블록 전부.
 #: `Dataset` 은 이들을 `pairs` 주머니에 담고 `assemble` 은 건너뛴다. 가족을 새로 만들 때
 #: 여기 한 줄만 더하면 두 자리가 같이 따라온다 — 예전엔 세 상수를 두 곳에서 각각 나열해서
 #: 한쪽만 고치면 블록이 조용히 dense 로 떨어졌다(`KeyError` 도 안 난다).
-FOLD_MATRIX_BLOCKS = PAIR_BLOCKS + LATENT_BLOCKS + MODULE_BLOCKS + SIGNATURE_BLOCKS
+FOLD_MATRIX_BLOCKS = (
+    PAIR_BLOCKS
+    + LATENT_BLOCKS
+    + MODULE_BLOCKS
+    + SIGNATURE_BLOCKS
+    + EVIDENCE_BLOCKS
+)
 
 #: sparse 블록 -> (parquet 파일명 템플릿, 문서 열 이름)
 SPARSE_SOURCES = {
@@ -237,6 +251,8 @@ BLOCK_SOURCES = {
     "lnmf": "{split}_mutation_encoded.parquet",
     "gmod": "{split}_mutation_encoded.parquet",
     "csig": "{split}_mutation_encoded.parquet",
+    "ebovr": "{split}_gene_mutated_matrix.parquet",
+    "ebbnb": "{split}_gene_mutated_matrix.parquet",
 }
 
 DENSE_BLOCK_COLUMNS = {
@@ -291,6 +307,8 @@ BLOCK_DESC = {
     "lnmf": "잠재 NMF (fold 안 fit)",
     "gmod": "하드 유전자 모듈 (fold 안 KMeans)",
     "csig": "클래스 서명 몫 (fold 안 라벨 선택)",
+    "ebovr": "EB shrinkage 기반 OVR supervised gene evidence 26종",
+    "ebbnb": "EB shrinkage 기반 Bernoulli supervised gene evidence 26종",
 }
 
 #: 래더. 한 번에 한 축만 바꾼다.
@@ -325,6 +343,25 @@ CONFIGS: dict[str, dict] = {
         "blocks": ("domain", "rollup16", "enc3"),
         "weight": "balanced",
         "desc": "도메인 + 시프트내성 rollup + 유전자",
+    },
+    # --- 지도형 gene evidence encoding ----------------------------------
+    # 일반 block과 달리 outer-train 행도 inner cross-fitting으로 만든다. v018b에서
+    # 안정적인 production 승격 조건을 충족하지 못했으므로 full_all에는 넣지 않고
+    # 명시적으로 요청할 때만 실행하는 experimental config로 둔다.
+    "f4r_ebovr": {
+        "blocks": ("domain", "rollup16", "enc3", "ebovr"),
+        "weight": "balanced",
+        "desc": "f4r + EB-OVR supervised gene evidence encoding 26종",
+    },
+    "f4r_ebbnb": {
+        "blocks": ("domain", "rollup16", "enc3", "ebbnb"),
+        "weight": "balanced",
+        "desc": "f4r + EB-Bernoulli supervised gene evidence encoding 26종",
+    },
+    "f4r_ebboth": {
+        "blocks": ("domain", "rollup16", "enc3", "ebovr", "ebbnb"),
+        "weight": "balanced",
+        "desc": "f4r + EB-OVR + EB-Bernoulli encoding (조건부 대조군)",
     },
     # --- 오늘 추가된 피처의 독립 ablation ---------------------------------
     "f4r_parse": {
@@ -482,6 +519,10 @@ CONFIGS: dict[str, dict] = {
         "desc": "도메인 + 시프트내성 rollup + 클래스 서명 (enc3 없음, 중복성 대조군)",
     },
 }
+
+# `--configs all`은 기존 ladder의 의미와 실행 시간을 유지한다. 지도 evidence는
+# 계산비가 크고 아직 experimental이므로 config 이름을 명시해야만 실행한다.
+EXPERIMENTAL_EVIDENCE_CONFIGS = ("f4r_ebovr", "f4r_ebbnb", "f4r_ebboth")
 
 #: 모델별 기본 하이퍼파라미터.
 #:
@@ -941,6 +982,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     latent_blocks = [b for b in spec["blocks"] if b in LATENT_BLOCKS]
     module_blocks = [b for b in spec["blocks"] if b in MODULE_BLOCKS]
     signature_blocks = [b for b in spec["blocks"] if b in SIGNATURE_BLOCKS]
+    evidence_blocks = [b for b in spec["blocks"] if b in EVIDENCE_BLOCKS]
     topk = args.topk if gene_blocks else None
     k_slug = f"k{topk}" if topk else "kall"
     # sparse 축을 stem 에 안 넣으면 --sparse-topk 를 바꿔 두 번 돌릴 때 두 번째가
@@ -1019,12 +1061,22 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         if signature_blocks
         else {}
     )
+    evidence_kwargs = (
+        dict(
+            strength=args.evidence_strength,
+            prior_weight=args.evidence_prior_weight,
+            inner_n_splits=args.evidence_inner_splits,
+        )
+        if evidence_blocks
+        else {}
+    )
     latent_slug = _latent_slug(latent_kwargs)
     module_slug = _module_slug(module_kwargs)
     signature_slug = _signature_slug(signature_kwargs)
+    evidence_slug = _evidence_slug(evidence_kwargs)
     stem = (
         f"{args.model}_{args.tag}_{config}_{CV_SLUG[cv]}_{k_slug}"
-        f"{sparse_slug}{comut_slug}{latent_slug}{module_slug}{signature_slug}"
+        f"{sparse_slug}{comut_slug}{latent_slug}{module_slug}{signature_slug}{evidence_slug}"
         f"_s{args.seed}"
     )
 
@@ -1067,6 +1119,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     latent_diagnostics: dict[str, dict[str, list[dict]]] = {}
     module_diagnostics: dict[str, dict[str, list[dict]]] = {}
     signature_diagnostics: dict[str, dict[str, list[dict]]] = {}
+    evidence_diagnostics: dict[str, dict[str, dict]] = {}
     # fold 별 기저·모듈맵. 안정성 진단(주각 코사인)과 모듈맵 CSV 에 쓴다.
     latent_bases: dict[str, list] = {}
     module_maps: dict[str, list] = {}
@@ -1262,6 +1315,29 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             x_train = np.hstack([x_train, sig_tr])
             x_test = np.hstack([x_test, sig_te])
 
+        # 지도 gene evidence — outer-valid/test는 outer-train 전체로 fit한 encoder의
+        # transform이고, **outer-train 행은 inner cross-fitting 값으로 교체**한다.
+        # 일반 supervised block처럼 전체 outer-train을 fit_transform하면 모델
+        # training feature가 자기 label을 직접 되읽으므로 금지한다.
+        for block in evidence_blocks:
+            _, evidence_train, evidence_test, evidence_diag = (
+                build_fold_gene_evidence_block(
+                    data.pairs[block][1],
+                    data.pairs[block][2],
+                    train_index,
+                    data.y[train_index],
+                    block=block,
+                    classes=data.classes,
+                    strength=args.evidence_strength,
+                    prior_weight=args.evidence_prior_weight,
+                    inner_n_splits=args.evidence_inner_splits,
+                    random_state=args.seed + fold,
+                )
+            )
+            evidence_diagnostics.setdefault(block, {})[str(fold)] = evidence_diag
+            x_train = np.hstack([x_train, evidence_train])
+            x_test = np.hstack([x_test, evidence_test])
+
         n_features = x_train.shape[1]
         fold_widths.append(n_features)
 
@@ -1386,6 +1462,21 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
                 "diagnostics": signature_diagnostics,
             }
             if signature_blocks
+            else None
+        ),
+        "gene_evidence": (
+            {
+                "blocks": evidence_blocks,
+                "params": evidence_kwargs,
+                "fit_scope": {
+                    "outer_train_rows": "inner_cross_fitted",
+                    "outer_validation": "outer_train_fit_transform_only",
+                    "test": "outer_train_fit_transform_only",
+                    "inner_seed": "model_seed + outer_fold",
+                },
+                "diagnostics": evidence_diagnostics,
+            }
+            if evidence_blocks
             else None
         ),
         "n_features": int(n_features),
@@ -1570,6 +1661,18 @@ def _signature_slug(signature_kwargs: dict) -> str:
     )
 
 
+def _evidence_slug(evidence_kwargs: dict) -> str:
+    """지도 evidence 파라미터 -> stem 슬러그. 블록이 없으면 `""`."""
+    if not evidence_kwargs:
+        return ""
+    strength = f"{evidence_kwargs['strength']:g}".replace(".", "p")
+    prior = f"{evidence_kwargs['prior_weight']:g}".replace(".", "p")
+    return (
+        f"_ebs{strength}p{prior}i{evidence_kwargs['inner_n_splits']}"
+        f"{_digest(evidence_kwargs)}"
+    )
+
+
 def _pairwise_alignment(bases: list) -> float:
     """fold 쌍마다 주각 코사인 평균을 내고 다시 평균. 1 에 가까우면 안정적이다.
 
@@ -1651,6 +1754,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tag", default="v2", help="파일명에 들어가는 실험 이름")
     parser.add_argument("--submission", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true", help="파일을 쓰지 않는다")
+
+    # --- supervised gene evidence encoding (ebovr / ebbnb) ----------------
+    parser.add_argument(
+        "--evidence-strength",
+        type=float,
+        default=20.0,
+        help="gene global prevalence Empirical-Bayes shrinkage strength",
+    )
+    parser.add_argument(
+        "--evidence-prior-weight",
+        type=float,
+        default=0.0,
+        help="Bernoulli class-prior log weight. 기본 비교는 0",
+    )
+    parser.add_argument(
+        "--evidence-inner-splits",
+        type=int,
+        default=5,
+        help="outer-train supervised evidence의 inner cross-fitting fold 수",
+    )
 
     # --- 공변이 쌍 블록 (comut) ------------------------------------------
     parser.add_argument(
@@ -1799,7 +1922,7 @@ def main() -> None:
     args.override = _parse_override(args.overrides)
 
     configs = (
-        list(CONFIGS)
+        [c for c in CONFIGS if c not in EXPERIMENTAL_EVIDENCE_CONFIGS]
         if args.configs == "all"
         else [c.strip() for c in args.configs.split(",") if c.strip()]
     )
