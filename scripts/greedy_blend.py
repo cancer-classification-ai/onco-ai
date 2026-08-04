@@ -182,7 +182,16 @@ def main() -> int:
         log(f"  fold {fold}: 멤버 {chosen}개 선택 · 이 fold 점수 {score:.4f}")
 
     crossfit_score = float(macro_f1(y, np.asarray(classes)[crossfit.argmax(1)]))
-    log(f"\n교차적합 macro F1 = {crossfit_score:.4f}   ← 보고할 값")
+    # 교차적합 OOF 를 남긴다. 없으면 이 앙상블을 **다음 블렌딩의 멤버로 못 쓰고**,
+    # 팀 드라이브 규격(`export_for_drive.py`)도 oof 를 요구해 내보내기가 막힌다.
+    oof_out = ARTIFACTS / "oof" / f"oof_{args.tag}.csv"
+    # `y_true` 를 같이 넣는다 — `export_for_drive.py` 가 팀 규격의 `true_label` 을
+    # 여기서 읽는다. 없으면 내보내기가 막힌다.
+    pd.DataFrame({"ID": ids,
+                  **{f"p_{c}": crossfit[:, j] for j, c in enumerate(classes)},
+                  "y_true": y}).to_csv(oof_out, index=False)
+    log(f"\nOOF: {oof_out}")
+    log(f"교차적합 macro F1 = {crossfit_score:.4f}   ← 보고할 값")
     log(f"  fold 별 {[round(s, 4) for s in per_fold]}")
 
     # --- 전체 적합: test 변환용 가중치 (점수로 보고하지 않는다) ---
