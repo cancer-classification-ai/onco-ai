@@ -44,6 +44,7 @@ smoke 3개 설정에 실제로 등장하는 값의 합집합으로 잡는다
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -106,6 +107,24 @@ SMOKE_ROLE_TARGET_N_ESTIMATORS = {
     "search_space_center_cost": 700,  # {400..1000 step100} 의 중앙값
     "compute_upper_bound_diagnostic": 1000,  # 탐색 공간 상한
 }
+
+#: `_objective_core` 가 trial user_attr 로 저장하는 진단값의 화이트리스트
+#: (spec §5.5/tickets Ticket 3 §5) — `evaluate_params_on_cached_folds` 의
+#: 반환 dict 에 `oof_proba`/`oof_pred`/`y_all`(return_oof=True 전용) 같은 큰
+#: 배열이 섞여도 이 목록에 없으면 저장되지 않는다.
+DIAGNOSTIC_USER_ATTR_KEYS: tuple[str, ...] = (
+    "oof_macro_f1",
+    "oof_per_class_f1",
+    "oof_pred_class_distribution",
+    "fold_macro_f1",
+    "fold_train_macro_f1",
+    "fold_std",
+    "train_validation_gap",
+    "fold_elapsed_seconds",
+    "trial_elapsed_seconds",
+    "n_features",
+    "n_splits",
+)
 
 #: Ticket 2 §4 — smoke 3개는 고정 설정이다(TPE 가 고르지 않는다). 모델 선택에
 #: 쓰지 않는다(smoke 전용, audit 목적).
@@ -262,6 +281,11 @@ def precompute_fold_cache(f4r: dict, fold_ids: np.ndarray, n_splits: int) -> lis
     return cache
 
 
+def compute_fold_hash(fold_ids: np.ndarray) -> str:
+    """Group5 fold 배정의 sha256 — trial 간 fold 가 바뀌지 않았다는 진단값(Ticket 3 §5)."""
+    return hashlib.sha256(np.ascontiguousarray(fold_ids).tobytes()).hexdigest()
+
+
 # ---------------------------------------------------------------- 공통 objective 코어
 def evaluate_params_on_cached_folds(
     fold_cache: list[dict],
@@ -270,11 +294,20 @@ def evaluate_params_on_cached_folds(
     *,
     seed: int,
     n_jobs: int,
+    return_oof: bool = False,
 ) -> dict:
     """캐시된 fold 행렬로 RF 를 학습·평가한다. Optuna 를 몰라도 되는 순수 함수.
 
     반환값은 spec §5.5 진단값(전체/fold별 OOF, fold별 train, 격차, 시간, 클래스별
     F1)을 전부 담는다. test 행렬은 인자로 받지도 않는다 — 구조적으로 만들 수 없다.
+
+    `return_oof=True` 면 전체 OOF 확률 배열(`oof_proba`)과 정답(`y_all`)도 함께
+    돌려준다 — Ticket 3 의 trial 0 RF-A 재현 검증처럼 행 단위 비교가 필요한
+    한 번뿐인 호출 전용이다. `objective_main`/`objective_smoke` 는 이 플래그를
+    쓰지 않고, `_objective_core` 도 `DIAGNOSTIC_USER_ATTR_KEYS` 화이트리스트로
+    걸러 저장하므로 `oof_proba`가 Optuna user_attrs(SQLite)에 들어가는 경로가
+    구조적으로 없다(spec §5 "OOF probability 전체를 SQLite user_attrs에 저장하지
+    않는다").
     """
     class_order = classes.tolist()
     n = sum(len(entry["valid_index"]) for entry in fold_cache)
@@ -307,10 +340,13 @@ def evaluate_params_on_cached_folds(
 
     oof_pred = classes[oof.argmax(axis=1)]
     oof_macro_f1 = macro_f1_with_labels(y_all, oof_pred, classes)
+    pred_labels, pred_counts = np.unique(oof_pred, return_counts=True)
+    oof_pred_class_distribution = {str(k): int(v) for k, v in zip(pred_labels, pred_counts)}
 
-    return {
+    result = {
         "oof_macro_f1": oof_macro_f1,
         "oof_per_class_f1": per_class_f1(y_all, oof_pred, labels=classes),
+        "oof_pred_class_distribution": oof_pred_class_distribution,
         "fold_macro_f1": fold_scores,
         "fold_train_macro_f1": fold_train_scores,
         "fold_std": float(np.std(fold_scores)),
@@ -320,6 +356,11 @@ def evaluate_params_on_cached_folds(
         "n_features": fold_cache[0]["n_features"],
         "n_splits": len(fold_cache),
     }
+    if return_oof:
+        result["oof_proba"] = oof
+        result["oof_pred"] = oof_pred
+        result["y_all"] = y_all
+    return result
 
 
 def _objective_core(
@@ -350,8 +391,13 @@ def _objective_core(
     except Exception as exc:  # noqa: BLE001 — 원인을 기록하고 다시 던진다
         trial.set_user_attr("failure_reason", f"{type(exc).__name__}: {str(exc)[:300]}")
         raise
-    for key, value in result.items():
-        trial.set_user_attr(key, value)
+    # 화이트리스트로만 저장한다 — `evaluate_params_on_cached_folds` 가 나중에
+    # `return_oof=True` 로 `oof_proba`/`oof_pred`/`y_all` 을 돌려주게 되더라도
+    # (이 함수는 항상 기본값으로 호출하지만) Optuna SQLite 에는 절대 들어가지
+    # 않는다는 것을 구조적으로 보장한다.
+    for key in DIAGNOSTIC_USER_ATTR_KEYS:
+        if key in result:
+            trial.set_user_attr(key, result[key])
     trial.set_user_attr("peak_memory_bytes", train_rf.peak_memory_bytes())
     return result["oof_macro_f1"]
 
@@ -376,13 +422,22 @@ def objective_smoke(
 
 
 def objective_main(
-    trial: optuna.Trial, *, fold_cache: list[dict], classes: np.ndarray, seed: int, n_jobs: int
+    trial: optuna.Trial,
+    *,
+    fold_cache: list[dict],
+    classes: np.ndarray,
+    seed: int,
+    n_jobs: int,
+    fold_hash: str | None = None,
 ) -> float:
-    """RF-B 본 탐색 objective. Ticket 3 가 호출한다 — 이 스크립트는 실행하지 않는다."""
+    """RF-B 본 탐색 objective(Ticket 3 §5)."""
     params = suggest_rf_b_params(trial)
+    extra_user_attrs = {"is_smoke": False}
+    if fold_hash is not None:
+        extra_user_attrs["fold_hash"] = fold_hash
     return _objective_core(
         trial, params, fold_cache=fold_cache, classes=classes, seed=seed, n_jobs=n_jobs,
-        extra_user_attrs={"is_smoke": False},
+        extra_user_attrs=extra_user_attrs,
     )
 
 
@@ -496,6 +551,133 @@ def run_smoke_study(
             )
     run_info["preserved_trials_checked"] = sorted(before)
     return study, run_info
+
+
+def count_complete(study: optuna.Study) -> int:
+    return sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE)
+
+
+def _run_one_trial(study: optuna.Study, objective) -> optuna.trial.FrozenTrial:
+    """`study.optimize(objective, n_trials=1)` 를 부르고 방금 처리된 trial 을 정확히 찾는다.
+
+    본 탐색(Ticket 3)은 `_run_waiting_trials`(Ticket 2, smoke 전용)와 달리 두 종류의
+    trial 을 섞어서 소비한다 — trial 0 은 미리 enqueue 된 WAITING 이고, trial 1
+    이후는 TPE 가 그 자리에서 새로 표본 추출한다. 후자는 `study.trials[-1]` 로
+    안전하게 찾을 수 있지만(새 번호가 끝에 생김), 전자는 안 된다(§Ticket 2 에서
+    실제로 겪은 버그). 그래서 실행 전후 "존재하는 trial 번호 전체"와 "WAITING
+    trial 번호"를 함께 비교해 방금 정착(settle)된 trial 을 찾는다 — 새 번호가
+    생겼으면 그게 정답, 아니면 WAITING 이 줄어든 번호가 정답이다.
+    """
+    numbers_before = {t.number for t in study.trials}
+    waiting_before = {t.number for t in study.trials if t.state == optuna.trial.TrialState.WAITING}
+    study.optimize(objective, n_trials=1, catch=(Exception,))
+    numbers_after = {t.number for t in study.trials}
+
+    new_numbers = numbers_after - numbers_before
+    if new_numbers:
+        if len(new_numbers) != 1:
+            raise RuntimeError(f"trial 1개 실행에 새 번호가 {len(new_numbers)}개 생겼다: {new_numbers}")
+        return study.trials[next(iter(new_numbers))]
+
+    waiting_after = {t.number for t in study.trials if t.state == optuna.trial.TrialState.WAITING}
+    settled = waiting_before - waiting_after
+    if len(settled) != 1:
+        raise RuntimeError(
+            f"trial 1개 실행에 새 번호도 안 생기고 WAITING 변화가 {len(settled)}개다: {settled}"
+        )
+    return study.trials[next(iter(settled))]
+
+
+def run_main_study(
+    fold_cache: list[dict],
+    classes: np.ndarray,
+    *,
+    db_path: Path,
+    seed: int,
+    sampler_seed: int,
+    n_jobs: int,
+    target_total_trials: int,
+    fold_hash: str | None = None,
+    hard_timeout_seconds: float = HARD_TIMEOUT_SECONDS,
+    consecutive_failure_limit: int = 3,
+    max_new_trials: int | None = None,
+) -> tuple[optuna.Study, dict]:
+    """RF-B 본 탐색(Ticket 3 §2). `target_total_trials` 는 "이번에 몇 개 더" 가 아니라
+    "study 전체 COMPLETE 가 총 몇 개가 될 때까지" 다 — 재실행해도 이미 끝난 trial 을
+    다시 세지 않는다.
+
+    trial 0(RF-A 기준선)은 study 가 비어 있을 때만 enqueue 한다. 누적 실행시간은
+    study 자체의 user_attr(`cumulative_wall_seconds`, RDB storage 에 영속)로
+    프로세스 재시작을 넘어 이어간다 — 새 trial 을 **시작하기 전에** 이미 누적이
+    hard timeout 을 넘었으면 시작하지 않는다(이미 실행 중이던 trial 을 중간에
+    끊지는 않는다 — 애초에 한 번에 한 trial 만 돈다).
+    """
+    storage = _build_storage_url(db_path)
+    study = optuna.create_study(
+        study_name=MAIN_STUDY_NAME,
+        storage=storage,
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=sampler_seed),
+        pruner=optuna.pruners.NopPruner(),
+        load_if_exists=True,
+    )
+    if not study.trials:
+        study.enqueue_trial(dict(RF_A_BASELINE_POINT), user_attrs={"note": "RF-A baseline trial 0"})
+        log("본 탐색 study: RF-A 기준선을 trial 0 으로 enqueue 했다.")
+
+    def objective(trial: optuna.Trial) -> float:
+        return objective_main(
+            trial, fold_cache=fold_cache, classes=classes, seed=seed, n_jobs=n_jobs, fold_hash=fold_hash
+        )
+
+    cumulative_seconds = float(study.user_attrs.get("cumulative_wall_seconds", 0.0))
+    consecutive_failures = 0
+    last_reason: str | None = None
+    ran_this_call = 0
+    stop_reason: str | None = None
+
+    while True:
+        if count_complete(study) >= target_total_trials:
+            break
+        if max_new_trials is not None and ran_this_call >= max_new_trials:
+            break
+        if cumulative_seconds >= hard_timeout_seconds:
+            stop_reason = "HARD_TIMEOUT_REACHED_BEFORE_STARTING_NEW_TRIAL"
+            log(
+                f"누적 {cumulative_seconds:.0f}s 가 hard timeout {hard_timeout_seconds:.0f}s 에 "
+                "도달 — 새 trial 을 시작하지 않는다."
+            )
+            break
+
+        t0 = time.perf_counter()
+        trial = _run_one_trial(study, objective)
+        cumulative_seconds += time.perf_counter() - t0
+        study.set_user_attr("cumulative_wall_seconds", cumulative_seconds)
+        ran_this_call += 1
+
+        if trial.state == optuna.trial.TrialState.FAIL:
+            reason = trial.user_attrs.get("failure_reason", "unknown")
+            consecutive_failures = consecutive_failures + 1 if reason == last_reason else 1
+            last_reason = reason
+            log(f"  trial {trial.number} FAIL ({consecutive_failures}연속) — {reason}")
+            if consecutive_failures >= consecutive_failure_limit:
+                raise SystemExit(
+                    f"연속 {consecutive_failure_limit} trial 동일 원인 실패 — {reason}. "
+                    "본 탐색을 중단한다(Stop 조건, tickets Ticket 3 §6)."
+                )
+        else:
+            consecutive_failures = 0
+            last_reason = None
+            log(f"  trial {trial.number} COMPLETE  value={trial.value:.4f}  누적 {cumulative_seconds:.0f}s")
+
+    info = {
+        "ran_this_call": ran_this_call,
+        "complete_total": count_complete(study),
+        "target_total_trials": target_total_trials,
+        "cumulative_wall_seconds": cumulative_seconds,
+        "stop_reason": stop_reason,
+    }
+    return study, info
 
 
 # ---------------------------------------------------------------- 예산 계산

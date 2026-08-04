@@ -490,3 +490,206 @@ def test_cli_help_exits_cleanly(capsys):
     out = capsys.readouterr().out
     assert "--data-dir" in out
     assert "--max-new-trials" in out
+
+
+# ================================================================== Ticket 3
+# 본 탐색(`run_main_study`) — smoke(Ticket 2, 위)와 별개 경로. 전부 합성 데이터.
+
+
+def test_evaluate_returns_predicted_class_distribution():
+    f4r, y, fold_ids = make_synthetic_f4r()
+    cache = tune_rf.precompute_fold_cache(f4r, fold_ids, N_SPLITS)
+    result = tune_rf.evaluate_params_on_cached_folds(
+        cache, CLASS_ORDER, tune_rf.SMOKE_TRIALS_SPEC[0]["params"], seed=42, n_jobs=1
+    )
+    dist = result["oof_pred_class_distribution"]
+    assert sum(dist.values()) == len(y)
+    assert set(dist) <= set(CLASS_ORDER.tolist())
+
+
+def test_return_oof_includes_full_arrays_without_mutating_default_path():
+    f4r, y, fold_ids = make_synthetic_f4r()
+    cache = tune_rf.precompute_fold_cache(f4r, fold_ids, N_SPLITS)
+    params = tune_rf.SMOKE_TRIALS_SPEC[0]["params"]
+
+    default_result = tune_rf.evaluate_params_on_cached_folds(cache, CLASS_ORDER, params, seed=42, n_jobs=1)
+    assert "oof_proba" not in default_result
+
+    full_result = tune_rf.evaluate_params_on_cached_folds(
+        cache, CLASS_ORDER, params, seed=42, n_jobs=1, return_oof=True
+    )
+    assert full_result["oof_proba"].shape == (len(y), N_CLASSES)
+    assert len(full_result["oof_pred"]) == len(y)
+    assert len(full_result["y_all"]) == len(y)
+    # 나머지 진단값은 return_oof 여부와 무관하게 동일해야 한다(같은 계산의 부산물일 뿐).
+    assert full_result["oof_macro_f1"] == default_result["oof_macro_f1"]
+
+
+def test_diagnostic_user_attr_allowlist_excludes_oof_arrays(tmp_path):
+    """`return_oof=True` 로 얻는 큰 배열이 실수로라도 Optuna user_attrs 에 안 들어가야 한다."""
+    assert "oof_proba" not in tune_rf.DIAGNOSTIC_USER_ATTR_KEYS
+    assert "oof_pred" not in tune_rf.DIAGNOSTIC_USER_ATTR_KEYS
+    assert "y_all" not in tune_rf.DIAGNOSTIC_USER_ATTR_KEYS
+
+    f4r, y, fold_ids = make_synthetic_f4r()
+    cache = tune_rf.precompute_fold_cache(f4r, fold_ids, N_SPLITS)
+    study, _ = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=tmp_path / "main.db", seed=42, sampler_seed=42, n_jobs=1,
+        target_total_trials=1,
+    )
+    for key in ("oof_proba", "oof_pred", "y_all"):
+        assert key not in study.trials[0].user_attrs
+
+
+def test_compute_fold_hash_is_stable_and_sensitive_to_change():
+    a = np.array([0, 1, 2, 3, 4, 0, 1])
+    b = np.array([0, 1, 2, 3, 4, 0, 1])
+    c = np.array([0, 1, 2, 3, 4, 0, 2])
+    assert tune_rf.compute_fold_hash(a) == tune_rf.compute_fold_hash(b)
+    assert tune_rf.compute_fold_hash(a) != tune_rf.compute_fold_hash(c)
+
+
+def test_objective_main_records_fold_hash_when_given(tmp_path):
+    f4r, y, fold_ids = make_synthetic_f4r()
+    cache = tune_rf.precompute_fold_cache(f4r, fold_ids, N_SPLITS)
+    fold_hash = tune_rf.compute_fold_hash(fold_ids)
+    study, _ = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=tmp_path / "main.db", seed=42, sampler_seed=42, n_jobs=1,
+        target_total_trials=1, fold_hash=fold_hash,
+    )
+    assert study.trials[0].user_attrs["fold_hash"] == fold_hash
+
+
+def test_run_main_study_enqueues_rf_a_baseline_as_trial_0_only_once(tmp_path):
+    f4r, y, fold_ids = make_synthetic_f4r()
+    cache = tune_rf.precompute_fold_cache(f4r, fold_ids, N_SPLITS)
+    db_path = tmp_path / "main.db"
+
+    study, _ = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=db_path, seed=42, sampler_seed=42, n_jobs=1, target_total_trials=1
+    )
+    resolved = tune_rf._resolve_baseline_point(tune_rf.RF_A_BASELINE_POINT)
+    trial0_params = dict(study.trials[0].params)
+    trial0_params["max_features"] = tune_rf.MAX_FEATURES_KEYS[trial0_params.pop("max_features_key")]
+    assert trial0_params == resolved
+
+    # 다시 호출해도 trial 0 이 중복 enqueue 되지 않는다(스터디에 이미 trial 이 있다).
+    study2, info2 = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=db_path, seed=42, sampler_seed=42, n_jobs=1, target_total_trials=1
+    )
+    assert info2["ran_this_call"] == 0
+    assert len(study2.trials) == 1
+
+
+def test_run_main_study_target_total_semantics_resume_runs_only_remaining(tmp_path):
+    f4r, y, fold_ids = make_synthetic_f4r()
+    cache = tune_rf.precompute_fold_cache(f4r, fold_ids, N_SPLITS)
+    db_path = tmp_path / "main.db"
+
+    study1, info1 = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=db_path, seed=42, sampler_seed=42, n_jobs=1,
+        target_total_trials=5, max_new_trials=2,
+    )
+    assert info1["ran_this_call"] == 2
+    assert info1["complete_total"] == 2
+
+    study2, info2 = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=db_path, seed=42, sampler_seed=42, n_jobs=1, target_total_trials=5
+    )
+    assert info2["ran_this_call"] == 3  # 5 - 2 만 더 실행
+    assert info2["complete_total"] == 5
+    assert len(study2.trials) == 5
+
+    # 이미 목표에 도달했으면 세 번째 호출은 아무것도 더 실행하지 않는다.
+    study3, info3 = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=db_path, seed=42, sampler_seed=42, n_jobs=1, target_total_trials=5
+    )
+    assert info3["ran_this_call"] == 0
+    assert info3["complete_total"] == 5
+
+
+def test_run_main_study_cumulative_wall_seconds_persists_across_resumes(tmp_path):
+    f4r, y, fold_ids = make_synthetic_f4r()
+    cache = tune_rf.precompute_fold_cache(f4r, fold_ids, N_SPLITS)
+    db_path = tmp_path / "main.db"
+
+    _, info1 = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=db_path, seed=42, sampler_seed=42, n_jobs=1,
+        target_total_trials=3, max_new_trials=1,
+    )
+    _, info2 = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=db_path, seed=42, sampler_seed=42, n_jobs=1, target_total_trials=3
+    )
+    assert info2["cumulative_wall_seconds"] > info1["cumulative_wall_seconds"]
+
+
+def test_run_main_study_stops_before_starting_new_trial_past_hard_timeout(tmp_path):
+    f4r, y, fold_ids = make_synthetic_f4r()
+    cache = tune_rf.precompute_fold_cache(f4r, fold_ids, N_SPLITS)
+    study, info = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=tmp_path / "main.db", seed=42, sampler_seed=42, n_jobs=1,
+        target_total_trials=5, hard_timeout_seconds=0.0001,
+    )
+    assert info["stop_reason"] == "HARD_TIMEOUT_REACHED_BEFORE_STARTING_NEW_TRIAL"
+    # trial 0 은 이미 시작된 뒤라 끝까지 실행됐어야 한다(중간에 끊지 않는다).
+    assert study.trials[0].state == optuna.trial.TrialState.COMPLETE
+
+
+def test_run_main_study_three_consecutive_same_reason_failures_stop(tmp_path, monkeypatch):
+    def boom(*_a, **_k):
+        raise RuntimeError("합성 강제 실패")
+
+    monkeypatch.setattr(tune_rf, "create_model", boom)
+    f4r, y, fold_ids = make_synthetic_f4r()
+    cache = tune_rf.precompute_fold_cache(f4r, fold_ids, N_SPLITS)
+
+    with pytest.raises(SystemExit, match="연속 3 trial 동일 원인 실패"):
+        tune_rf.run_main_study(
+            cache, CLASS_ORDER, db_path=tmp_path / "main.db", seed=42, sampler_seed=42, n_jobs=1,
+            target_total_trials=5,
+        )
+
+
+def test_run_one_trial_identifies_waiting_trial_correctly(tmp_path):
+    """Ticket 2 에서 실제로 겪은 버그(`study.trials[-1]` 오판) 회귀 테스트."""
+    study = optuna.create_study(direction="maximize")
+    study.enqueue_trial({"x": 1})
+    study.enqueue_trial({"x": 2})
+    study.enqueue_trial({"x": 3})
+
+    def objective(trial):
+        return float(trial.suggest_categorical("x", [1, 2, 3]))
+
+    first = tune_rf._run_one_trial(study, objective)
+    assert first.number == 0
+    assert first.params["x"] == 1
+
+    second = tune_rf._run_one_trial(study, objective)
+    assert second.number == 1
+    assert second.params["x"] == 2
+
+
+def test_run_one_trial_identifies_freshly_sampled_trial():
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
+
+    def objective(trial):
+        return float(trial.suggest_int("x", 1, 100))
+
+    t1 = tune_rf._run_one_trial(study, objective)
+    t2 = tune_rf._run_one_trial(study, objective)
+    assert t1.number == 0
+    assert t2.number == 1
+
+
+def test_main_study_search_space_matches_suggest_rf_b_params(tmp_path):
+    """본 탐색이 실제로 `suggest_rf_b_params` 의 탐색 공간을 쓰는지(TPE 로 뽑은 값 검증)."""
+    f4r, y, fold_ids = make_synthetic_f4r()
+    cache = tune_rf.precompute_fold_cache(f4r, fold_ids, N_SPLITS)
+    study, _ = tune_rf.run_main_study(
+        cache, CLASS_ORDER, db_path=tmp_path / "main.db", seed=42, sampler_seed=42, n_jobs=1,
+        target_total_trials=3,
+    )
+    for trial in study.trials:
+        params = trial.user_attrs["params"]
+        assert params["n_estimators"] in range(400, 1001, 100)
+        assert params["criterion"] in ("gini", "log_loss")
