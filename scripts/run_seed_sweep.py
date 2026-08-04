@@ -169,8 +169,11 @@ def blend_report(args) -> None:
     cols = [f"p_{c}" for c in classes]
 
     rows = []
+    # `--seeds` 로 목록을 줄이면 SEEDS[:4] 와 SEEDS[:5] 가 같은 목록이 된다. 그대로 두면
+    # 3/4/5개 행이 똑같은 숫자로 찍혀 "seed 를 늘려도 안 오른다" 로 오독된다.
+    seed_counts = [n for n in (3, 4, 5) if n <= len(SEEDS)]
     for cv_name in CV_KEYS:
-        for n_seed in (3, 4, 5):
+        for n_seed in seed_counts:
             seeds = SEEDS[:n_seed]
             per_model = {}
             for model in MODELS:
