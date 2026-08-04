@@ -367,6 +367,31 @@ CONFIGS: dict[str, dict] = {
         "weight": "balanced",
         "desc": "f4r + fold-train 빈도·희귀도 21종 + AA 치환 통계 9종",
     },
+    # 실제 full-feature 기준선. 같은 신호의 대조군/대체 표현(rollup46, gec,
+    # exacttok, lnmf)은 함께 넣지 않는다. 그 블록들은 독립 ablation 용이고,
+    # 전부 합치면 "정보 추가"가 아니라 같은 정보를 여러 번 가중하는 구성이 된다.
+    # 외부 pathway 파일은 저장소에 없으므로 포함하지 않는다.
+    "full_all": {
+        "blocks": (
+            "domain",
+            "rollup16",
+            "enc3",
+            "gtype",
+            "parsed19",
+            "burden8",
+            "aa9",
+            "freq21",
+            "aatrans9",
+            "sigtok",
+            "ptok",
+            "comut",
+            "lsvd",
+            "gmod",
+            "csig",
+        ),
+        "weight": "balanced",
+        "desc": "외부데이터 없이 생성 가능한 비중복 full feature 기준선",
+    },
     # --- 중복 처리 전략 --------------------------------------------------
     # 서명 TF-IDF 축. f5x 를 대조군으로 함께 둔다 — "서명이 원문 문자열보다 낫다"는
     # 주장이 CV 숫자로 남아야 리뷰가 된다.

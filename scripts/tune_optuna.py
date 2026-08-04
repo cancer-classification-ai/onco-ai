@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""f4r 하이퍼파라미터 Optuna 탐색 — 파이프라인은 그대로 두고 파라미터만 흔든다.
+"""GBDT 하이퍼파라미터 Optuna 탐색 — 파이프라인은 그대로 두고 파라미터만 흔든다.
 
     # 1) 재현 검증 — 기준선 파라미터로 f4r 실측값이 그대로 나오는지 본다 (필수 선행)
     .\\.venv\\Scripts\\python.exe scripts\\tune_optuna.py --verify --cv both
@@ -29,7 +29,8 @@ import 해서 쓰므로 열 순서까지 동일하다 — `colsample_bytree` 가
 ## 규정 준수
 
 `train_gbdt.py` 와 같다. chi2 선택·BurdenBinner·balanced 가중치는 fold 의 train
-부분에서만 fit 하고, test 는 이 스크립트에서 아예 건드리지 않는다. `eval_set` 도
+부분에서만 fit 한다. `Dataset` 이 train/test 스키마 정렬을 위해 test parquet을
+읽지만, Optuna fold 행렬·통계·예측에는 실제 test 값을 쓰지 않는다. `eval_set` 도
 쓰지 않는다 — 탐색 대상에 `n_estimators` 를 넣어 반복수를 CV 로 고르게 한다.
 
 ## `--cv both` — 두 분할을 같이 재는 이유
@@ -90,6 +91,19 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 import optuna  # noqa: E402
 
 from cancer_hack.features_basic import BurdenBinner  # noqa: E402
+from cancer_hack.features_graph import (  # noqa: E402
+    MANUAL_PAIRS,
+    build_fold_comutation_block,
+)
+from cancer_hack.features_latent import (  # noqa: E402
+    build_fold_latent_block,
+    build_fold_module_block,
+)
+from cancer_hack.features_signature import build_fold_signature_block  # noqa: E402
+from cancer_hack.features_sparse import (  # noqa: E402
+    build_fold_parsed_token_block,
+    build_fold_tfidf_block,
+)
 from cancer_hack.metrics import macro_f1  # noqa: E402
 from cancer_hack.models_gbdt import create_model, gpu_available, resolve_sample_weight  # noqa: E402
 from cancer_hack.validation import (  # noqa: E402
@@ -106,8 +120,10 @@ from train_gbdt import (  # noqa: E402
     MODEL_PARAMS,
     MODULE_BLOCKS,
     PAIR_BLOCKS,
+    SIGNATURE_BLOCKS,
     SPARSE_BLOCKS,
     Dataset,
+    build_fold_frequency_blocks,
     log,
 )
 
@@ -129,6 +145,54 @@ BASELINE_N_FEATURES = 1055
 
 #: 탐색 대상이 아닌 고정값. 기준선과 같아야 한다.
 FIXED_PARAMS = {"objective": "multi:softprob", "tree_method": "hist"}
+
+# train_gbdt.py CLI 기본값과 바이트 단위로 같은 피처 설정. Optuna는 모델
+# 하이퍼파라미터만 탐색하므로 이 축들은 고정한다. 최종 재실행 명령도 기본값을
+# 그대로 사용해 동일한 full_all 행렬을 만든다.
+FOLD_FEATURE_DEFAULTS = {
+    "sparse_topk": 1000,
+    "tfidf_min_df": 3,
+    "parsed_min_df": 2,
+    "comut": {
+        "pool": "drivers",
+        "pool_topk": 300,
+        "mode": "mutated",
+        "value": "share",
+        "topk": 20,
+        "min_support": 20,
+        "min_class_support": 8,
+        "min_purity": 0.25,
+        "min_lift": 0.15,
+        "max_hyper_fraction": 0.50,
+        "max_pairs_per_gene": 3,
+    },
+    "latent": {
+        "method": "svd",
+        "n_components": 64,
+        "row_norm": "l2",
+        "value": "proj",
+        "mode": "mutated",
+        "gene_weight": "none",
+        "min_gene_support": 5,
+        "random_state": 0,
+    },
+    "module": {
+        "value": "share",
+        "n_modules": 24,
+        "svd_components": 64,
+        "mode": "mutated",
+        "min_gene_support": 5,
+        "random_state": 0,
+    },
+    "signature": {
+        "value": "share",
+        "topk": 30,
+        "mode": "mutated",
+        "min_class_support": 5,
+        "min_lift": 0.05,
+        "max_hyper_fraction": 0.50,
+    },
+}
 
 
 def suggest_params(trial: optuna.Trial) -> dict:
@@ -169,6 +233,169 @@ BASELINE_POINT = {
 
 
 # ---------------------------------------------------------------- CV
+def _fold_feature_cache_key(
+    *, config: str, cv: str, topk: int, n_splits: int
+) -> tuple[str, str, int, int]:
+    """모델 파라미터와 무관한 fold 행렬 캐시 키."""
+    return config, cv, int(topk), int(n_splits)
+
+
+def _build_fold_feature_matrices(
+    data: Dataset,
+    *,
+    config: str,
+    cv: str,
+    topk: int,
+    n_splits: int,
+) -> list[np.ndarray]:
+    """train_gbdt와 같은 순서로 fold-local 블록을 만들고 trial 간 재사용한다.
+
+    TF-IDF, frequency, 공변이, 잠재/모듈, 클래스 서명은 모델 파라미터와 무관하다.
+    trial마다 다시 fit하면 full_all 탐색 시간이 대부분 피처 재생성에 쓰이므로
+    (data, config, CV, top-K)별로 한 번만 만든다. 실제 test 행은 전혀 transform하지
+    않고, 진단 인자가 필요한 블록에는 train 첫 행 하나만 더미 audit 행으로 넘긴다.
+    """
+    cache = getattr(data, "_optuna_fold_matrix_cache", None)
+    if cache is None:
+        cache = {}
+        data._optuna_fold_matrix_cache = cache
+    key = _fold_feature_cache_key(
+        config=config, cv=cv, topk=topk, n_splits=n_splits
+    )
+    if key in cache:
+        return cache[key]
+
+    spec = CONFIGS[config]
+    gene_blocks = [b for b in spec["blocks"] if b in GENE_BLOCKS]
+    sparse_blocks = [b for b in spec["blocks"] if b in SPARSE_BLOCKS]
+    frequency_blocks = [b for b in spec["blocks"] if b in FREQUENCY_BLOCKS]
+    pair_blocks = [b for b in spec["blocks"] if b in PAIR_BLOCKS]
+    latent_blocks = [b for b in spec["blocks"] if b in LATENT_BLOCKS]
+    module_blocks = [b for b in spec["blocks"] if b in MODULE_BLOCKS]
+    signature_blocks = [b for b in spec["blocks"] if b in SIGNATURE_BLOCKS]
+
+    names, dense_train, _ = data.assemble(config)
+    burden_positions = [i for i, name in enumerate(names) if name in BURDEN_COLUMNS]
+    fold_ids = data.folds[fold_column(cv, n_splits)].to_numpy()
+    matrices: list[np.ndarray] = []
+
+    for fold in range(n_splits):
+        train_index = np.where(fold_ids != fold)[0]
+        check_all_classes_present(data.y, train_index, data.classes)
+        x_train = dense_train.copy()
+
+        if burden_positions:
+            binner = BurdenBinner().fit(data.rollup_train.iloc[train_index])
+            wanted = [names[i] for i in burden_positions]
+            x_train[:, burden_positions] = binner.transform(data.rollup_train)[
+                wanted
+            ].to_numpy(np.float32)
+
+        for block in gene_blocks:
+            _, gene_train, _ = data.gene[block]
+            selector = Chi2TopKSelector(k=topk).fit(
+                gene_train[train_index], data.y[train_index]
+            )
+            x_train = np.hstack([x_train, gene_train[:, selector.indices_]])
+
+        for block in sparse_blocks:
+            train_docs, _ = data.docs[block]
+            # sklearn TfidfTransformer는 0행 transform을 거부한다. 반환값은 버리므로
+            # test 대신 train 첫 문서 하나만 audit 입력으로 사용한다. fit에는 여전히
+            # train_index만 들어가며 이 행의 transform 결과는 모델에 붙지 않는다.
+            audit_docs = train_docs[:1]
+            if block == "ptok":
+                _, sparse_train, _ = build_fold_parsed_token_block(
+                    train_docs,
+                    audit_docs,
+                    train_index,
+                    data.y[train_index],
+                    prefix="count__ptok__",
+                    topk=FOLD_FEATURE_DEFAULTS["sparse_topk"],
+                    min_df=FOLD_FEATURE_DEFAULTS["parsed_min_df"],
+                )
+            else:
+                _, sparse_train, _ = build_fold_tfidf_block(
+                    train_docs,
+                    audit_docs,
+                    train_index,
+                    data.y[train_index],
+                    prefix=f"tfidf__{block}__",
+                    topk=FOLD_FEATURE_DEFAULTS["sparse_topk"],
+                    min_df=FOLD_FEATURE_DEFAULTS["tfidf_min_df"],
+                )
+            x_train = np.hstack([x_train, sparse_train])
+
+        if frequency_blocks:
+            if data.raw_train is None or data.raw_gene_columns is None:
+                raise RuntimeError("frequency raw frame이 로드되지 않았다")
+            _, frequency_train, _ = build_fold_frequency_blocks(
+                data.raw_train,
+                data.raw_train.iloc[0:0],
+                train_index,
+                gene_columns=data.raw_gene_columns,
+                blocks=frequency_blocks,
+            )
+            x_train = np.hstack([x_train, frequency_train])
+
+        for block in pair_blocks:
+            columns, pair_train, _ = data.pairs[block]
+            _, pair_features, _, _ = build_fold_comutation_block(
+                pair_train,
+                pair_train[:1],
+                train_index,
+                data.y[train_index],
+                gene_names=columns,
+                manual_pairs=MANUAL_PAIRS,
+                **FOLD_FEATURE_DEFAULTS["comut"],
+            )
+            x_train = np.hstack([x_train, pair_features])
+
+        for block in latent_blocks:
+            columns, latent_train, _ = data.pairs[block]
+            latent_params = dict(FOLD_FEATURE_DEFAULTS["latent"])
+            if block == "lnmf":
+                latent_params["method"] = "nmf"
+            _, latent_features, _, _, _ = build_fold_latent_block(
+                latent_train,
+                latent_train[:1],
+                train_index,
+                data.y[train_index],
+                gene_names=columns,
+                **latent_params,
+            )
+            x_train = np.hstack([x_train, latent_features])
+
+        for block in module_blocks:
+            columns, module_train, _ = data.pairs[block]
+            _, module_features, _, _, _ = build_fold_module_block(
+                module_train,
+                module_train[:1],
+                train_index,
+                data.y[train_index],
+                gene_names=columns,
+                **FOLD_FEATURE_DEFAULTS["module"],
+            )
+            x_train = np.hstack([x_train, module_features])
+
+        for block in signature_blocks:
+            columns, signature_train, _ = data.pairs[block]
+            _, signature_features, _, _ = build_fold_signature_block(
+                signature_train,
+                signature_train[:1],
+                train_index,
+                data.y[train_index],
+                gene_names=columns,
+                **FOLD_FEATURE_DEFAULTS["signature"],
+            )
+            x_train = np.hstack([x_train, signature_features])
+
+        matrices.append(x_train.astype(np.float32, copy=False))
+
+    cache[key] = matrices
+    return matrices
+
+
 def cross_validate(
     data: Dataset,
     params: dict,
@@ -184,47 +411,31 @@ def cross_validate(
     verbose: bool = False,
     prune_state: dict | None = None,
 ) -> dict:
-    """f4r 의 fold 루프. `train_gbdt.run_config` 와 학습 경로가 같다.
+    """선택 config의 fold 루프. `train_gbdt.run_config` 와 학습 경로가 같다.
 
-    다른 점은 test 를 안 만지고 파일을 안 쓴다는 것뿐이다. `trial` 을 주면 fold 마다
-    중간값을 보고해 pruner 가 끊을 수 있게 한다.
+    다른 점은 test 예측/행렬을 만들지 않고 파일을 안 쓴다는 것이다. `trial` 을 주면
+    fold 마다 중간값을 보고해 pruner 가 끊을 수 있게 한다.
 
     `prune_state` 는 `--cv both` 에서 두 분할의 fold 를 **하나의 연속된 step 수열**로
     잇는다. 분할마다 step 0 부터 다시 세면 pruner 가 skf fold 0 과 sgkf fold 0 을 같은
     칸에 놓고 비교해 버린다. 두 분할은 높이가 다르니(sgkf 가 늘 위다) 그 비교는 무의미하다.
     """
     spec = CONFIGS[config]
-    # 이 튜너는 dense + GENE_BLOCKS 만 만든다. fold 안에서 새로 fit 하는 블록
-    # (TF-IDF·빈도·공변이 쌍·잠재·모듈)은 `assemble` 이 건너뛰고 여기서도 안 붙이므로,
-    # 막지 않으면 f4rl 을 튜닝하고 f4r 숫자를 돌려받는다 — 조용히 틀린 답이 나온다.
-    unsupported = [
-        b
-        for b in spec["blocks"]
-        if (
-            b in SPARSE_BLOCKS
-            or b in FREQUENCY_BLOCKS
-            or b in PAIR_BLOCKS
-            or b in LATENT_BLOCKS
-            or b in MODULE_BLOCKS
-        )
-    ]
-    if unsupported:
-        raise ValueError(
-            f"config {config} 의 블록 {unsupported} 은 이 튜너가 만들지 않는다. "
-            "그대로 돌리면 그 블록이 빠진 채 학습돼 다른 config 의 점수가 나온다. "
-            "scripts/train_gbdt.py 로 돌리거나, cross_validate 에 fold 스탠자를 옮겨 온다."
-        )
-    gene_blocks = [b for b in spec["blocks"] if b in GENE_BLOCKS]
-    names, dense_train, _ = data.assemble(config)
-    burden_positions = [i for i, n in enumerate(names) if n in BURDEN_COLUMNS]
     fold_ids = data.folds[fold_column(cv, n_splits)].to_numpy()
     group_keys = data.folds["group_key"].to_numpy()
+    fold_matrices = _build_fold_feature_matrices(
+        data,
+        config=config,
+        cv=cv,
+        topk=topk,
+        n_splits=n_splits,
+    )
 
     oof = np.zeros((len(data.y), len(data.classes)), dtype=np.float64)
     fold_scores: list[float] = []
     fold_train_scores: list[float] = []
     devices: list[str] = []
-    n_features = len(names)
+    n_features = 0
     started = time.perf_counter()
 
     for fold in range(n_splits):
@@ -232,23 +443,7 @@ def cross_validate(
         train_index = np.where(fold_ids != fold)[0]
         check_all_classes_present(data.y, train_index, data.classes)
 
-        x_train = dense_train.copy()
-
-        # burden 2열 — 경계는 fold 의 train 부분에서만 잡는다.
-        if burden_positions:
-            binner = BurdenBinner().fit(data.rollup_train.iloc[train_index])
-            wanted = [names[i] for i in burden_positions]
-            x_train[:, burden_positions] = binner.transform(data.rollup_train)[
-                wanted
-            ].to_numpy(np.float32)
-
-        # 유전자 블록 — chi2 도 fold 의 train 부분에서만 fit 한다.
-        for block in gene_blocks:
-            columns, gene_train, _ = data.gene[block]
-            selector = Chi2TopKSelector(k=topk).fit(
-                gene_train[train_index], data.y[train_index]
-            )
-            x_train = np.hstack([x_train, gene_train[:, selector.indices_]])
+        x_train = fold_matrices[fold]
 
         n_features = x_train.shape[1]
         weight = resolve_sample_weight(
@@ -268,8 +463,6 @@ def cross_validate(
             fold_train_scores.append(
                 macro_f1(data.y[train_index], model.predict(x_train[train_index]))
             )
-        del x_train
-
         if verbose:
             extra = f" train={fold_train_scores[-1]:.4f}" if track_train else ""
             log(f"    fold {fold + 1}/{n_splits}  Macro F1={score:.4f}{extra}")
@@ -395,6 +588,11 @@ def verify(data: Dataset, args) -> int:
     이게 통과해야 탐색 결과를 믿을 수 있다. 재현이 안 되면 파이프라인이 어딘가
     달라진 것이고, 그 위에서 고른 최적값은 f4r 의 최적값이 아니다.
     """
+    if args.config != "f4r":
+        raise SystemExit(
+            "--verify 정답지는 기존 f4r 실측값뿐이다. 다른 config는 정답지가 없어 "
+            "재현 여부를 판정할 수 없다."
+        )
     log(f"=== 재현 검증: 기준선 파라미터로 f4r {'/'.join(args.cv_list)} 를 다시 돈다 ===")
     baseline = dict(MODEL_PARAMS["xgb"])
     log(f"파라미터: {baseline}")
@@ -452,8 +650,11 @@ def run_study(data: Dataset, args) -> None:
 
     # trial 0 으로 기준선을 넣는다. 같은 코드·같은 fold 에서 나온 숫자여야 비교가 된다.
     if not study.trials:
-        study.enqueue_trial(BASELINE_POINT, user_attrs={"note": "f4r baseline"})
-        log("기준선 f4r 을 trial 0 으로 넣었다.")
+        study.enqueue_trial(
+            BASELINE_POINT,
+            user_attrs={"note": f"{args.config} default-parameter baseline"},
+        )
+        log(f"기준선 {args.config} + 기본 파라미터를 trial 0 으로 넣었다.")
 
     log(f"study={args.study}  storage={storage}")
     log(f"분할 {args.cv_list} · 목적함수 {args.objective}")
@@ -499,7 +700,7 @@ def report(study: optuna.Study, args) -> None:
     log("\n" + "=" * 108)
     log(f"완료 {len(done)}개 / 전체 {len(study.trials)}개 (pruned {pruned}개) · "
         f"목적함수 {args.objective}")
-    log(f"기준선 f4r trial {baseline.number} = {base_score:.4f}"
+    log(f"기준선 {args.config} trial {baseline.number} = {base_score:.4f}"
         + (f"  격차 {base_gap:+.4f}" if base_gap is not None else "")
         + (f"  sgkf−skf {base_split:+.4f}" if base_split is not None else ""))
     log("-" * 108)
@@ -644,7 +845,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42, help="모델 시드")
     parser.add_argument("--sampler-seed", type=int, default=42, help="TPE 시드")
     parser.add_argument("--n-trials", type=int, default=60)
-    parser.add_argument("--study", default="f4r_xgb_both", help="study 이름 = db 파일명")
+    parser.add_argument(
+        "--study",
+        default=None,
+        help="study 이름 = db 파일명. 기본: {config}_xgb_{cv}",
+    )
     parser.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
     parser.add_argument("--no-track-train", action="store_true",
                         help="train 점수를 안 잰다. 빨라지지만 격차를 못 본다")
@@ -677,6 +882,9 @@ def main() -> None:
         raise SystemExit(
             f"--objective {args.objective} 는 지금 잴 분할 {args.cv_list} 로 계산할 수 없다"
         )
+
+    if args.study is None:
+        args.study = f"{args.config}_xgb_{args.cv}"
 
     if args.show_best:
         storage = f"sqlite:///{(TUNING_DIR / f'{args.study}.db').as_posix()}"

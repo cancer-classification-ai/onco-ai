@@ -1024,6 +1024,28 @@ def test_frequency_configs_are_wired_as_fold_only_blocks():
     assert set(train_gbdt.FREQUENCY_BLOCKS).isdisjoint(train_gbdt.BLOCK_SOURCES)
 
 
+def test_full_all_contains_every_production_feature_family_without_controls():
+    blocks = set(train_gbdt.CONFIGS["full_all"]["blocks"])
+    assert blocks == {
+        "domain",
+        "rollup16",
+        "enc3",
+        "gtype",
+        "parsed19",
+        "burden8",
+        "aa9",
+        "freq21",
+        "aatrans9",
+        "sigtok",
+        "ptok",
+        "comut",
+        "lsvd",
+        "gmod",
+        "csig",
+    }
+    assert blocks.isdisjoint({"rollup", "gec", "exacttok", "lnmf"})
+
+
 def test_frequency_fold_builder_does_not_fit_valid_or_test_rows():
     raw_train = pd.DataFrame(
         {
