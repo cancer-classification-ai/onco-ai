@@ -1,0 +1,13 @@
+{
+  "action": "created",
+  "path": "artifacts/metadata/class_order.json",
+  "source": "docs/specs/random_forest_stacking_model.md#2.3",
+  "reason": "Ticket 1a는 실제 대회 데이터를 열지 않으므로 train.csv의 SUBCLASS에서 새로 계산하지 않았다. 구현 전 조사(grep -rln 'class_order' src/ scripts/ tests/ artifacts/)로 저장소 안에 이미 기록된 다른 canonical class order 산출물이 있는지 확인했으나 없었다 — artifacts/oof, artifacts/logs 등은 전부 .gitkeep만 있고 실제 GBDT 산출물이 커밋되어 있지 않다. 대신 승인 완료된 spec §2.3이 26개 SUBCLASS 알파벳 순서를 'sklearn.LabelEncoder 정렬과 동일 관례, 저장소 전체에서 일관됨'으로 이미 확정해 두었으므로, 그 리스트를 '이미 기록된 정본'으로 재사용했다.",
+  "investigated_at_commit": "3255e5aa4bc270e085dc87ddeee49c346f8da0b1",
+  "generated_by": "cancer_hack.class_order.resolve_class_order (Ticket 1a)",
+  "class_order": [
+    "ACC", "BLCA", "BRCA", "CESC", "COAD", "DLBC", "GBMLGG", "HNSC", "KIPAN",
+    "KIRC", "LAML", "LGG", "LIHC", "LUAD", "LUSC", "OV", "PAAD", "PCPG",
+    "PRAD", "SARC", "SKCM", "STES", "TGCT", "THCA", "THYM", "UCEC"
+  ]
+}

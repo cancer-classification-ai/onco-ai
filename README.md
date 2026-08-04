@@ -73,6 +73,42 @@ python scripts/train_gbdt.py --model xgb --configs f16 --set n_estimators=500  #
 채택된 값인지 기각된 값인지 적어 뒀다. **기각된 것도 등록돼 있다** — 그 구성으로 낸
 제출본을 재현할 수 있어야 해서다.
 
+DL 모델은 Kaggle에서 한 명령으로 세 단계 ladder를 실행한다.
+
+```bash
+python scripts/run_dl_ladder.py --device cuda --seed 42
+```
+
+기본 실행 순서는 다음과 같다.
+
+1. full dense feature를 사용하는 MLP baseline
+2. mutation token만 사용하는 Hierarchical Gene Set Encoder
+3. 두 표현을 결합하는 full-feature Hybrid
+
+세 모델은 동일한 `train_folds.parquet`을 사용하며 OOF, 로그, test 확률,
+submission을 `artifacts/{oof,logs,test_predictions,submissions}/`에 각각 저장한다.
+특정 모델만 실행하려면 `--models`를 사용한다.
+
+```bash
+python scripts/run_dl_ladder.py --models mlp --device cuda --seed 42
+python scripts/run_dl_ladder.py --models set_encoder --device cuda --seed 42
+python scripts/run_dl_ladder.py --models hybrid --device cuda --seed 42
+```
+
+Gene Set Encoder의 유전자별 count·중복·유형·위치 통계를 누적 비교하려면 별도
+ablation ladder를 실행한다.
+
+```bash
+# set_v0 → set_v1_count → set_v2_type → set_v3_position → set_v4_full → hybrid_v2
+python scripts/run_gene_rule_ladder.py --device cuda --seed 42
+
+# 최종 강화형 두 모델만 실행
+python scripts/run_gene_rule_ladder.py \
+  --experiments set_v4_full hybrid_v2 \
+  --device cuda \
+  --seed 42
+```
+
 ### 예측 생성 · 제출 파일
 
 ```bash

@@ -14,6 +14,8 @@
     gec     top-K  유전자 토큰 수, fold 안에서 chi2 선택
     sigtok  top-K  서명 문서 TF-IDF, fold 안에서 어휘·IDF·chi2 전부 fit
     exacttok top-K 원문 토큰 TF-IDF — sigtok 대조군
+    freq21      21  fold-train 빈도·IDF·희귀도 집계
+    aatrans9     9  fold-train 아미노산 치환 빈도·희귀도·log-odds
     comut   ~10~20 공변이 유전자 쌍, fold 안에서 지지도·lift·과변이 가드로 선택
             (`--comut-*` 플래그, `cancer_hack.features_graph` 참고)
     lsvd       64  잠재 SVD 성분 — 행을 L2 정규화하고 fold 안에서 기저를 fit
@@ -22,6 +24,9 @@
             (`--latent-*`/`--module-*` 플래그, `cancer_hack.features_latent` 참고)
     csig       26  클래스 서명 몫 — fold 안에서 라벨로 클래스별 유전자 집합을 고른다
             (`--signature-*` 플래그, `cancer_hack.features_signature` 참고)
+    ebovr      26  EB-OVR supervised gene evidence — outer-train은 inner cross-fit
+    ebbnb      26  EB-Bernoulli likelihood — 같은 누수 방지 계약
+            (`--evidence-*` 플래그, `cancer_hack.features_gene_evidence` 참고)
 
 ## 왜 래더인가
 
@@ -100,6 +105,13 @@ from cancer_hack.features_graph import (  # noqa: E402
     MANUAL_PAIRS,
     build_fold_comutation_block,
 )
+from cancer_hack.features_frequency import (  # noqa: E402
+    AA_TRANSITION_FEATURE_COLUMNS,
+    FREQUENCY_RARITY_FEATURE_COLUMNS,
+    TrainAATransitionFeatures,
+    TrainFrequencyFeatures,
+)
+from cancer_hack.features_gene_evidence import build_fold_gene_evidence_block  # noqa: E402
 from cancer_hack.features_latent import (  # noqa: E402
     MODULE_VALUES,
     SHIFT_EXPOSED_VALUES,
@@ -171,6 +183,11 @@ GENE_BLOCKS = ("enc3", "gec", "gecr", "gtype")
 #: 바뀌므로 `Dataset` 이 행렬을 미리 못 만든다. 들고 있는 건 문서 문자열이다.
 SPARSE_BLOCKS = ("sigtok", "exacttok", "ptok")
 
+#: 원본 mutation 문자열을 들고 있다가 fold-train 통계로 만드는 블록.
+#: Parquet으로 미리 만들면 validation 분포가 fit에 섞이므로 Dataset은 raw frame만
+#: 보관하고 run_config의 fold 루프에서 fit/transform한다.
+FREQUENCY_BLOCKS = ("freq21", "aatrans9")
+
 #: fold 안에서 쌍을 고르는 블록. 열의 정체와 **개수**가 fold 마다 바뀐다는 점은
 #: SPARSE_BLOCKS 와 같지만, 원본 유전자 행렬 자체는 고정이라 GENE_BLOCKS 처럼 미리
 #: 읽어 둘 수 있다 — 그래서 `Dataset.pairs` 는 문서 문자열이 아니라 gene 블록과 같은
@@ -194,11 +211,21 @@ MODULE_BLOCKS = ("gmod",)
 #: 흐려진다. 지도 블록이라 `selected` 등록도 의미가 있다(고른 유전자가 fold 마다 바뀐다).
 SIGNATURE_BLOCKS = ("csig",)
 
+#: gene->class score를 직접 학습하는 지도 인코딩. XGBoost training row가 자기
+#: label을 되읽지 않도록 outer-train 내부에서 한 번 더 cross-fitting한다.
+EVIDENCE_BLOCKS = ("ebovr", "ebbnb")
+
 #: 원본 유전자 행렬을 그대로 들고 있다가 **fold 안에서** 열을 만드는 블록 전부.
 #: `Dataset` 은 이들을 `pairs` 주머니에 담고 `assemble` 은 건너뛴다. 가족을 새로 만들 때
 #: 여기 한 줄만 더하면 두 자리가 같이 따라온다 — 예전엔 세 상수를 두 곳에서 각각 나열해서
 #: 한쪽만 고치면 블록이 조용히 dense 로 떨어졌다(`KeyError` 도 안 난다).
-FOLD_MATRIX_BLOCKS = PAIR_BLOCKS + LATENT_BLOCKS + MODULE_BLOCKS + SIGNATURE_BLOCKS
+FOLD_MATRIX_BLOCKS = (
+    PAIR_BLOCKS
+    + LATENT_BLOCKS
+    + MODULE_BLOCKS
+    + SIGNATURE_BLOCKS
+    + EVIDENCE_BLOCKS
+)
 
 #: sparse 블록 -> (parquet 파일명 템플릿, 문서 열 이름)
 SPARSE_SOURCES = {
@@ -229,6 +256,8 @@ BLOCK_SOURCES = {
     "lnmf": "{split}_mutation_encoded.parquet",
     "gmod": "{split}_mutation_encoded.parquet",
     "csig": "{split}_mutation_encoded.parquet",
+    "ebovr": "{split}_gene_mutated_matrix.parquet",
+    "ebbnb": "{split}_gene_mutated_matrix.parquet",
 }
 
 DENSE_BLOCK_COLUMNS = {
@@ -303,11 +332,15 @@ BLOCK_DESC = {
     "parsed19": "Mutation 문자열 구조 19종",
     "burden8": "추가 burden 8종",
     "aa9": "아미노산 치환 페널티 9종",
+    "freq21": "fold-train 빈도·IDF·희귀도 21종",
+    "aatrans9": "fold-train AA 치환 빈도·희귀도·log-odds 9종",
     "comut": "공변이 쌍 (fold 안 선택)",
     "lsvd": "잠재 SVD (fold 안 fit)",
     "lnmf": "잠재 NMF (fold 안 fit)",
     "gmod": "하드 유전자 모듈 (fold 안 KMeans)",
     "csig": "클래스 서명 몫 (fold 안 라벨 선택)",
+    "ebovr": "EB shrinkage 기반 OVR supervised gene evidence 26종",
+    "ebbnb": "EB shrinkage 기반 Bernoulli supervised gene evidence 26종",
 }
 
 #: 래더. 한 번에 한 축만 바꾼다.
@@ -343,6 +376,25 @@ CONFIGS: dict[str, dict] = {
         "weight": "balanced",
         "desc": "도메인 + 시프트내성 rollup + 유전자",
     },
+    # --- 지도형 gene evidence encoding ----------------------------------
+    # 일반 block과 달리 outer-train 행도 inner cross-fitting으로 만든다. v018b에서
+    # 안정적인 production 승격 조건을 충족하지 못했으므로 full_all에는 넣지 않고
+    # 명시적으로 요청할 때만 실행하는 experimental config로 둔다.
+    "f4r_ebovr": {
+        "blocks": ("domain", "rollup16", "enc3", "ebovr"),
+        "weight": "balanced",
+        "desc": "f4r + EB-OVR supervised gene evidence encoding 26종",
+    },
+    "f4r_ebbnb": {
+        "blocks": ("domain", "rollup16", "enc3", "ebbnb"),
+        "weight": "balanced",
+        "desc": "f4r + EB-Bernoulli supervised gene evidence encoding 26종",
+    },
+    "f4r_ebboth": {
+        "blocks": ("domain", "rollup16", "enc3", "ebovr", "ebbnb"),
+        "weight": "balanced",
+        "desc": "f4r + EB-OVR + EB-Bernoulli encoding (조건부 대조군)",
+    },
     # --- 오늘 추가된 피처의 독립 ablation ---------------------------------
     "f4r_parse": {
         "blocks": ("domain", "rollup16", "enc3", "parsed19"),
@@ -368,6 +420,46 @@ CONFIGS: dict[str, dict] = {
         "blocks": ("domain", "rollup16", "enc3", "aa9"),
         "weight": "balanced",
         "desc": "f4r + 아미노산 치환 페널티 9종",
+    },
+    "f4r_freq": {
+        "blocks": ("domain", "rollup16", "enc3", "freq21"),
+        "weight": "balanced",
+        "desc": "f4r + fold-train 빈도·IDF·희귀도 21종",
+    },
+    "f4r_aatrans": {
+        "blocks": ("domain", "rollup16", "enc3", "aatrans9"),
+        "weight": "balanced",
+        "desc": "f4r + fold-train AA 치환 통계 9종",
+    },
+    "f4r_freqaa": {
+        "blocks": ("domain", "rollup16", "enc3", "freq21", "aatrans9"),
+        "weight": "balanced",
+        "desc": "f4r + fold-train 빈도·희귀도 21종 + AA 치환 통계 9종",
+    },
+    # 실제 full-feature 기준선. 같은 신호의 대조군/대체 표현(rollup46, gec,
+    # exacttok, lnmf)은 함께 넣지 않는다. 그 블록들은 독립 ablation 용이고,
+    # 전부 합치면 "정보 추가"가 아니라 같은 정보를 여러 번 가중하는 구성이 된다.
+    # 외부 pathway 파일은 저장소에 없으므로 포함하지 않는다.
+    "full_all": {
+        "blocks": (
+            "domain",
+            "rollup16",
+            "enc3",
+            "gtype",
+            "parsed19",
+            "burden8",
+            "aa9",
+            "freq21",
+            "aatrans9",
+            "sigtok",
+            "ptok",
+            "comut",
+            "lsvd",
+            "gmod",
+            "csig",
+        ),
+        "weight": "balanced",
+        "desc": "외부데이터 없이 생성 가능한 비중복 full feature 기준선",
     },
     # --- 중복 처리 전략 --------------------------------------------------
     # 서명 TF-IDF 축. f5x 를 대조군으로 함께 둔다 — "서명이 원문 문자열보다 낫다"는
@@ -522,6 +614,10 @@ CONFIGS: dict[str, dict] = {
         "desc": "f16 에서 gec 를 행정규화(상대빈도) gecr 로 바꾼 것",
     },
 }
+
+# `--configs all`은 기존 ladder의 의미와 실행 시간을 유지한다. 지도 evidence는
+# 계산비가 크고 아직 experimental이므로 config 이름을 명시해야만 실행한다.
+EXPERIMENTAL_EVIDENCE_CONFIGS = ("f4r_ebovr", "f4r_ebbnb", "f4r_ebboth")
 
 #: 모델별 기본 하이퍼파라미터.
 #:
@@ -778,6 +874,11 @@ class Dataset:
         self.docs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.rollup_train: pd.DataFrame | None = None
         self.rollup_test: pd.DataFrame | None = None
+        self.raw_train: pd.DataFrame | None = None
+        self.raw_test: pd.DataFrame | None = None
+        self.raw_gene_columns: list[str] | None = None
+        if set(blocks) & set(FREQUENCY_BLOCKS):
+            self._load_frequency_raw_frames()
         # comut 과 enc3 는 같은 parquet(`{split}_mutation_encoded.parquet`)을 읽어
         # 똑같은 (열 이름, train 배열, test 배열) 을 낸다. `block_cache_key` 로 캐시해
         # 두 번 안 읽는다 — 안 그러면 6,201x4,384 + 2,546x4,384 float32 를 두 벌 들고
@@ -789,6 +890,9 @@ class Dataset:
         ] = {}
 
         for name in sorted(blocks):
+            if name in FREQUENCY_BLOCKS:
+                log(f"[block] {name:9s} {'fold':>6s}  {BLOCK_DESC[name]}")
+                continue
             if name in SPARSE_BLOCKS:
                 self.docs[name] = self._load_documents(name)
                 log(f"[block] {name:9s} {'문서':>6s}  {BLOCK_DESC[name]}")
@@ -825,6 +929,40 @@ class Dataset:
         )
 
     # -- 로딩 -------------------------------------------------------------
+    def _load_frequency_raw_frames(self) -> None:
+        """빈도 블록이 필요할 때만 raw mutation 문자열을 메모리에 올린다."""
+        frames = []
+        for split in ("train", "test"):
+            path = RAW_DIR / f"{split}.csv"
+            if not path.exists():
+                raise FileNotFoundError(
+                    f"{path} 가 없다. {FREQUENCY_BLOCKS} 는 fold-train 통계를 "
+                    "fit하므로 원본 mutation 문자열이 필요하다."
+                )
+            frames.append(pd.read_csv(path, dtype=str, na_filter=False))
+
+        train_frame, test_frame = frames
+        train_genes = [
+            column for column in train_frame.columns if column not in ("ID", "SUBCLASS")
+        ]
+        test_genes = [
+            column for column in test_frame.columns if column not in ("ID", "SUBCLASS")
+        ]
+        if train_genes != test_genes:
+            raise ValueError("frequency train/test 유전자 열 또는 순서가 다르다")
+        if not np.array_equal(
+            train_frame["ID"].astype(str).to_numpy(), self.train_ids
+        ):
+            raise ValueError("frequency raw train ID 순서가 도메인 블록과 다르다")
+        if not np.array_equal(
+            test_frame["ID"].astype(str).to_numpy(), self.test_ids
+        ):
+            raise ValueError("frequency raw test ID 순서가 도메인 블록과 다르다")
+
+        self.raw_train = train_frame
+        self.raw_test = test_frame
+        self.raw_gene_columns = train_genes
+
     def _load_pair(self, name, base, test_base):
         if name == "domain":
             return base, test_base
@@ -999,6 +1137,7 @@ class Dataset:
                 block in GENE_BLOCKS
                 or block in SPARSE_BLOCKS
                 or block in FOLD_MATRIX_BLOCKS
+                or block in FREQUENCY_BLOCKS
             ):
                 continue
             columns, train_array, test_array = self.dense[block]
@@ -1013,14 +1152,68 @@ class Dataset:
 
 
 # ---------------------------------------------------------------- 학습
+def build_fold_frequency_blocks(
+    raw_train: pd.DataFrame,
+    raw_test: pd.DataFrame,
+    train_index: np.ndarray,
+    *,
+    gene_columns: list[str],
+    blocks: list[str],
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """fold-train에서만 빈도 통계를 fit해 전체 train/test를 transform한다."""
+    unknown = sorted(set(blocks) - set(FREQUENCY_BLOCKS))
+    if unknown:
+        raise ValueError(f"모르는 frequency 블록: {unknown}")
+
+    names: list[str] = []
+    train_parts: list[np.ndarray] = []
+    test_parts: list[np.ndarray] = []
+    fit_frame = raw_train.iloc[np.asarray(train_index)]
+
+    for block in blocks:
+        if block == "freq21":
+            builder = TrainFrequencyFeatures(rare_df_threshold=2)
+            columns = list(FREQUENCY_RARITY_FEATURE_COLUMNS)
+        else:
+            builder = TrainAATransitionFeatures(
+                alpha=1.0,
+                unique_transitions_per_sample=True,
+            )
+            columns = list(AA_TRANSITION_FEATURE_COLUMNS)
+
+        builder.fit(fit_frame, gene_columns=gene_columns)
+        train_features = builder.transform(raw_train, gene_columns=gene_columns)
+        test_features = builder.transform(raw_test, gene_columns=gene_columns)
+        if list(train_features.columns) != columns or list(test_features.columns) != columns:
+            raise RuntimeError(f"{block} 출력 스키마가 상수 정의와 다르다")
+
+        names.extend(columns)
+        train_parts.append(train_features.to_numpy(np.float32))
+        test_parts.append(test_features.to_numpy(np.float32))
+
+    if not train_parts:
+        return (
+            [],
+            np.empty((len(raw_train), 0), dtype=np.float32),
+            np.empty((len(raw_test), 0), dtype=np.float32),
+        )
+    return (
+        names,
+        np.hstack(train_parts).astype(np.float32, copy=False),
+        np.hstack(test_parts).astype(np.float32, copy=False),
+    )
+
+
 def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     spec = CONFIGS[config]
     gene_blocks = [b for b in spec["blocks"] if b in GENE_BLOCKS]
     sparse_blocks = [b for b in spec["blocks"] if b in SPARSE_BLOCKS]
+    frequency_blocks = [b for b in spec["blocks"] if b in FREQUENCY_BLOCKS]
     pair_blocks = [b for b in spec["blocks"] if b in PAIR_BLOCKS]
     latent_blocks = [b for b in spec["blocks"] if b in LATENT_BLOCKS]
     module_blocks = [b for b in spec["blocks"] if b in MODULE_BLOCKS]
     signature_blocks = [b for b in spec["blocks"] if b in SIGNATURE_BLOCKS]
+    evidence_blocks = [b for b in spec["blocks"] if b in EVIDENCE_BLOCKS]
     topk = args.topk if gene_blocks else None
     k_slug = f"k{topk}" if topk else "kall"
     # sparse 축을 stem 에 안 넣으면 --sparse-topk 를 바꿔 두 번 돌릴 때 두 번째가
@@ -1097,12 +1290,22 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         if signature_blocks
         else {}
     )
+    evidence_kwargs = (
+        dict(
+            strength=args.evidence_strength,
+            prior_weight=args.evidence_prior_weight,
+            inner_n_splits=args.evidence_inner_splits,
+        )
+        if evidence_blocks
+        else {}
+    )
     latent_slug = _latent_slug(latent_kwargs)
     module_slug = _module_slug(module_kwargs)
     signature_slug = _signature_slug(signature_kwargs)
+    evidence_slug = _evidence_slug(evidence_kwargs)
     stem = (
         f"{args.model}_{args.tag}_{config}_{CV_SLUG[cv]}_{k_slug}"
-        f"{sparse_slug}{comut_slug}{latent_slug}{module_slug}{signature_slug}"
+        f"{sparse_slug}{comut_slug}{latent_slug}{module_slug}{signature_slug}{evidence_slug}"
         f"_s{args.seed}"
     )
 
@@ -1146,6 +1349,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     latent_diagnostics: dict[str, dict[str, list[dict]]] = {}
     module_diagnostics: dict[str, dict[str, list[dict]]] = {}
     signature_diagnostics: dict[str, dict[str, list[dict]]] = {}
+    evidence_diagnostics: dict[str, dict[str, dict]] = {}
     # fold 별 기저·모듈맵. 안정성 진단(주각 코사인)과 모듈맵 CSV 에 쓴다.
     latent_bases: dict[str, list] = {}
     module_maps: dict[str, list] = {}
@@ -1213,6 +1417,38 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             selected.setdefault(block, {})[str(fold)] = sparse_names
             x_train = np.hstack([x_train, sparse_train])
             x_test = np.hstack([x_test, sparse_test])
+
+        # 빈도·희귀도 블록 — raw mutation 문자열의 document frequency를 fold의
+        # train 부분에서만 fit한다. validation/test는 같은 lookup으로 transform만
+        # 받는다. 전체 train에 한 번 fit하면 outer-valid 분포가 새므로 금지한다.
+        if frequency_blocks:
+            if (
+                data.raw_train is None
+                or data.raw_test is None
+                or data.raw_gene_columns is None
+            ):
+                raise RuntimeError("frequency raw frame이 로드되지 않았다")
+            frequency_names, frequency_train, frequency_test = (
+                build_fold_frequency_blocks(
+                    data.raw_train,
+                    data.raw_test,
+                    train_index,
+                    gene_columns=data.raw_gene_columns,
+                    blocks=frequency_blocks,
+                )
+            )
+            expected_width = sum(
+                len(FREQUENCY_RARITY_FEATURE_COLUMNS)
+                if block == "freq21"
+                else len(AA_TRANSITION_FEATURE_COLUMNS)
+                for block in frequency_blocks
+            )
+            if len(frequency_names) != expected_width:
+                raise RuntimeError(
+                    f"frequency 열 수 {len(frequency_names)}, 기대 {expected_width}"
+                )
+            x_train = np.hstack([x_train, frequency_train])
+            x_test = np.hstack([x_test, frequency_test])
 
         # 공변이 쌍 — 후보 풀·지지도·클래스별 지지도·과변이 의존도·lift 를 전부 fold
         # 의 train 부분에서만 계산한다. test 행렬은 transform 만 받는다
@@ -1309,6 +1545,29 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             x_train = np.hstack([x_train, sig_tr])
             x_test = np.hstack([x_test, sig_te])
 
+        # 지도 gene evidence — outer-valid/test는 outer-train 전체로 fit한 encoder의
+        # transform이고, **outer-train 행은 inner cross-fitting 값으로 교체**한다.
+        # 일반 supervised block처럼 전체 outer-train을 fit_transform하면 모델
+        # training feature가 자기 label을 직접 되읽으므로 금지한다.
+        for block in evidence_blocks:
+            _, evidence_train, evidence_test, evidence_diag = (
+                build_fold_gene_evidence_block(
+                    data.pairs[block][1],
+                    data.pairs[block][2],
+                    train_index,
+                    data.y[train_index],
+                    block=block,
+                    classes=data.classes,
+                    strength=args.evidence_strength,
+                    prior_weight=args.evidence_prior_weight,
+                    inner_n_splits=args.evidence_inner_splits,
+                    random_state=args.seed + fold,
+                )
+            )
+            evidence_diagnostics.setdefault(block, {})[str(fold)] = evidence_diag
+            x_train = np.hstack([x_train, evidence_train])
+            x_test = np.hstack([x_test, evidence_test])
+
         n_features = x_train.shape[1]
         fold_widths.append(n_features)
 
@@ -1376,6 +1635,27 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             if sparse_blocks
             else None
         ),
+        "frequency": (
+            {
+                "blocks": frequency_blocks,
+                "frequency_columns": (
+                    list(FREQUENCY_RARITY_FEATURE_COLUMNS)
+                    if "freq21" in frequency_blocks
+                    else []
+                ),
+                "aa_transition_columns": (
+                    list(AA_TRANSITION_FEATURE_COLUMNS)
+                    if "aatrans9" in frequency_blocks
+                    else []
+                ),
+                "rare_df_threshold": 2,
+                "aa_transition_alpha": 1.0,
+                "unique_transitions_per_sample": True,
+                "fit_scope": "fold_train_only",
+            }
+            if frequency_blocks
+            else None
+        ),
         "comut": (
             {
                 "blocks": pair_blocks,
@@ -1425,6 +1705,21 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
                 "diagnostics": signature_diagnostics,
             }
             if signature_blocks
+            else None
+        ),
+        "gene_evidence": (
+            {
+                "blocks": evidence_blocks,
+                "params": evidence_kwargs,
+                "fit_scope": {
+                    "outer_train_rows": "inner_cross_fitted",
+                    "outer_validation": "outer_train_fit_transform_only",
+                    "test": "outer_train_fit_transform_only",
+                    "inner_seed": "model_seed + outer_fold",
+                },
+                "diagnostics": evidence_diagnostics,
+            }
+            if evidence_blocks
             else None
         ),
         "n_features": int(n_features),
@@ -1631,6 +1926,18 @@ def _signature_slug(signature_kwargs: dict) -> str:
     )
 
 
+def _evidence_slug(evidence_kwargs: dict) -> str:
+    """지도 evidence 파라미터 -> stem 슬러그. 블록이 없으면 `""`."""
+    if not evidence_kwargs:
+        return ""
+    strength = f"{evidence_kwargs['strength']:g}".replace(".", "p")
+    prior = f"{evidence_kwargs['prior_weight']:g}".replace(".", "p")
+    return (
+        f"_ebs{strength}p{prior}i{evidence_kwargs['inner_n_splits']}"
+        f"{_digest(evidence_kwargs)}"
+    )
+
+
 def _pairwise_alignment(bases: list) -> float:
     """fold 쌍마다 주각 코사인 평균을 내고 다시 평균. 1 에 가까우면 안정적이다.
 
@@ -1743,6 +2050,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--track-train", action="store_true",
         help="fold 마다 train 점수도 재서 일반화 격차를 남긴다. fold 당 train 행 전체를 "
         "한 번 더 예측하므로 느려진다. 끄면 기존 로그와 키 구성이 같다",
+    )
+
+    # --- supervised gene evidence encoding (ebovr / ebbnb) ----------------
+    parser.add_argument(
+        "--evidence-strength",
+        type=float,
+        default=20.0,
+        help="gene global prevalence Empirical-Bayes shrinkage strength",
+    )
+    parser.add_argument(
+        "--evidence-prior-weight",
+        type=float,
+        default=0.0,
+        help="Bernoulli class-prior log weight. 기본 비교는 0",
+    )
+    parser.add_argument(
+        "--evidence-inner-splits",
+        type=int,
+        default=5,
+        help="outer-train supervised evidence의 inner cross-fitting fold 수",
     )
 
     # --- 공변이 쌍 블록 (comut) ------------------------------------------
@@ -1894,7 +2221,7 @@ def main() -> None:
     resolve_model_params(args)  # 조기 검증 — Dataset 생성(수십 초) 전에 죽는다
 
     configs = (
-        list(CONFIGS)
+        [c for c in CONFIGS if c not in EXPERIMENTAL_EVIDENCE_CONFIGS]
         if args.configs == "all"
         else [c.strip() for c in args.configs.split(",") if c.strip()]
     )

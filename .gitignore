@@ -51,5 +51,18 @@ data/process/*
 artifacts/tuning/*
 !artifacts/tuning/.gitkeep
 
+# ==================== RF runtime logs/metrics ====================
+# scripts/train_rf.py, scripts/run_rf_b_optuna.py 가 만드는 실행별 로그·지표
+# JSON/CSV(artifacts/logs/*.json, artifacts/metrics/*)는 다른 runtime artifact
+# (*.csv/*.parquet/artifacts/tuning/*)와 같은 이유로 커밋 대상이 아니다 — 확장자가
+# json이라 기존 패턴에 걸리지 않았을 뿐이다.
+artifacts/logs/*
+!artifacts/logs/.gitkeep
+artifacts/metrics/*
+!artifacts/metrics/.gitkeep
+
+# ==================== Local experiment outputs ====================
+v018b_gene_evidence_ablation/
+
 # ==================== macOS ====================
 .DS_Store

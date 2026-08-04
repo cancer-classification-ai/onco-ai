@@ -128,9 +128,16 @@ def main() -> None:
         print(dist["ratio"].unstack(level=args.label_col).round(2).to_string())
 
     save_parquet(folds, args.out)
-    meta = {
+    try:
         # posix 로 적어 둔다 — 팀원 OS 마다 구분자가 달라지면 diff 가 지저분해진다.
-        "source": args.input.resolve().relative_to(PROJECT_ROOT).as_posix(),
+        source = args.input.resolve().relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        # --input 이 저장소 밖 경로(RF 작업의 외부 데이터 디렉터리 등)를 가리키면
+        # relative_to 가 ValueError 를 낸다. 그런 경로는 절대경로를 그대로 적지 않고
+        # 파일명만 남긴다 — RF 쪽 provenance 정책(파일명+SHA-256, 절대경로 금지)과 동일하다.
+        source = args.input.name
+    meta = {
+        "source": source,
         "n_splits": args.n_splits,
         "seed": args.seed,
         "label_column": args.label_col,
