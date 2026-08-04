@@ -7,8 +7,10 @@ from cancer_hack.dataset_dl import (
     MutationSampleDataset,
     MutationTokenizer,
     collate_mutation_samples,
+    resolve_domain_prefixes,
     tokenize_frame,
 )
+from cancer_hack.features_domain import ALL_DOMAIN_PREFIXES, DOMAIN_PREFIXES
 
 
 def test_tokenize_and_collate_preserve_hierarchy(toy_frame: pd.DataFrame) -> None:
@@ -26,6 +28,13 @@ def test_tokenize_and_collate_preserve_hierarchy(toy_frame: pd.DataFrame) -> Non
     assert len(batch["token_to_gene"]) == 12
     assert batch["labels"].tolist() == [0, 1, 2, 3]
     assert tokenizer.vocab_sizes["gene"] == 4
+
+
+def test_full_domain_feature_set_includes_m_block() -> None:
+    assert resolve_domain_prefixes("default") == DOMAIN_PREFIXES
+    assert "M_" not in resolve_domain_prefixes("default")
+    assert resolve_domain_prefixes("all") == ALL_DOMAIN_PREFIXES
+    assert "M_" in resolve_domain_prefixes("all")
 
 
 def test_empty_sample_is_retained() -> None:

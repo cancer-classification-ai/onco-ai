@@ -35,6 +35,13 @@ from cancer_hack.dataset_dl import (  # noqa: E402
     tokenize_frame,
 )
 from cancer_hack.features_basic import BurdenBinner  # noqa: E402
+from cancer_hack.features_frequency import (  # noqa: E402
+    AA_TRANSITION_FEATURE_COLUMNS,
+    FREQUENCY_RARITY_FEATURE_COLUMNS,
+    TrainAATransitionFeatures,
+    TrainFrequencyFeatures,
+)
+from cancer_hack.features_latent import build_fold_latent_block  # noqa: E402
 from cancer_hack.io import save_csv, write_submission  # noqa: E402
 from cancer_hack.metrics import (  # noqa: E402
     build_prediction_frame,
@@ -48,6 +55,8 @@ from cancer_hack.validation import CV_SLUG, fold_column  # noqa: E402
 RAW_DIR = PROJECT_ROOT / "data/raw"
 PROC_DIR = PROJECT_ROOT / "data/process"
 ARTIFACTS = PROJECT_ROOT / "artifacts"
+FREQUENCY_BLOCKS = ("freq21", "aatrans9")
+BURDEN_COLUMNS = ("hypermutated_flag", "burden_quantile_bin")
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,13 +124,150 @@ def append_fold_burden(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fit the two stateful rollup16 columns on fold-train only."""
     binner = BurdenBinner().fit(rollup_train.iloc[train_index])
-    columns = ["hypermutated_flag", "burden_quantile_bin"]
+    columns = list(BURDEN_COLUMNS)
     train_extra = binner.transform(rollup_train)[columns].to_numpy(np.float32)
     test_extra = binner.transform(rollup_test)[columns].to_numpy(np.float32)
     return (
         np.hstack([train_dense, train_extra]),
         np.hstack([test_dense, test_extra]),
     )
+
+
+def build_fold_frequency_blocks(
+    raw_train: pd.DataFrame,
+    raw_test: pd.DataFrame,
+    train_index: np.ndarray,
+    *,
+    gene_columns: list[str],
+    blocks: list[str],
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Fit frequency/rarity lookups on fold-train and transform every row."""
+    unknown = sorted(set(blocks) - set(FREQUENCY_BLOCKS))
+    if unknown:
+        raise ValueError(f"unknown DL frequency blocks: {unknown}")
+
+    names: list[str] = []
+    train_parts: list[np.ndarray] = []
+    test_parts: list[np.ndarray] = []
+    fit_frame = raw_train.iloc[np.asarray(train_index)]
+    for block in blocks:
+        if block == "freq21":
+            builder = TrainFrequencyFeatures(rare_df_threshold=2)
+            expected = list(FREQUENCY_RARITY_FEATURE_COLUMNS)
+        else:
+            builder = TrainAATransitionFeatures(
+                alpha=1.0,
+                unique_transitions_per_sample=True,
+            )
+            expected = list(AA_TRANSITION_FEATURE_COLUMNS)
+        builder.fit(fit_frame, gene_columns=gene_columns)
+        train_frame = builder.transform(raw_train, gene_columns=gene_columns)
+        test_frame = builder.transform(raw_test, gene_columns=gene_columns)
+        if list(train_frame.columns) != expected or list(test_frame.columns) != expected:
+            raise RuntimeError(f"{block} output schema differs from its constants")
+        names.extend(f"{block}__{column}" for column in expected)
+        train_parts.append(train_frame.to_numpy(np.float32))
+        test_parts.append(test_frame.to_numpy(np.float32))
+
+    if not train_parts:
+        return (
+            [],
+            np.empty((len(raw_train), 0), dtype=np.float32),
+            np.empty((len(raw_test), 0), dtype=np.float32),
+        )
+    return (
+        names,
+        np.hstack(train_parts).astype(np.float32, copy=False),
+        np.hstack(test_parts).astype(np.float32, copy=False),
+    )
+
+
+def load_latent_source(
+    process_dir: Path,
+    train_ids: np.ndarray,
+    test_ids: np.ndarray,
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Load the encoded gene matrix used to fit a latent basis inside each fold."""
+    train = pd.read_parquet(process_dir / "train_mutation_encoded.parquet")
+    test = pd.read_parquet(process_dir / "test_mutation_encoded.parquet")
+    if not np.array_equal(train["ID"].astype(str).to_numpy(), train_ids):
+        raise ValueError("latent train ID order differs from dense feature blocks")
+    if not np.array_equal(test["ID"].astype(str).to_numpy(), test_ids):
+        raise ValueError("latent test ID order differs from dense feature blocks")
+    genes = [column for column in train.columns if column not in ("ID", "SUBCLASS")]
+    test_genes = [column for column in test.columns if column not in ("ID", "SUBCLASS")]
+    if genes != test_genes:
+        raise ValueError("latent train/test gene columns or order differ")
+    return (
+        genes,
+        train[genes].to_numpy(np.float32),
+        test[genes].to_numpy(np.float32),
+    )
+
+
+def append_fold_engineered_features(
+    train_dense: np.ndarray,
+    test_dense: np.ndarray,
+    train_index: np.ndarray,
+    *,
+    labels: np.ndarray,
+    frequency_blocks: list[str],
+    raw_train: pd.DataFrame | None,
+    raw_test: pd.DataFrame | None,
+    raw_gene_columns: list[str] | None,
+    latent_source: tuple[list[str], np.ndarray, np.ndarray] | None,
+    latent_config: dict[str, object],
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Append every configured fold-fitted dense block without data leakage."""
+    names: list[str] = []
+    if frequency_blocks:
+        if raw_train is None or raw_test is None or raw_gene_columns is None:
+            raise RuntimeError("frequency blocks require aligned raw train/test frames")
+        frequency_names, frequency_train, frequency_test = build_fold_frequency_blocks(
+            raw_train,
+            raw_test,
+            train_index,
+            gene_columns=raw_gene_columns,
+            blocks=frequency_blocks,
+        )
+        train_dense = np.hstack([train_dense, frequency_train])
+        test_dense = np.hstack([test_dense, frequency_test])
+        names.extend(frequency_names)
+
+    if latent_source is not None:
+        latent_genes, latent_train, latent_test = latent_source
+        methods_value = latent_config.get(
+            "methods", [latent_config.get("method", "svd")]
+        )
+        methods = (
+            [str(methods_value)]
+            if isinstance(methods_value, str)
+            else [str(method) for method in methods_value]
+        )
+        unknown_methods = sorted(set(methods) - {"svd", "nmf"})
+        if unknown_methods:
+            raise ValueError(f"unknown DL latent methods: {unknown_methods}")
+        shared_config = {
+            key: value
+            for key, value in latent_config.items()
+            if key not in ("method", "methods")
+        }
+        for method in methods:
+            latent_names, fold_latent_train, fold_latent_test, _, _ = (
+                build_fold_latent_block(
+                    latent_train,
+                    latent_test,
+                    train_index,
+                    labels[train_index],
+                    gene_names=latent_genes,
+                    method=method,
+                    **shared_config,
+                )
+            )
+            train_dense = np.hstack([train_dense, fold_latent_train])
+            test_dense = np.hstack([test_dense, fold_latent_test])
+            names.extend(latent_names)
+    return train_dense, test_dense, names
 
 
 def scale_fold_dense(
@@ -331,6 +477,18 @@ def main() -> None:
             f"CLI model {args.model!r} differs from config model {configured_model!r}"
         )
     training = dict(config.get("training", {}))
+    dense_features = dict(config.get("dense_features", {}))
+    frequency_blocks = list(dense_features.get("frequency_blocks", []))
+    unknown_frequency = sorted(set(frequency_blocks) - set(FREQUENCY_BLOCKS))
+    if unknown_frequency:
+        raise ValueError(f"unknown dense frequency blocks: {unknown_frequency}")
+    latent_config = dict(dense_features.get("latent", {}))
+    latent_enabled = bool(latent_config.pop("enabled", False))
+    if (frequency_blocks or latent_enabled) and args.model == "set_encoder":
+        raise ValueError(
+            "fold dense features require model=mlp or model=hybrid; "
+            "set_encoder does not consume dense inputs"
+        )
     early_stopping = dict(training.get("early_stopping", {}))
     tokenizer_config = dict(config.get("tokenizer", {}))
     model_params = dict(config.get("model_params", {}))
@@ -342,7 +500,11 @@ def main() -> None:
 
     seed_everything(args.seed)
     device = resolve_device(args.device)
-    dense_bundle = load_dense_feature_bundle(PROC_DIR)
+    domain_feature_set = str(dense_features.get("domain_feature_set", "default"))
+    dense_bundle = load_dense_feature_bundle(
+        PROC_DIR,
+        domain_feature_set=domain_feature_set,
+    )
     classes = np.unique(dense_bundle.labels)
     label_to_index = {label: index for index, label in enumerate(classes)}
     labels = np.asarray([label_to_index[label] for label in dense_bundle.labels])
@@ -358,10 +520,11 @@ def main() -> None:
 
     tokenizer = None
     vocab_sizes = None
-    if args.model == "mlp":
-        train_samples = [[] for _ in dense_bundle.train_ids]
-        test_samples = [[] for _ in dense_bundle.test_ids]
-    else:
+    train_raw = None
+    test_raw = None
+    raw_gene_columns: list[str] | None = None
+    needs_raw = args.model != "mlp" or bool(frequency_blocks)
+    if needs_raw:
         train_raw = pd.read_csv(RAW_DIR / "train.csv", dtype=str, na_filter=False)
         test_raw = pd.read_csv(RAW_DIR / "test.csv", dtype=str, na_filter=False)
         if not np.array_equal(
@@ -370,12 +533,17 @@ def main() -> None:
             test_raw["ID"].astype(str).to_numpy(), dense_bundle.test_ids
         ):
             raise ValueError("raw CSV ID order differs from feature blocks")
-        genes = [
-            column
-            for column in train_raw.columns
-            if column not in ("ID", "SUBCLASS")
+        raw_gene_columns = [
+            column for column in train_raw.columns if column not in ("ID", "SUBCLASS")
         ]
-        tokenizer = MutationTokenizer(genes, **tokenizer_config)
+
+    if args.model == "mlp":
+        train_samples = [[] for _ in dense_bundle.train_ids]
+        test_samples = [[] for _ in dense_bundle.test_ids]
+    else:
+        assert train_raw is not None and test_raw is not None
+        assert raw_gene_columns is not None
+        tokenizer = MutationTokenizer(raw_gene_columns, **tokenizer_config)
         vocab_sizes = tokenizer.vocab_sizes
         max_tokens = config.get("max_tokens_per_gene", 32)
         print(f"tokenizing {len(train_raw):,} train / {len(test_raw):,} test samples")
@@ -386,6 +554,14 @@ def main() -> None:
             test_raw, tokenizer, max_tokens_per_gene=max_tokens
         )
 
+    latent_source = (
+        load_latent_source(
+            PROC_DIR, dense_bundle.train_ids, dense_bundle.test_ids
+        )
+        if latent_enabled
+        else None
+    )
+
     oof = np.zeros((len(labels), len(classes)), dtype=np.float32)
     test_probability = np.zeros(
         (len(dense_bundle.test_ids), len(classes)), dtype=np.float32
@@ -393,6 +569,8 @@ def main() -> None:
     fold_scores: list[float] = []
     fold_losses: list[list[float]] = []
     fold_training: list[dict[str, object]] = []
+    fold_dense_dimensions: list[int] = []
+    fold_feature_columns: list[list[str]] = []
     started = time.perf_counter()
     fold_values = range(1) if args.dry_run else range(args.n_splits)
 
@@ -407,11 +585,27 @@ def main() -> None:
             dense_bundle.rollup_test,
             train_index,
         )
+        feature_columns = [*dense_bundle.columns, *BURDEN_COLUMNS]
+        dense_train, dense_test, engineered_names = append_fold_engineered_features(
+            dense_train,
+            dense_test,
+            train_index,
+            labels=dense_bundle.labels,
+            frequency_blocks=frequency_blocks,
+            raw_train=train_raw,
+            raw_test=test_raw,
+            raw_gene_columns=raw_gene_columns,
+            latent_source=latent_source,
+            latent_config=latent_config,
+        )
+        feature_columns.extend(engineered_names)
         dense_train, dense_test = scale_fold_dense(
             dense_train, dense_test, train_index
         )
         use_dense = args.model in ("mlp", "hybrid")
         dense_dim = dense_train.shape[1]
+        fold_dense_dimensions.append(int(dense_dim))
+        fold_feature_columns.append(feature_columns)
         common = dict(
             samples=train_samples,
             ids=dense_bundle.train_ids,
@@ -527,7 +721,12 @@ def main() -> None:
         "device": str(device),
         "epochs": epochs,
         "batch_size": batch_size,
-        "n_features": int(dense_bundle.train.shape[1] + 2),
+        "domain_feature_set": domain_feature_set,
+        "frequency_blocks": frequency_blocks,
+        "latent": {"enabled": latent_enabled, **latent_config},
+        "n_features": fold_dense_dimensions[0],
+        "fold_n_features": fold_dense_dimensions,
+        "feature_columns": fold_feature_columns[0],
         "fold_macro_f1": fold_scores,
         "fold_train_loss": fold_losses,
         "fold_training": fold_training,
