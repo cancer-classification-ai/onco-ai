@@ -1,0 +1,35 @@
+# RF-A — 재현 가능한 Random Forest 기준선 (docs/specs/random_forest_stacking_model.md §4).
+#
+# 이 파일은 팀 관례(configs/*.yaml)를 따르는 기록용 설정이다 — train_rf.py 는 이
+# 파일을 직접 읽지 않는다(다른 팀 yaml 들과 동일하게 아직 별도 로더가 없다).
+# `--config` 는 JSON 하이퍼파라미터 오버라이드용이고, 이 값들은 이미
+# scripts/train_rf.py 의 DEFAULT_PARAMS["rf"] 에 고정돼 있어 별도 --config 없이도
+# 아래와 동일하게 학습된다. 실행 명령은 맨 아래 참고.
+
+model: RandomForestClassifier
+params:
+  n_estimators: 500
+  max_features: sqrt
+  class_weight: balanced_subsample
+  random_state: 42
+  bootstrap: true
+  # n_jobs 는 CLI 실행 시점에 cancer_hack.models_rf.default_n_jobs() 가
+  # os.cpu_count()-1 로 계산한다(8코어 환경 기준 7) — 팀원마다 코어 수가 달라
+  # 여기 고정값을 적지 않는다. 필요하면 --n-jobs 로 덮어쓴다.
+sample_weight: none  # class_weight 와 중복 적용 금지 (PR#27 결론)
+
+cv:
+  kind: sgkf          # StratifiedGroupKFold, groups=profile_hash 정수 코드
+  fold_column: fold_group5
+  n_splits: 5
+  seed: 42            # 모델 seed 와 별개 — data/process/train_folds.parquet 생성 시드
+
+feature_set: f4r        # domain(539) + rollup16(16) + enc3 fold-local chi2 top500(500) = 1,055열
+class_order_path: artifacts/metadata/class_order.json
+
+# 실행 명령 (외부 데이터 경로는 실행 시에만 --data-dir 로 전달, 이 파일에는 적지 않는다):
+#   python scripts/train_rf.py --data-dir <external-data-dir> \
+#     --folds-path data/process/train_folds.parquet \
+#     --model rf --feature-set f4r \
+#     --class-order-path artifacts/metadata/class_order.json \
+#     --cv sgkf --n-splits 5 --tag a_f4r --seed 42
