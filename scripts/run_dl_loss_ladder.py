@@ -81,7 +81,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--base-config",
         type=Path,
-        default=PROJECT_ROOT / "configs/mlp_full_features_svd.yaml",
+        default=PROJECT_ROOT / "configs/mlp_full_features.yaml",
+    )
+    parser.add_argument(
+        "--latent-methods",
+        nargs="+",
+        choices=["svd", "nmf"],
+        default=["svd"],
+        help="fixed latent representation used by every loss experiment",
     )
     parser.add_argument("--cv", choices=["skf", "sgkf"], default="skf")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="cuda")
@@ -107,6 +114,22 @@ def load_base_config(path: Path, model: str) -> dict[str, object]:
         raise ValueError(
             f"base config model {config.get('model')!r} differs from {model!r}"
         )
+    return config
+
+
+def configure_latent_methods(
+    base: dict[str, object],
+    methods: list[str],
+) -> dict[str, object]:
+    """Pin one latent recipe for the whole loss ladder."""
+    config = json.loads(json.dumps(base))
+    dense = dict(config.get("dense_features", {}))
+    latent = dict(dense.get("latent", {}))
+    if not bool(latent.get("enabled", False)):
+        raise ValueError("loss ladder requires an enabled latent config")
+    latent["methods"] = list(dict.fromkeys(methods))
+    dense["latent"] = latent
+    config["dense_features"] = dense
     return config
 
 
@@ -277,7 +300,10 @@ def write_comparison(
 
 def main() -> None:
     args = parse_args()
-    base = load_base_config(args.base_config, args.model)
+    base = configure_latent_methods(
+        load_base_config(args.base_config, args.model),
+        args.latent_methods,
+    )
     completed: dict[str, Path] = {}
     for experiment in dict.fromkeys(args.experiments):
         path = run_experiment(

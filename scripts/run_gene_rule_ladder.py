@@ -3,7 +3,6 @@
 
     python scripts/run_gene_rule_ladder.py --device cuda --seed 42
     python scripts/run_gene_rule_ladder.py --experiments set_v4_full hybrid_v2 --device cuda
-    python scripts/run_gene_rule_ladder.py --experiments mlp_full_domain hybrid_v3_full_domain --device cuda
 """
 
 from __future__ import annotations
@@ -41,23 +40,7 @@ EXPERIMENTS: dict[str, tuple[str, Path]] = {
         PROJECT_ROOT / "configs/gene_set_encoder_full.yaml",
     ),
     "hybrid_v2": ("hybrid", PROJECT_ROOT / "configs/hybrid_set_mlp_v2.yaml"),
-    "mlp_full_domain": (
-        "mlp",
-        PROJECT_ROOT / "configs/mlp_full_domain.yaml",
-    ),
-    "hybrid_v3_full_domain": (
-        "hybrid",
-        PROJECT_ROOT / "configs/hybrid_set_mlp_v2_full_domain.yaml",
-    ),
 }
-DEFAULT_EXPERIMENTS = (
-    "set_v0",
-    "set_v1_count",
-    "set_v2_type",
-    "set_v3_position",
-    "set_v4_full",
-    "hybrid_v2",
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,7 +51,7 @@ def parse_args() -> argparse.Namespace:
         "--experiments",
         nargs="+",
         choices=list(EXPERIMENTS),
-        default=list(DEFAULT_EXPERIMENTS),
+        default=list(EXPERIMENTS),
     )
     parser.add_argument("--cv", choices=["skf", "sgkf"], default="skf")
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")

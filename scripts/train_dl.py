@@ -68,6 +68,13 @@ def parse_args() -> argparse.Namespace:
         "--model", required=True, choices=["mlp", "set_encoder", "hybrid"]
     )
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--latent-methods",
+        nargs="+",
+        choices=["svd", "nmf"],
+        default=None,
+        help="override dense_features.latent.methods without duplicating YAML files",
+    )
     parser.add_argument("--cv", choices=["skf", "sgkf"], default="skf")
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
@@ -578,6 +585,10 @@ def main() -> None:
         raise ValueError(f"unknown dense frequency blocks: {unknown_frequency}")
     latent_config = dict(dense_features.get("latent", {}))
     latent_enabled = bool(latent_config.pop("enabled", False))
+    if args.latent_methods is not None:
+        if not latent_enabled:
+            raise ValueError("--latent-methods requires an enabled latent config")
+        latent_config["methods"] = list(dict.fromkeys(args.latent_methods))
     if (frequency_blocks or latent_enabled) and args.model == "set_encoder":
         raise ValueError(
             "fold dense features require model=mlp or model=hybrid; "

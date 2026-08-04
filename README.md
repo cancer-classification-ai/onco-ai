@@ -82,35 +82,29 @@ python scripts/run_dl_ladder.py --models set_encoder --device cuda --seed 42
 python scripts/run_dl_ladder.py --models hybrid --device cuda --seed 42
 ```
 
-Frequency와 latent 피처를 fold 안에서 fit하는 full-feature DL은 설정을 분리해
-비교한다. 세 설정 모두 `freq21`과 `aatrans9`를 사용하며 latent 방식만 다르다.
-
-| 실험 | MLP 설정 | Hybrid 설정 |
-|---|---|---|
-| SVD 64 | `mlp_full_features_svd.yaml` | `hybrid_set_mlp_v2_full_features_svd.yaml` |
-| NMF 64 | `mlp_full_features_nmf.yaml` | `hybrid_set_mlp_v2_full_features_nmf.yaml` |
-| SVD 64 + NMF 64 | `mlp_full_features.yaml` | `hybrid_set_mlp_v2_full_features.yaml` |
-
-Kaggle에서는 계산이 빠르고 안정적인 SVD부터 실행한 뒤, 같은 fold의 OOF Macro F1로
-NMF와 결합 설정을 비교한다.
+Full-feature 설정은 `freq21`과 `aatrans9`를 항상 사용한다. 중복 YAML을 만들지 않고
+`--latent-methods`로 SVD/NMF를 선택한다.
 
 ```bash
 # 1) 권장 기준선: frequency + SVD
 python scripts/train_dl.py \
   --model mlp \
-  --config configs/mlp_full_features_svd.yaml \
+  --config configs/mlp_full_features.yaml \
+  --latent-methods svd \
   --cv skf --device cuda --seed 42 --tag mlp_full_svd_s42
 
 # 2) frequency + NMF
 python scripts/train_dl.py \
   --model mlp \
-  --config configs/mlp_full_features_nmf.yaml \
+  --config configs/mlp_full_features.yaml \
+  --latent-methods nmf \
   --cv skf --device cuda --seed 42 --tag mlp_full_nmf_s42
 
 # 3) frequency + SVD + NMF
 python scripts/train_dl.py \
   --model mlp \
   --config configs/mlp_full_features.yaml \
+  --latent-methods svd nmf \
   --cv skf --device cuda --seed 42 --tag mlp_full_svd_nmf_s42
 ```
 
@@ -122,7 +116,8 @@ python scripts/train_dl.py \
 ```bash
 python scripts/run_dl_loss_ladder.py \
   --model mlp \
-  --base-config configs/mlp_full_features_svd.yaml \
+  --base-config configs/mlp_full_features.yaml \
+  --latent-methods svd \
   --device cuda \
   --seed 42
 ```

@@ -71,25 +71,3 @@ def test_gene_rule_command_uses_experiment_specific_tag() -> None:
         "configs/hybrid_set_mlp_v2.yaml"
     )
     assert command[command.index("--tag") + 1] == "hybrid_v2_s2025"
-
-
-def test_full_domain_experiments_enable_all_domain_blocks() -> None:
-    module = _load_module()
-    for experiment in ("mlp_full_domain", "hybrid_v3_full_domain"):
-        _, config_path = module.EXPERIMENTS[experiment]
-        with config_path.open(encoding="utf-8") as handle:
-            config = yaml.safe_load(handle)
-        assert config["dense_features"]["domain_feature_set"] == "all"
-
-    command = module.build_command(
-        "hybrid_v3_full_domain",
-        cv="skf",
-        device="cuda",
-        seed=42,
-        dry_run=False,
-        no_submission=False,
-    )
-    assert command[command.index("--config") + 1].endswith(
-        "configs/hybrid_set_mlp_v2_full_domain.yaml"
-    )
-    assert command[command.index("--tag") + 1] == "hybrid_v3_full_domain_s42"

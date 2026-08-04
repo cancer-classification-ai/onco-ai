@@ -43,6 +43,19 @@ def test_best_focal_uses_oof_then_singleton_tiebreak() -> None:
     assert ladder.select_best_focal(rows) == "d_focal_sqrt_g1"
 
 
+def test_ladder_pins_one_latent_recipe_without_mutating_base() -> None:
+    ladder = _load_module()
+    base = {
+        "model": "mlp",
+        "dense_features": {
+            "latent": {"enabled": True, "methods": ["svd", "nmf"]}
+        },
+    }
+    configured = ladder.configure_latent_methods(base, ["svd"])
+    assert configured["dense_features"]["latent"]["methods"] == ["svd"]
+    assert base["dense_features"]["latent"]["methods"] == ["svd", "nmf"]
+
+
 def test_train_command_uses_no_submission_and_stable_tag(tmp_path) -> None:
     ladder = _load_module()
     command = ladder.train_command(
