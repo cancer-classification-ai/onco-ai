@@ -96,6 +96,27 @@ def build_prediction_frame(
     return frame
 
 
+def validate_prediction_frame_schema(
+    frame: pd.DataFrame,
+    ids: Sequence,
+    classes: Sequence[str],
+    *,
+    oof: bool,
+) -> None:
+    """Validate the shared OOF/test probability artifact contract."""
+    expected = ["ID", *probability_columns(classes)]
+    if oof:
+        expected.append("y_true")
+    expected.append("y_pred")
+    if list(frame.columns) != expected:
+        raise ValueError(f"prediction columns differ: {list(frame.columns)}")
+    expected_ids = np.asarray(ids, dtype=str)
+    if not np.array_equal(frame["ID"].astype(str).to_numpy(), expected_ids):
+        raise ValueError("prediction IDs or order differ")
+    if frame[probability_columns(classes)].isna().any().any():
+        raise ValueError("prediction probabilities contain NaN")
+
+
 def read_prediction_frame(path) -> tuple[pd.DataFrame, list[str]]:
     """예측 csv 를 읽어 (프레임, 클래스 목록) 을 돌려준다.
 
