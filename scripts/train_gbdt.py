@@ -63,6 +63,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 import traceback
@@ -599,6 +600,45 @@ def effective_params(model) -> dict[str, str]:
     if not actual:
         actual = model.describe().get("params", {})
     return {k: str(actual[k]) for k in _LOGGED_PARAMS if actual.get(k) is not None}
+
+
+#: 데스크톱 스파이크에 남겨 둘 GPU 메모리(MiB). 이 GPU 는 화면 출력도 함께 하고 있어서
+#: 브라우저 탭 하나가 순간적으로 1GB 넘게 잡는다. `fit_with_fallback` docstring 참고 —
+#: 폴백으로 CPU 로 끌려가면 그 fold 만 느려지는 게 아니라 시간 비교가 통째로 깨진다.
+GPU_RESERVE_MIB = 2600
+
+#: 자동 산정의 하한·상한. 하한은 기존 고정값(0.4)이라 자동이 실패해도 이전만큼은 쓴다.
+GPU_RAM_PART_MIN = 0.40
+GPU_RAM_PART_MAX = 0.75
+
+
+def resolve_gpu_ram_part(requested: float | str) -> float:
+    """`--gpu-ram-part auto` 면 지금 비어 있는 GPU 메모리에서 정한다.
+
+    고정 비율은 "브라우저가 떠 있을 때" 와 "없을 때" 를 구별하지 못한다. 낮게 박으면
+    평소에 손해고, 높게 박으면 스파이크에 죽는다. 실행 시점의 여유를 보고 정하면
+    둘 다 피한다.
+
+    nvidia-smi 가 없거나 파싱이 안 되면 하한으로 떨어진다 — 조용히 크게 잡지 않는다.
+    """
+    if not isinstance(requested, str) or requested != "auto":
+        return float(requested)
+    try:
+        output = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip().splitlines()[0]
+        free_mib, total_mib = (int(x) for x in output.split(","))
+    except Exception as error:  # noqa: BLE001
+        log(f"[gpu] 여유 메모리를 못 읽었다({type(error).__name__}) — 하한 {GPU_RAM_PART_MIN} 을 쓴다")
+        return GPU_RAM_PART_MIN
+
+    usable = max(0, free_mib - GPU_RESERVE_MIB)
+    part = min(GPU_RAM_PART_MAX, max(GPU_RAM_PART_MIN, usable / total_mib))
+    log(f"[gpu] 여유 {free_mib}/{total_mib} MiB · 예약 {GPU_RESERVE_MIB} "
+        f"-> gpu_ram_part {part:.2f} ({int(part * total_mib)} MiB)")
+    return part
 
 
 def model_params_for(name: str) -> dict:
@@ -1624,7 +1664,12 @@ def build_parser() -> argparse.ArgumentParser:
              "돌릴 때 둘의 합이 코어 수를 넘지 않게 나눈다. 주의: xgb 는 스레드 수가 "
              "바뀌면 트리도 바뀐다 — 섞을 OOF 끼리는 같은 값을 쓴다",
     )
-    parser.add_argument("--gpu-ram-part", type=float, default=0.4, help="CatBoost 전용")
+    parser.add_argument(
+        "--gpu-ram-part", default="auto",
+        help="CatBoost 전용. 'auto' 면 실행 시점의 GPU 여유에서 정한다 "
+        f"(예약 {GPU_RESERVE_MIB} MiB, 범위 {GPU_RAM_PART_MIN}~{GPU_RAM_PART_MAX}). "
+        "숫자를 주면 그 값을 그대로 쓴다",
+    )
     parser.add_argument("--tag", default="v2", help="파일명에 들어가는 실험 이름")
     parser.add_argument("--submission", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true", help="파일을 쓰지 않는다")
@@ -1779,6 +1824,7 @@ def main() -> None:
     args = build_parser().parse_args()
     args.device = {"gpu": True, "cpu": False, "auto": "auto"}[args.device]
     args.override = _parse_override(args.overrides)
+    args.gpu_ram_part = resolve_gpu_ram_part(args.gpu_ram_part)
     model_params_for(args.model)  # 조기 검증 — Dataset 생성(수십 초) 전에 죽는다
 
     configs = (
