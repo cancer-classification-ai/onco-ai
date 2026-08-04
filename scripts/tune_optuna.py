@@ -100,6 +100,7 @@ from cancer_hack.validation import (  # noqa: E402
 from train_gbdt import (  # noqa: E402
     BURDEN_COLUMNS,
     CONFIGS,
+    FREQUENCY_BLOCKS,
     GENE_BLOCKS,
     LATENT_BLOCKS,
     MODEL_PARAMS,
@@ -194,12 +195,18 @@ def cross_validate(
     """
     spec = CONFIGS[config]
     # 이 튜너는 dense + GENE_BLOCKS 만 만든다. fold 안에서 새로 fit 하는 블록
-    # (TF-IDF·공변이 쌍·잠재·모듈)은 `assemble` 이 건너뛰고 여기서도 안 붙이므로,
+    # (TF-IDF·빈도·공변이 쌍·잠재·모듈)은 `assemble` 이 건너뛰고 여기서도 안 붙이므로,
     # 막지 않으면 f4rl 을 튜닝하고 f4r 숫자를 돌려받는다 — 조용히 틀린 답이 나온다.
     unsupported = [
         b
         for b in spec["blocks"]
-        if b in SPARSE_BLOCKS or b in PAIR_BLOCKS or b in LATENT_BLOCKS or b in MODULE_BLOCKS
+        if (
+            b in SPARSE_BLOCKS
+            or b in FREQUENCY_BLOCKS
+            or b in PAIR_BLOCKS
+            or b in LATENT_BLOCKS
+            or b in MODULE_BLOCKS
+        )
     ]
     if unsupported:
         raise ValueError(
