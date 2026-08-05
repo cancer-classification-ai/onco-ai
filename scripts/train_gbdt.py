@@ -685,6 +685,11 @@ _LOGGED_PARAMS = (
     "colsample_bytree",
     "rsm",
     "subsample",
+    "C",
+    "solver",
+    "max_iter",
+    "tol",
+    "l1_ratio",
     "tree_method",
     "device",
     "random_seed",
@@ -1204,8 +1209,16 @@ def build_fold_frequency_blocks(
     )
 
 
-def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
+def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> dict:
+    """Build fold-safe features and train one model per fold.
+
+    ``fit_model`` is an optional dependency-injection point with the same
+    signature as :func:`fit_with_fallback`.  GBDT callers omit it and preserve
+    the existing behavior.  Linear and other tabular models can reuse the exact
+    same feature/fold contract without copying this large assembly loop.
+    """
     spec = CONFIGS[config]
+    trainer = fit_with_fallback if fit_model is None else fit_model
     gene_blocks = [b for b in spec["blocks"] if b in GENE_BLOCKS]
     sparse_blocks = [b for b in spec["blocks"] if b in SPARSE_BLOCKS]
     frequency_blocks = [b for b in spec["blocks"] if b in FREQUENCY_BLOCKS]
@@ -1343,6 +1356,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     fold_seconds: list[float] = []
     fold_widths: list[int] = []
     devices: list[str] = []
+    fold_models: list[dict] = []
     selected: dict[str, dict[str, list[str]]] = {}
     comut_diagnostics: dict[str, dict[str, list[dict]]] = {}
     comut_widths: list[int] = []
@@ -1576,7 +1590,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         weight = resolve_sample_weight(
             spec["weight"], data.y[train_index], group_keys[train_index]
         )
-        model = fit_with_fallback(args, x_train[train_index], data.y[train_index], weight)
+        model = trainer(args, x_train[train_index], data.y[train_index], weight)
 
         if list(model.classes_) != list(data.classes):
             raise RuntimeError(
@@ -1586,7 +1600,9 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         oof[valid_index] = model.predict_proba(x_train[valid_index])
         test_proba += model.predict_proba(x_test) / args.n_splits
 
-        devices.append(model.describe().get("device", "?"))
+        model_detail = model.describe()
+        fold_models.append(model_detail)
+        devices.append(model_detail.get("device", "?"))
         params = effective_params(model)
 
         score = macro_f1(
@@ -1747,6 +1763,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         "support": summary["support"],
         "device": devices[0] if devices else "?",
         "device_mixed": len(set(devices)) > 1,
+        "fold_models": fold_models,
         "model_params": params,
         "elapsed_seconds": elapsed,
     }
