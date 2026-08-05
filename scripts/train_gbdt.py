@@ -20,6 +20,8 @@
             (`--comut-*` 플래그, `cancer_hack.features_graph` 참고)
     lsvd       64  잠재 SVD 성분 — 행을 L2 정규화하고 fold 안에서 기저를 fit
     lnmf       64  잠재 NMF 성분 — 같은 계약, 비음수 혼합
+    rwr256    256  fold-train 공변이 그래프 RWR -> fold-train SVD -> 행 L2 정규화
+            (`--rwr-*` 플래그, `cancer_hack.features_rwr` 참고)
     gmod       24  하드 유전자 모듈 — fold 안에서 KMeans 로 배타 배정
             (`--latent-*`/`--module-*` 플래그, `cancer_hack.features_latent` 참고)
     csig       26  클래스 서명 몫 — fold 안에서 라벨로 클래스별 유전자 집합을 고른다
@@ -120,6 +122,7 @@ from cancer_hack.features_latent import (  # noqa: E402
     module_membership_frame,
     subspace_alignment,
 )
+from cancer_hack.features_rwr import build_fold_rwr_block  # noqa: E402
 from cancer_hack.features_signature import build_fold_signature_block  # noqa: E402
 from cancer_hack.features_sparse import (  # noqa: E402
     build_fold_parsed_token_block,
@@ -201,6 +204,10 @@ PAIR_BLOCKS = ("comut",)
 #: 이쪽 안정성은 `features_latent.subspace_alignment`(주각 코사인)로 따로 잰다.
 LATENT_BLOCKS = ("lsvd", "lnmf")
 
+#: fold-train 내부 공변이 그래프 -> 환자별 RWR -> fold-train SVD. 고정 PPI 파일이
+#: 저장소에 없으므로 1차 실험은 내부 그래프만 사용한다. fit 함수는 test와 y를 받지 않는다.
+RWR_BLOCKS = ("rwr256",)
+
 #: 유전자를 그룹으로 묶어 집계하는 블록. fold 마다 지지도 필터가 다시 걸려 모듈에 든
 #: 유전자 집합이 실제로 바뀌므로 `selected` 등록이 의미가 있다.
 MODULE_BLOCKS = ("gmod",)
@@ -222,6 +229,7 @@ EVIDENCE_BLOCKS = ("ebovr", "ebbnb")
 FOLD_MATRIX_BLOCKS = (
     PAIR_BLOCKS
     + LATENT_BLOCKS
+    + RWR_BLOCKS
     + MODULE_BLOCKS
     + SIGNATURE_BLOCKS
     + EVIDENCE_BLOCKS
@@ -254,6 +262,7 @@ BLOCK_SOURCES = {
     # `block_cache_key` 가 enc3/comut 와 같은 키를 낸다 — 배열 한 벌을 나눠 쓴다.
     "lsvd": "{split}_mutation_encoded.parquet",
     "lnmf": "{split}_mutation_encoded.parquet",
+    "rwr256": "{split}_mutation_encoded.parquet",
     "gmod": "{split}_mutation_encoded.parquet",
     "csig": "{split}_mutation_encoded.parquet",
     "ebovr": "{split}_gene_mutated_matrix.parquet",
@@ -337,6 +346,7 @@ BLOCK_DESC = {
     "comut": "공변이 쌍 (fold 안 선택)",
     "lsvd": "잠재 SVD (fold 안 fit)",
     "lnmf": "잠재 NMF (fold 안 fit)",
+    "rwr256": "내부 공변이 RWR + SVD 256 (fold 안 fit)",
     "gmod": "하드 유전자 모듈 (fold 안 KMeans)",
     "csig": "클래스 서명 몫 (fold 안 라벨 선택)",
     "ebovr": "EB shrinkage 기반 OVR supervised gene evidence 26종",
@@ -375,6 +385,19 @@ CONFIGS: dict[str, dict] = {
         "blocks": ("domain", "rollup16", "enc3"),
         "weight": "balanced",
         "desc": "도메인 + 시프트내성 rollup + 유전자",
+    },
+    # --- RWR256 동일 모델 ablation ---------------------------------------
+    # config 이름은 모델과 분리한다. CatBoost에서 1차 검증한 뒤 같은 두 config를
+    # XGBoost로 그대로 재사용한다. cbopt10 등 과거 튜닝 파라미터는 사용하지 않는다.
+    "dense_base": {
+        "blocks": ("domain", "rollup16", "gecr"),
+        "weight": "balanced",
+        "desc": "RWR dense 대조군",
+    },
+    "dense_rwr256": {
+        "blocks": ("domain", "rollup16", "gecr", "rwr256"),
+        "weight": "balanced",
+        "desc": "dense baseline + RWR256",
     },
     # --- 지도형 gene evidence encoding ----------------------------------
     # 일반 block과 달리 outer-train 행도 inner cross-fitting으로 만든다. v018b에서
@@ -651,7 +674,10 @@ LGBM_TEXT_NMF_CONFIGS = (
     "lgbm_text_nmf_no_ptok",
     "lgbm_text_nmf_no_lnmf",
 )
-EXPLICIT_ONLY_CONFIGS = EXPERIMENTAL_EVIDENCE_CONFIGS + LGBM_TEXT_NMF_CONFIGS
+RWR_DENSE_CONFIGS = ("dense_base", "dense_rwr256")
+EXPLICIT_ONLY_CONFIGS = (
+    EXPERIMENTAL_EVIDENCE_CONFIGS + LGBM_TEXT_NMF_CONFIGS + RWR_DENSE_CONFIGS
+)
 
 #: 모델별 기본 하이퍼파라미터.
 #:
@@ -1258,6 +1284,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
     frequency_blocks = [b for b in spec["blocks"] if b in FREQUENCY_BLOCKS]
     pair_blocks = [b for b in spec["blocks"] if b in PAIR_BLOCKS]
     latent_blocks = [b for b in spec["blocks"] if b in LATENT_BLOCKS]
+    rwr_blocks = [b for b in spec["blocks"] if b in RWR_BLOCKS]
     module_blocks = [b for b in spec["blocks"] if b in MODULE_BLOCKS]
     signature_blocks = [b for b in spec["blocks"] if b in SIGNATURE_BLOCKS]
     evidence_blocks = [b for b in spec["blocks"] if b in EVIDENCE_BLOCKS]
@@ -1323,6 +1350,20 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
         if latent_blocks
         else {}
     )
+    rwr_kwargs = (
+        dict(
+            n_components=args.rwr_components,
+            restart=args.rwr_restart,
+            max_iter=args.rwr_max_iter,
+            tol=args.rwr_tol,
+            min_gene_support=args.rwr_min_gene_support,
+            min_edge_support=args.rwr_min_edge_support,
+            topk_neighbors=args.rwr_topk_neighbors,
+            random_state=args.rwr_random_state,
+        )
+        if rwr_blocks
+        else {}
+    )
     module_kwargs = (
         dict(
             value=args.module_value,
@@ -1357,12 +1398,14 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
         else {}
     )
     latent_slug = _latent_slug(latent_kwargs)
+    rwr_slug = _rwr_slug(rwr_kwargs)
     module_slug = _module_slug(module_kwargs)
     signature_slug = _signature_slug(signature_kwargs)
     evidence_slug = _evidence_slug(evidence_kwargs)
     stem = (
         f"{args.model}_{args.tag}_{config}_{CV_SLUG[cv]}_{k_slug}"
-        f"{sparse_slug}{comut_slug}{latent_slug}{module_slug}{signature_slug}{evidence_slug}"
+        f"{sparse_slug}{comut_slug}{latent_slug}{rwr_slug}"
+        f"{module_slug}{signature_slug}{evidence_slug}"
         f"_s{args.seed}"
     )
 
@@ -1405,6 +1448,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
     comut_diagnostics: dict[str, dict[str, list[dict]]] = {}
     comut_widths: list[int] = []
     latent_diagnostics: dict[str, dict[str, list[dict]]] = {}
+    rwr_diagnostics: dict[str, dict[str, dict]] = {}
     module_diagnostics: dict[str, dict[str, list[dict]]] = {}
     signature_diagnostics: dict[str, dict[str, list[dict]]] = {}
     evidence_diagnostics: dict[str, dict[str, dict]] = {}
@@ -1558,6 +1602,27 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
             latent_diagnostics.setdefault(block, {})[str(fold)] = lat_diag
             x_train = np.hstack([x_train, lat_tr])
             x_test = np.hstack([x_test, lat_te])
+
+        # RWR256 — 내부 공변이 그래프와 SVD를 outer-train 행으로만 fit한다.
+        # validation/test의 변이 유전자는 seed로 transform될 뿐 그래프·정규화·기저를
+        # 바꾸지 않는다. features_rwr.fit_*은 test와 y 인자를 아예 받지 않는다.
+        for block in rwr_blocks:
+            columns, rwr_train, rwr_test = data.pairs[block]
+            rwr_names, rwr_tr, rwr_te, rwr_diag, _ = build_fold_rwr_block(
+                rwr_train,
+                rwr_test,
+                train_index,
+                gene_names=columns,
+                **rwr_kwargs,
+            )
+            if len(rwr_names) != args.rwr_components:
+                raise RuntimeError(
+                    f"{block} 폭 {len(rwr_names)}, 기대 {args.rwr_components}. "
+                    "실데이터에서는 RWR256 폭이 고정이어야 한다"
+                )
+            rwr_diagnostics.setdefault(block, {})[str(fold)] = rwr_diag
+            x_train = np.hstack([x_train, rwr_tr])
+            x_test = np.hstack([x_test, rwr_te])
 
         # 유전자 모듈 — KMeans 배정을 fold 의 train 부분에서만 fit 한다.
         for block in module_blocks:
@@ -1749,6 +1814,21 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
                 "diagnostics": latent_diagnostics,
             }
             if latent_blocks
+            else None
+        ),
+        "rwr": (
+            {
+                "blocks": rwr_blocks,
+                "params": rwr_kwargs,
+                "network_source": "fold_train_internal_comutation",
+                "seed_source": "patient_mutated_genes_unsupervised",
+                "graph_fit_scope": "outer_train_only",
+                "svd_fit_scope": "outer_train_only",
+                "validation_test_scope": "transform_only",
+                "post_svd_normalization": "row_l2",
+                "diagnostics": rwr_diagnostics,
+            }
+            if rwr_blocks
             else None
         ),
         "module": (
@@ -1980,6 +2060,18 @@ def _latent_slug(latent_kwargs: dict) -> str:
     return (
         f"_lt{latent_kwargs['n_components']}{latent_kwargs['method']}"
         f"{latent_kwargs['row_norm']}{_digest(latent_kwargs)}"
+    )
+
+
+def _rwr_slug(rwr_kwargs: dict) -> str:
+    """RWR graph/SVD parameters -> collision-safe stem suffix."""
+
+    if not rwr_kwargs:
+        return ""
+    restart = f"{rwr_kwargs['restart']:g}".replace(".", "p")
+    return (
+        f"_rw{rwr_kwargs['n_components']}a{restart}"
+        f"k{rwr_kwargs['topk_neighbors']}{_digest(rwr_kwargs)}"
     )
 
 
@@ -2247,6 +2339,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="fold-train 에서 이 행수 미만 변이된 유전자는 분해 전에 뺀다",
     )
     parser.add_argument("--latent-random-state", type=int, default=0)
+
+    # --- 비지도 RWR + SVD 블록 (rwr256) ----------------------------------
+    parser.add_argument(
+        "--rwr-components", type=int, default=256, help="RWR 전파 벡터 SVD 차원"
+    )
+    parser.add_argument(
+        "--rwr-restart",
+        type=float,
+        default=0.5,
+        help="환자 seed로 돌아오는 restart 확률",
+    )
+    parser.add_argument("--rwr-max-iter", type=int, default=20)
+    parser.add_argument("--rwr-tol", type=float, default=1e-6)
+    parser.add_argument(
+        "--rwr-min-gene-support",
+        type=int,
+        default=5,
+        help="fold-train에서 그래프 노드로 연결될 최소 변이 행 수",
+    )
+    parser.add_argument(
+        "--rwr-min-edge-support",
+        type=int,
+        default=2,
+        help="fold-train 공변이 edge 최소 동시 변이 행 수",
+    )
+    parser.add_argument(
+        "--rwr-topk-neighbors",
+        type=int,
+        default=32,
+        help="유전자별 cosine 공변이 이웃 상한",
+    )
+    parser.add_argument("--rwr-random-state", type=int, default=0)
 
     # --- 하드 유전자 모듈 블록 (gmod) --------------------------------------
     parser.add_argument("--module-n", type=int, default=24, help="KMeans 모듈 수")
