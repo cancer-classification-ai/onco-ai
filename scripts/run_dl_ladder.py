@@ -21,6 +21,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import artifacts_dir, process_dir, raw_dir  # noqa: E402
 from cancer_hack.validation import CV_SLUG  # noqa: E402
 
 MODEL_CONFIGS = {
@@ -86,13 +89,13 @@ def artifact_paths(
 ) -> list[Path]:
     stem = f"dl_{model}_{tag}_{CV_SLUG[cv]}"
     paths = [
-        PROJECT_ROOT / "artifacts/oof" / f"oof_{stem}.csv",
-        PROJECT_ROOT / "artifacts/test_predictions" / f"test_{stem}.csv",
-        PROJECT_ROOT / "artifacts/logs" / f"{stem}.json",
+        artifacts_dir() / "oof" / f"oof_{stem}.csv",
+        artifacts_dir() / "test_predictions" / f"test_{stem}.csv",
+        artifacts_dir() / "logs" / f"{stem}.json",
     ]
     if include_submission:
         paths.append(
-            PROJECT_ROOT / "artifacts/submissions" / f"submission_{stem}.csv"
+            artifacts_dir() / "submissions" / f"submission_{stem}.csv"
         )
     return paths
 
@@ -132,21 +135,21 @@ def build_train_command(
 
 def check_inputs(models: list[str], *, need_submission: bool) -> None:
     missing = [
-        PROJECT_ROOT / "data/process" / name
+        process_dir() / name
         for name in FULL_FEATURE_FILES
-        if not (PROJECT_ROOT / "data/process" / name).exists()
+        if not (process_dir() / name).exists()
     ]
     if any(model in ("set_encoder", "hybrid") for model in models):
         missing.extend(
             path
             for path in (
-                PROJECT_ROOT / "data/raw/train.csv",
-                PROJECT_ROOT / "data/raw/test.csv",
+                raw_dir() / "train.csv",
+                raw_dir() / "test.csv",
             )
             if not path.exists()
         )
     if need_submission:
-        sample = PROJECT_ROOT / "data/raw/sample_submission.csv"
+        sample = raw_dir() / "sample_submission.csv"
         if not sample.exists():
             missing.append(sample)
     if missing:
@@ -163,7 +166,7 @@ def print_summary(models: list[str], tags: dict[str, str], cv: str) -> None:
     print(f"{'model':<14}{'OOF Macro F1':>15}{'singleton':>15}{'best epochs':>20}")
     for model in models:
         stem = f"dl_{model}_{tags[model]}_{CV_SLUG[cv]}"
-        path = PROJECT_ROOT / "artifacts/logs" / f"{stem}.json"
+        path = artifacts_dir() / "logs" / f"{stem}.json"
         with path.open(encoding="utf-8") as handle:
             result = json.load(handle)
         best_epochs = [

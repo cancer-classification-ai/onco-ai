@@ -56,6 +56,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_ARTIFACTS, LazyDir, artifacts_dir, process_dir, raw_dir  # noqa: E402
 from cancer_hack.io import save_csv, write_submission  # noqa: E402
 from cancer_hack.metrics import (  # noqa: E402
     build_prediction_frame,
@@ -65,11 +68,9 @@ from cancer_hack.metrics import (  # noqa: E402
 )
 from calibrate_ensemble import _load_fold_values, _load_prediction_set  # noqa: E402
 
-ARTIFACTS = PROJECT_ROOT / "artifacts"
-DEFAULT_FOLDS = PROJECT_ROOT / "data/process/train_folds.parquet"
-DEFAULT_SAMPLE = PROJECT_ROOT / "data/raw/sample_submission.csv"
-
-
+ARTIFACTS = LAZY_ARTIFACTS
+DEFAULT_FOLDS = LazyDir(lambda: process_dir() / "train_folds.parquet")
+DEFAULT_SAMPLE = LazyDir(lambda: raw_dir() / "sample_submission.csv")
 def log(message: str) -> None:
     print(message, flush=True)
 

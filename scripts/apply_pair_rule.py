@@ -29,15 +29,16 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_RAW, raw_dir  # noqa: E402
 from cancer_hack.pair_rule import (  # noqa: E402
     DEFAULT_MIN_MUT,
     apply_to_submission,
     build_pair_rule,
 )
 
-RAW_DIR = PROJECT_ROOT / "data/raw"
-
-
+RAW_DIR = LAZY_RAW
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter

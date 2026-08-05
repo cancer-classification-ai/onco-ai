@@ -67,7 +67,7 @@ def test_gene_rule_command_uses_experiment_specific_tag() -> None:
 
     assert command[0] == sys.executable
     assert command[command.index("--model") + 1] == "hybrid"
-    assert command[command.index("--config") + 1].endswith(
-        "configs/hybrid_set_mlp_v2.yaml"
-    )
+    # Path 로 비교한다 — Windows 는 구분자가 `\` 라 문자열 endswith 가 늘 실패한다.
+    config_path = Path(command[command.index("--config") + 1])
+    assert config_path.parts[-2:] == ("configs", "hybrid_set_mlp_v2.yaml")
     assert command[command.index("--tag") + 1] == "hybrid_v2_s2025"

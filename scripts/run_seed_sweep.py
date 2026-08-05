@@ -61,7 +61,10 @@ for _stream in (sys.stdout, sys.stderr):
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-ARTIFACTS = PROJECT_ROOT / "artifacts"
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_ARTIFACTS, LazyDir, artifacts_dir, process_dir, raw_dir  # noqa: E402
+ARTIFACTS = LAZY_ARTIFACTS
 #: 서브프로세스로 부를 파이썬. **`sys.executable` 이 먼저다** — Colab·Linux 에는
 #: `.venv/Scripts/python.exe` 가 없고, 있더라도 지금 이 스크립트를 돌리는 인터프리터와
 #: 다른 것을 부르면 라이브러리 버전이 갈려 OOF 가 조용히 어긋난다(requirements.txt
@@ -90,8 +93,11 @@ N_SPLITS = 5
 MODELS = ["xgb", "catboost", "rf"]
 #: v002 의 고정 가중. 모델 순서는 MODELS 와 같다.
 FIXED_WEIGHTS = [0.45, 0.45, 0.10]
-FOLDS_FILE = PROJECT_ROOT / "data" / "process" / "train_folds.parquet"
-SEEDS = [42, 7, 2024, 1234, 5678]
+FOLDS_FILE = LazyDir(lambda: process_dir() / "train_folds.parquet")
+from cancer_hack.validation import SEED_SWEEP  # noqa: E402
+
+#: 앞 셋은 `SEED_ENSEMBLE` 과 같다 — 그래야 스윕 결과의 일부를 앙상블에 그대로 재사용한다.
+SEEDS = list(SEED_SWEEP)
 CV_KEYS = {"skf5": "skf", "group5": "sgkf"}  # 파일명 조각 -> --cv 값
 
 #: 모델별 대략 학습 시간(초, 분할 하나 기준). `--dry-run` 예상치용.
@@ -180,7 +186,7 @@ def blend_report(args) -> None:
     """3/4/5 seed × 균등/고정 × skf5/group5 = 12 조합을 OOF 로 비교한다."""
     from sklearn.metrics import f1_score
 
-    labels = pd.read_csv(PROJECT_ROOT / "data" / "raw" / "train.csv",
+    labels = pd.read_csv(raw_dir() / "train.csv",
                          usecols=["ID", "SUBCLASS"]).set_index("ID")["SUBCLASS"]
     classes = sorted(labels.unique())
     cols = [f"p_{c}" for c in classes]

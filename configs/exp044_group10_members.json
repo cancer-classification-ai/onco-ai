@@ -1,0 +1,11 @@
+{
+  "library": [
+    "catboost_e44_f16_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "catboost_e44_f16n_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "rf_e44_f16_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "rf_e44_f16n_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "xgb_e44_f16_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "xgb_e44_f16n_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "xgb_e44_f4rsig_group10_k500_sg30sha71bc36_s42"
+  ]
+}

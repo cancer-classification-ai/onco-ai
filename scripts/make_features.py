@@ -60,8 +60,12 @@ from cancer_hack.features_domain import (  # noqa: E402
 )
 from cancer_hack.features_sparse import build_parsed_token_documents  # noqa: E402
 
-RAW_DIR = PROJECT_ROOT / "data/raw"
-OUT_DIR = PROJECT_ROOT / "data/process"
+# 경로는 `cancer_hack.paths` 가 정한다. `_resolve_output` 이 호출 시점에 `OUT_DIR / 이름`
+# 을 만들므로, 노트북이 `use_run_dirs()` 로 출력 위치를 옮기면 그대로 따라간다.
+from cancer_hack.paths import (  # noqa: E402
+    LAZY_PROCESS as OUT_DIR,
+    LAZY_RAW as RAW_DIR,
+)
 
 
 def _resolve_output(explicit: Path | None, default_name: str) -> Path:

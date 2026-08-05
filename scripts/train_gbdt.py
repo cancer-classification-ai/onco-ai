@@ -137,16 +137,19 @@ from cancer_hack.models_gbdt import (  # noqa: E402
     resolve_sample_weight,
 )
 from cancer_hack.validation import (  # noqa: E402
-    CV_SLUG,
     FOLD_META_COLUMNS,
     Chi2TopKSelector,
     check_all_classes_present,
+    cv_slug,
     fold_column,
 )
+from cancer_hack.paths import LAZY_ARTIFACTS, LAZY_PROCESS, LAZY_RAW  # noqa: E402
 
-RAW_DIR = PROJECT_ROOT / "data/raw"
-PROC_DIR = PROJECT_ROOT / "data/process"
-ARTIFACTS = PROJECT_ROOT / "artifacts"
+# 경로는 `cancer_hack.paths` 가 정한다. 여기서 상수로 굳히면 노트북이 출력 위치를
+# 옮겨도 반영이 안 된다 — 값은 쓰는 시점에 정해진다(LazyDir docstring 참고).
+RAW_DIR = LAZY_RAW
+PROC_DIR = LAZY_PROCESS
+ARTIFACTS = LAZY_ARTIFACTS
 
 #: fold 안에서 채우는 2열. 자리는 미리 잡아 두고 값은 fold 마다 다시 쓴다.
 BURDEN_COLUMNS = ("hypermutated_flag", "burden_quantile_bin")
@@ -635,7 +638,14 @@ MODEL_PARAMS: dict[str, dict] = {
         reg_lambda=1.0,
     ),
     "lgbm": dict(n_estimators=800, learning_rate=0.05),
-    "catboost": dict(iterations=1000, learning_rate=0.05, depth=6),
+    # `rsm=1` 을 **명시한다.** `CatBoostModel.default_params()` 는 0.4 를 주는데 GPU 는
+    # `rsm != 1` 을 못 받아서(CatBoostError) 예전 코드가 조용히 빼 버렸다. 그래서 같은
+    # 설정이 GPU 에서는 열 샘플링 없이, CPU 에서는 0.4 로 학습되어 **device 마다 다른
+    # 모델**이 됐다. 지금 `artifacts/oof/` 의 CatBoost 는 전부 GPU 산출이므로 실효값이
+    # 1 이고, 여기 1 을 박아야 그 기록과 CPU 재실행이 같은 구성이 된다.
+    #
+    # 0.4 를 쓰고 싶으면 `--set rsm=0.4 --device cpu` 로 **의도를 드러내서** 준다.
+    "catboost": dict(iterations=1000, learning_rate=0.05, depth=6, rsm=1),
     # RF 는 튜닝 이력이 없다. 값의 근거는 `models_gbdt.RFModel.default_params()` 의
     # docstring 에 있고, 여기 다시 적는 이유는 이 dict 가 "이번 실행이 실제로 쓴 값"을
     # 보는 자리라서다.
@@ -1317,7 +1327,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
     signature_slug = _signature_slug(signature_kwargs)
     evidence_slug = _evidence_slug(evidence_kwargs)
     stem = (
-        f"{args.model}_{args.tag}_{config}_{CV_SLUG[cv]}_{k_slug}"
+        f"{args.model}_{args.tag}_{config}_{cv_slug(cv, args.n_splits)}_{k_slug}"
         f"{sparse_slug}{comut_slug}{latent_slug}{module_slug}{signature_slug}{evidence_slug}"
         f"_s{args.seed}"
     )
@@ -2272,7 +2282,7 @@ def main() -> None:
                     path = (
                         ARTIFACTS
                         / "logs"
-                        / f"{args.model}_{args.tag}_{config}_{CV_SLUG[cv]}_ERROR.json"
+                        / f"{args.model}_{args.tag}_{config}_{cv_slug(cv, args.n_splits)}_ERROR.json"
                     )
                     path.parent.mkdir(parents=True, exist_ok=True)
                     with open(path, "w", encoding="utf-8") as handle:

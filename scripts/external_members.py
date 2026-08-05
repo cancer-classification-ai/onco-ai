@@ -61,16 +61,20 @@ for _stream in (sys.stdout, sys.stderr):
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_RAW, LazyDir, artifacts_dir, process_dir, raw_dir  # noqa: E402
 from cancer_hack.metrics import macro_f1  # noqa: E402
 
-RAW = PROJECT_ROOT / "data" / "raw"
-FOLDS = PROJECT_ROOT / "data" / "process" / "train_folds.parquet"
-
+RAW = LAZY_RAW
+FOLDS = LazyDir(lambda: process_dir() / "train_folds.parquet")
 #: 우리 GBDT 멤버. `run_seed_sweep.py` 와 같은 규약이다.
 SLUG = "k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36"
 GBDT_MODELS = ["xgb", "catboost", "rf"]
 GBDT_WEIGHTS = [0.45, 0.45, 0.10]
-DEFAULT_SEEDS = [42, 7, 2024]
+from cancer_hack.validation import SEED_ENSEMBLE  # noqa: E402
+
+DEFAULT_SEEDS = list(SEED_ENSEMBLE)
 
 
 def log(message: str) -> None:
@@ -186,7 +190,7 @@ def verify(oof_path: Path, folds: pd.DataFrame, labels: pd.Series, classes: list
 
 def our_ensemble(cv: str, seeds: list[int], classes: list[str], labels: pd.Series):
     """f16 GBDT 3종 × seed 평균 -> 0.45/0.45/0.10 블렌드."""
-    oof_dir = PROJECT_ROOT / "artifacts" / "oof"
+    oof_dir = artifacts_dir() / "oof"
     cols = [f"p_{c}" for c in classes]
     stacks, ids = [], None
     for model in GBDT_MODELS:

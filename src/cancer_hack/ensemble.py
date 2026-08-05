@@ -7,6 +7,9 @@ from collections.abc import Sequence
 import numpy as np
 from sklearn.metrics import f1_score
 
+#: 0 확률에서 log·역수가 터지는 걸 막는 바닥값. 기하·조화평균에서만 쓴다.
+_EPS = 1e-12
+
 
 def _probability_stack(probabilities: Sequence[np.ndarray]) -> np.ndarray:
     if not probabilities:
@@ -24,19 +27,146 @@ def _probability_stack(probabilities: Sequence[np.ndarray]) -> np.ndarray:
     return stack / totals
 
 
+def _validated_weights(weights: Sequence[float], n_members: int) -> np.ndarray:
+    weights = np.asarray(weights, dtype=np.float64)
+    if weights.shape != (n_members,):
+        raise ValueError(f"weights 형상 {weights.shape}, 기대 {(n_members,)}")
+    if not np.isfinite(weights).all() or (weights < 0).any() or weights.sum() <= 0:
+        raise ValueError("weights 는 유한한 비음수이고 합이 양수여야 한다")
+    return weights / weights.sum()
+
+
 def weighted_average(
     probabilities: Sequence[np.ndarray], weights: Sequence[float]
 ) -> np.ndarray:
     """비음수·합 1 가중치로 모델 확률을 섞는다."""
 
     stack = _probability_stack(probabilities)
-    weights = np.asarray(weights, dtype=np.float64)
-    if weights.shape != (len(stack),):
-        raise ValueError(f"weights 형상 {weights.shape}, 기대 {(len(stack),)}")
-    if not np.isfinite(weights).all() or (weights < 0).any() or weights.sum() <= 0:
-        raise ValueError("weights 는 유한한 비음수이고 합이 양수여야 한다")
-    weights = weights / weights.sum()
-    return np.tensordot(weights, stack, axes=(0, 0))
+    return np.tensordot(_validated_weights(weights, len(stack)), stack, axes=(0, 0))
+
+
+def power_mean(
+    probabilities: Sequence[np.ndarray], weights: Sequence[float], power: float = 1.0
+) -> np.ndarray:
+    """가중 거듭제곱평균. `power=1` 산술 · `0` 기하 · `-1` 조화.
+
+    산술평균은 **한 멤버가 확신하면 그대로 끌려간다.** 0.99 를 낸 멤버 하나가 0.1 을 낸
+    셋을 이긴다. 지수를 내리면 그 반대가 된다 — 기하평균은 한 멤버가 0 에 가까우면
+    전체를 0 으로 끌어내려서, 모든 멤버가 동의해야 높은 값이 남는다.
+
+    어느 쪽이 맞는지는 멤버의 성격에 달렸다. 서로 다른 것을 잘 맞히는 멤버끼리는
+    산술이 낫고(한쪽이 아는 걸 살린다), 같은 것을 보며 잡음만 다른 멤버끼리는
+    기하가 낫다(잡음이 상쇄된다). 그래서 재 봐야 한다.
+    """
+
+    stack = _probability_stack(probabilities)
+    weights = _validated_weights(weights, len(stack))
+    if not np.isfinite(power):
+        raise ValueError("power 는 유한해야 한다")
+
+    if abs(power) < 1e-12:  # 기하평균 — log 합
+        mixed = np.exp(np.tensordot(weights, np.log(np.maximum(stack, _EPS)), axes=(0, 0)))
+    else:
+        mixed = np.tensordot(weights, np.maximum(stack, _EPS) ** power, axes=(0, 0)) ** (1.0 / power)
+
+    totals = mixed.sum(axis=1, keepdims=True)
+    return mixed / np.maximum(totals, _EPS)
+
+
+def rank_average(
+    probabilities: Sequence[np.ndarray],
+    weights: Sequence[float],
+    reference: Sequence[np.ndarray] | None = None,
+) -> np.ndarray:
+    """클래스 열마다 **순위(백분위)**로 바꾼 뒤 섞는다.
+
+    멤버마다 확률의 눈금이 다르다. DL 은 뾰족하고 RF 는 뭉툭한데, 산술평균은 그 눈금을
+    그대로 받아서 뾰족한 쪽에 끌려간다. 순위로 바꾸면 눈금이 사라지고 **순서만** 남는다.
+
+    열 안에서 순위를 매기는 게 핵심이다 — 클래스 c 를 놓고 행을 줄 세운다. 그러면
+    38행짜리 DLBC 열도 786행짜리 BRCA 열과 같은 (0, 1] 범위로 펴진다. macro F1 이
+    26클래스를 동등하게 세므로 이 펴짐이 그대로 이득이 될 수 있다.
+    대신 "얼마나 확신하는가" 는 통째로 버려진다.
+
+    규정 — `reference` 를 반드시 train 쪽으로 준다
+    ---------------------------------------------
+    `reference=None` 이면 **자기 자신 안에서** 순위를 매긴다. 이걸 test 에 쓰면
+    test 행끼리 줄을 세우게 되고, 그러면 "test 한 행만 따로 넣어도 같은 결과가 나오는가"
+    를 못 지킨다 — 대회 규정이 콕 집어 든 "test 자신의 통계값으로 처리" 에 해당한다.
+
+    그래서 실제 경로에서는 train(또는 fold 의 train 부분) 확률을 `reference` 로 넘긴다.
+    그러면 각 행이 **미리 정해진 함수**를 통과할 뿐이라 행 하나만 넣어도 같은 값이 나오고,
+    fit 은 train 에서만 일어난다. `None` 은 분석용이다.
+    """
+
+    stack = _probability_stack(probabilities)
+    weights = _validated_weights(weights, len(stack))
+    ref = stack if reference is None else _probability_stack(reference)
+    if len(ref) != len(stack) or ref.shape[2] != stack.shape[2]:
+        raise ValueError("reference 는 같은 멤버 수·클래스 수여야 한다")
+
+    ranked = np.empty_like(stack)
+    n_ref = ref.shape[1]
+    for member in range(len(stack)):
+        for column in range(stack.shape[2]):
+            grid = np.sort(ref[member, :, column])
+            ranked[member, :, column] = (
+                np.searchsorted(grid, stack[member, :, column], side="right") / n_ref
+            )
+
+    mixed = np.tensordot(weights, np.maximum(ranked, _EPS), axes=(0, 0))
+    return mixed / mixed.sum(axis=1, keepdims=True)
+
+
+def trimmed_mean(
+    probabilities: Sequence[np.ndarray], trim: int = 1
+) -> np.ndarray:
+    """양 끝 `trim` 개를 버리고 평균한다 (가중치 없음).
+
+    멤버 하나가 망가져도 결과가 안 무너지게 하는 쪽이다. `trim=0` 이면 그냥 평균이고,
+    멤버가 홀수이고 양쪽을 최대로 자르면 중앙값이 된다.
+    """
+
+    stack = _probability_stack(probabilities)
+    n_members = len(stack)
+    if trim < 0 or 2 * trim >= n_members:
+        raise ValueError(f"trim 은 0 이상 {(n_members - 1) // 2} 이하여야 한다")
+    if trim == 0:
+        mixed = stack.mean(axis=0)
+    else:
+        ordered = np.sort(stack, axis=0)
+        mixed = ordered[trim : n_members - trim].mean(axis=0)
+    return mixed / mixed.sum(axis=1, keepdims=True)
+
+
+#: `combine()` 이 받는 결합 형태. 스크립트·노트북이 문자열로 고를 수 있게 열어 둔다.
+BLEND_FORMS = ("mean", "geometric", "harmonic", "rank", "median", "trimmed")
+
+
+def combine(
+    probabilities: Sequence[np.ndarray],
+    weights: Sequence[float],
+    form: str = "mean",
+    reference: Sequence[np.ndarray] | None = None,
+) -> np.ndarray:
+    """이름으로 결합 형태를 고른다. 기본값 `mean` 이 기존 동작이다.
+
+    `reference` 는 `rank` 에서만 쓰인다 — 순위를 매길 기준 분포이고 train 쪽을 준다.
+    """
+
+    if form == "mean":
+        return weighted_average(probabilities, weights)
+    if form == "geometric":
+        return power_mean(probabilities, weights, power=0.0)
+    if form == "harmonic":
+        return power_mean(probabilities, weights, power=-1.0)
+    if form == "rank":
+        return rank_average(probabilities, weights, reference=reference)
+    if form == "median":
+        return trimmed_mean(probabilities, trim=(len(probabilities) - 1) // 2)
+    if form == "trimmed":
+        return trimmed_mean(probabilities, trim=1)
+    raise ValueError(f"모르는 결합 형태 {form!r} — {BLEND_FORMS} 중 하나여야 한다")
 
 
 def crossfit_calibrated_blend(
@@ -45,6 +175,7 @@ def crossfit_calibrated_blend(
     classes: Sequence[str],
     fold_values: np.ndarray,
     weights: Sequence[float],
+    form: str = "mean",
 ):
     """고정 가중 블렌드에 로짓 보정을 **교차적합**으로 얹는다.
 
@@ -53,6 +184,9 @@ def crossfit_calibrated_blend(
     구성을 고를 수 없다(실측으로 0.5210 -> 0.5438 만큼 부푼다).
 
     `(raw_blend, calibrated, fold_results)` 를 낸다. 앞의 둘은 OOF 행 순서 그대로다.
+
+    `form` 은 확률을 합치는 방식이다(`BLEND_FORMS`). 기본 `"mean"` 이 기존 동작이라
+    이 인자를 안 주던 호출은 그대로 같은 값을 낸다.
 
     `scripts/calibrate_ensemble.py` 와 재현 노트북이 **같은 이 함수를 부른다.**
     로직이 두 벌이면 노트북이 제출본을 재현하지 못하는 순간이 오는데, 그때는 대회
@@ -73,10 +207,15 @@ def crossfit_calibrated_blend(
         train_mask = fold_values != fold
         valid_mask = ~train_mask
 
-        train_blend = weighted_average([v[train_mask] for v in oof_arrays], weights)
+        # `rank` 는 fold 의 train 부분을 기준 분포로 삼는다. valid 를 valid 안에서
+        # 줄 세우면 test 에 그대로 못 옮기는 방식이 되고, 점수도 낙관적으로 나온다.
+        train_parts = [v[train_mask] for v in oof_arrays]
+        train_blend = combine(train_parts, weights, form, reference=train_parts)
         calibrator = MacroF1LogitBias().fit(train_blend, y_true[train_mask], classes)
 
-        valid_blend = weighted_average([v[valid_mask] for v in oof_arrays], weights)
+        valid_blend = combine(
+            [v[valid_mask] for v in oof_arrays], weights, form, reference=train_parts
+        )
         valid_adjusted = calibrator.predict_proba(valid_blend)
         raw_blend[valid_mask] = valid_blend
         calibrated[valid_mask] = valid_adjusted
@@ -86,6 +225,7 @@ def crossfit_calibrated_blend(
                 "fold": int(fold),
                 "n_train": int(train_mask.sum()),
                 "n_valid": int(valid_mask.sum()),
+                "form": form,
                 "weights": [float(w) for w in weights],
                 "bias": calibrator.bias_by_class(),
                 "raw_blend_macro_f1": macro_f1(
@@ -226,6 +366,15 @@ class GreedyEnsembleSelector:
 
     `bag_fraction` 은 Caruana 의 bagging 이다. 라운드마다 라이브러리의 일부만 후보로 두면
     "우연히 이 fold 에서 좋아 보이는 멤버" 가 매번 뽑히는 걸 막는다. 1.0 이면 끄는 것.
+
+    `form`
+    ------
+    담긴 멤버들을 무엇으로 합치느냐다. 기본 `"mean"` 은 확률의 산술평균이고,
+    `"geometric"` 은 로그 확률의 합이다(= 기하평균). **선택 과정에도 같이 적용된다** —
+    합치는 방식이 바뀌면 어느 멤버를 담는 게 이득인지도 바뀌므로, 합칠 때만 기하로
+    하고 고를 때는 산술로 하면 서로 다른 목적함수를 최적화하게 된다.
+
+    로그 합의 argmax 는 기하평균의 argmax 와 같아서(지수는 단조) 선택 루프는 그대로다.
     """
 
     def __init__(
@@ -236,6 +385,7 @@ class GreedyEnsembleSelector:
         bag_rounds: int = 1,
         random_state: int = 0,
         init_top_k: int = 1,
+        form: str = "mean",
     ) -> None:
         if n_rounds < 1:
             raise ValueError("n_rounds 는 1 이상이어야 한다")
@@ -245,6 +395,9 @@ class GreedyEnsembleSelector:
             raise ValueError("bag_rounds 는 1 이상이어야 한다")
         if init_top_k < 0:
             raise ValueError("init_top_k 는 0 이상이어야 한다")
+        if form not in ("mean", "geometric"):
+            raise ValueError(f"form 은 'mean' 또는 'geometric' 이어야 한다 (받은 값 {form!r})")
+        self.form = form
         self.n_rounds = int(n_rounds)
         self.bag_fraction = float(bag_fraction)
         self.bag_rounds = int(bag_rounds)
@@ -272,6 +425,10 @@ class GreedyEnsembleSelector:
         target = np.asarray([lookup[label] for label in y_true], dtype=np.int64)
         labels = np.arange(len(classes))
 
+        # 기하평균이면 로그 공간에서 더한다. 누적합의 argmax 가 곧 기하평균의 argmax 라
+        # 아래 선택 루프는 한 줄도 안 바뀐다.
+        work = np.log(np.maximum(stack, _EPS)) if self.form == "geometric" else stack
+
         def score_of(total: np.ndarray, count: int) -> float:
             return float(
                 f1_score(target, (total / count).argmax(axis=1),
@@ -285,15 +442,15 @@ class GreedyEnsembleSelector:
         # 라운드마다 후보를 새로 뽑으므로 bag 별로 독립 실행한 뒤 횟수를 합친다.
         for _ in range(self.bag_rounds):
             bag_counts = np.zeros(n_members, dtype=np.int64)
-            total = np.zeros(stack.shape[1:], dtype=np.float64)
+            total = np.zeros(work.shape[1:], dtype=np.float64)
             picked = 0
 
             # 시작점 — 단독 최고 몇 개를 먼저 담는다. 빈 상태에서 시작하면 1라운드가
             # 사실상 "단독 최고 고르기" 라 같은 일을 두 번 하게 된다.
             if self.init_top_k:
-                solo = np.asarray([score_of(stack[i], 1) for i in range(n_members)])
+                solo = np.asarray([score_of(work[i], 1) for i in range(n_members)])
                 for index in np.argsort(-solo)[: self.init_top_k]:
-                    total += stack[index]
+                    total += work[index]
                     bag_counts[index] += 1
                     picked += 1
 
@@ -307,12 +464,12 @@ class GreedyEnsembleSelector:
 
                 best_index, best_score = -1, -np.inf
                 for index in candidates:
-                    candidate = score_of(total + stack[index], picked + 1)
+                    candidate = score_of(total + work[index], picked + 1)
                     if candidate > best_score + 1e-12:
                         best_index, best_score = int(index), candidate
                 if best_index < 0:
                     break
-                total += stack[best_index]
+                total += work[best_index]
                 bag_counts[best_index] += 1
                 picked += 1
                 history.append({"round": _round, "picked": best_index, "macro_f1": best_score})
@@ -323,12 +480,12 @@ class GreedyEnsembleSelector:
         self.counts_ = counts
         self.weights_ = counts / counts.sum()
         self.train_macro_f1_ = score_of(
-            np.tensordot(self.weights_, stack, axes=(0, 0)), 1
+            np.tensordot(self.weights_, work, axes=(0, 0)), 1
         )
         return self
 
     def predict_proba(self, probabilities: Sequence[np.ndarray]) -> np.ndarray:
-        return weighted_average(probabilities, self.weights_)
+        return combine(probabilities, self.weights_, self.form)
 
     def predict(self, probabilities: Sequence[np.ndarray]) -> np.ndarray:
         raise NotImplementedError("클래스 이름이 필요하다 — predict_proba 의 argmax 를 쓴다")

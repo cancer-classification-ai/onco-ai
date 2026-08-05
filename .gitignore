@@ -63,6 +63,14 @@ artifacts/metrics/*
 artifacts/configs/
 artifacts/comparisons/
 
+# 실행별 산출물 묶음. runs/ 는 전략 매트릭스·분할 비교가 실행마다 통째로 쌓아서
+# 금세 GB 단위가 된다(현재 1.7GB). bundles/ 와 drive_export/ 는 oof·test 확률
+# csv·parquet 이라 같은 이유로 제외한다 — 공유는 드라이브로 한다.
+artifacts/runs/
+artifacts/bundles/
+artifacts/drive_export/
+artifacts/*.log
+
 # ==================== Local experiment outputs ====================
 v018b_gene_evidence_ablation/
 

@@ -1,0 +1,57 @@
+{
+  "panel": [
+    {
+      "model": "xgb",
+      "config": "f4rsig",
+      "tag": "e44"
+    },
+    {
+      "model": "xgb",
+      "config": "f16n",
+      "tag": "e44"
+    },
+    {
+      "model": "xgb",
+      "config": "f16",
+      "tag": "e44"
+    },
+    {
+      "model": "catboost",
+      "config": "f16",
+      "tag": "e44"
+    },
+    {
+      "model": "catboost",
+      "config": "f16n",
+      "tag": "e44"
+    },
+    {
+      "model": "rf",
+      "config": "f16n",
+      "tag": "e44"
+    },
+    {
+      "model": "rf",
+      "config": "f16",
+      "tag": "e44"
+    }
+  ],
+  "group5": [
+    "xgb_e44_f4rsig_group5_k500_sg30sha71bc36_s42",
+    "xgb_e44_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "xgb_e44_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "catboost_e44_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "catboost_e44_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "rf_e44_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "rf_e44_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42"
+  ],
+  "group10": [
+    "xgb_e44_f4rsig_group10_k500_sg30sha71bc36_s42",
+    "xgb_e44_f16n_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "xgb_e44_f16_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "catboost_e44_f16_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "catboost_e44_f16n_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "rf_e44_f16n_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42",
+    "rf_e44_f16_group10_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42"
+  ]
+}

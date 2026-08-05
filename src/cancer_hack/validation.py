@@ -59,13 +59,30 @@ from scipy.sparse import issparse
 from sklearn.feature_selection import chi2
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
+#: fold 분할 시드. 모델 시드와 별개다.
+#: **바꾸면 `artifacts/oof/` 의 예측 100여 개가 전부 무효가 된다** — fold 경계가 달라져
+#: 예전 OOF 와 새 OOF 를 섞는 순간 교차적합 보정이 valid fold 를 보게 된다.
 SEED = 42
+
+#: seed 앙상블에 쓰는 모델 시드. **이 셋을 계속 쓴다.**
+#:
+#: 지금까지의 3-seed 산출물(`*_seed3_*`, EXP_041 제출본 등)이 전부 이 값으로 나왔다.
+#: 여기를 바꾸면 그 기록들과 비교가 끊기고, 무엇보다 코드만 받은 사람이 우리와 다른
+#: 숫자를 얻는다. 시드는 취향이 아니라 **재현의 계약**이라 한 곳에 박아 두고 공유한다.
+#:
+#: 늘릴 때는 뒤에 덧붙인다 — 앞의 셋을 유지해야 기존 OOF 를 그대로 재사용할 수 있다.
+SEED_ENSEMBLE: tuple[int, ...] = (42, 7, 2024)
+
+#: seed 분산을 재는 스윕용. 앞 셋은 `SEED_ENSEMBLE` 과 같아야 재사용이 된다.
+SEED_SWEEP: tuple[int, ...] = SEED_ENSEMBLE + (1234, 5678)
+
 META_COLUMNS = ("ID", "SUBCLASS")
 CVKind = Literal["skf", "sgkf"]
 FoldIndex = tuple[pd.Index, pd.Index]
 
 #: fold 파일·아티팩트 이름에 쓰는 약칭. 기존 `oof_..._group5_...csv` 규약을 잇는다.
-#: 5-fold 를 전제로 굳어 있다 — 열 이름은 `fold_column()` 으로 만든다.
+#: **5-fold 전용이다.** 다른 분할 수로 학습할 때는 `cv_slug(kind, n_splits)` 를 쓴다 —
+#: 이 사전을 그대로 쓰면 10-fold 산출물이 `group5` 라는 이름을 달고 나온다.
 CV_SLUG: dict[str, str] = {"skf": "skf5", "sgkf": "group5"}
 
 #: fold 파일에서 fold 번호가 아닌 열. 순서가 파일의 앞 두 열 순서다.
@@ -406,6 +423,27 @@ def fold_column(kind: CVKind, n_splits: int = 5) -> str:
     if kind not in CV_SLUG:
         raise ValueError(f"알 수 없는 CV 방식: {kind!r} (skf 또는 sgkf)")
     return f"fold_{'skf' if kind == 'skf' else 'group'}{n_splits}"
+
+
+def cv_slug(kind: CVKind, n_splits: int = 5) -> str:
+    """산출물 이름에 들어갈 약칭. **분할 수를 반영한다.**
+
+    `CV_SLUG` 사전은 5-fold 문자열이 박혀 있어서, `--n-splits 10` 으로 학습해도
+    `oof_..._group5_....csv` 라는 이름이 나온다. 그러면 10-fold 예측이 5-fold
+    라이브러리에 조용히 섞인다 — `greedy_blend.py` 는 이름으로 후보를 모으므로
+    그 순간부터 fold 경계가 어긋난 채로 결합이 돌아간다. 파일만 봐서는 못 알아챈다.
+
+    기본값(5)에서는 기존 규약과 **같은 문자열**을 낸다. 지금까지의 산출물 이름은
+    한 글자도 안 바뀐다.
+
+    >>> cv_slug("skf"), cv_slug("sgkf")
+    ('skf5', 'group5')
+    >>> cv_slug("sgkf", 10), cv_slug("skf", 10)
+    ('group10', 'skf10')
+    """
+    if kind not in CV_SLUG:
+        raise ValueError(f"알 수 없는 CV 방식: {kind!r} (skf 또는 sgkf)")
+    return f"{'skf' if kind == 'skf' else 'group'}{n_splits}"
 
 
 def build_fold_frame(

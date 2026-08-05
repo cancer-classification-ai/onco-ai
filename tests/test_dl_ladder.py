@@ -30,7 +30,8 @@ def test_default_ladder_command_uses_model_specific_config_and_tag() -> None:
 
     assert command[0] == sys.executable
     assert command[command.index("--model") + 1] == "mlp"
-    assert command[command.index("--config") + 1].endswith("configs/mlp.yaml")
+    # Path 로 비교한다 — Windows 는 구분자가 `\` 라 문자열 endswith 가 늘 실패한다.
+    assert Path(command[command.index("--config") + 1]).parts[-2:] == ("configs", "mlp.yaml")
     assert command[command.index("--tag") + 1] == "mlp_full_s42"
     assert "--dry-run" not in command
     assert "--no-submission" not in command

@@ -51,11 +51,14 @@ from cancer_hack.metrics import (  # noqa: E402
     validate_prediction_frame_schema,
 )
 from cancer_hack.models_dl import create_dl_model  # noqa: E402
-from cancer_hack.validation import CV_SLUG, fold_column  # noqa: E402
+from cancer_hack.validation import cv_slug, fold_column  # noqa: E402
 
-RAW_DIR = PROJECT_ROOT / "data/raw"
-PROC_DIR = PROJECT_ROOT / "data/process"
-ARTIFACTS = PROJECT_ROOT / "artifacts"
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import (  # noqa: E402
+    LAZY_ARTIFACTS as ARTIFACTS,
+    LAZY_PROCESS as PROC_DIR,
+    LAZY_RAW as RAW_DIR,
+)
 FREQUENCY_BLOCKS = ("freq21", "aatrans9")
 BURDEN_COLUMNS = ("hypermutated_flag", "burden_quantile_bin")
 
@@ -100,11 +103,23 @@ def load_config(path: Path) -> dict[str, object]:
 
 
 def seed_everything(seed: int) -> None:
+    """난수원 넷을 다 고정한다. seed 만으로 같은 결과가 나와야 한다.
+
+    `torch.manual_seed` 만으로는 부족하다. cuDNN 이 실행할 때마다 알고리즘을 자동
+    선택(`benchmark=True`)하면 같은 seed 로도 커널이 달라져 결과가 흔들린다. 이 대회는
+    여러 사람이 각자 뽑은 OOF 를 한데 모아 블렌딩하는 구조라, **같은 코드·같은 seed 가
+    같은 숫자를 내야 한다**는 게 재현 가능성의 최소 조건이다.
+
+    대가는 속도다. `deterministic=True` 는 결정론적 커널만 쓰므로 conv 계열이 느려질 수
+    있다. 이 저장소의 DL 은 MLP·임베딩 위주라 체감 차이가 거의 없다.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -827,7 +842,7 @@ def main() -> None:
         dense_bundle.labels[singleton_mask], predicted_labels[singleton_mask]
     )
     tag = args.tag or args.config.stem
-    stem = f"dl_{args.model}_{tag}_{CV_SLUG[args.cv]}"
+    stem = f"dl_{args.model}_{tag}_{cv_slug(args.cv, args.n_splits)}"
     oof_frame = build_prediction_frame(
         dense_bundle.train_ids, oof, classes, y_true=dense_bundle.labels
     )

@@ -58,7 +58,7 @@
 pip install -r requirements.txt
 ```
 
-### 모델 학습
+### 모델 학습 — GBDT
 
 진입점은 `scripts/train_gbdt.py` 다. 피처셋은 `--configs`(스크립트 안 `CONFIGS` dict),
 하이퍼파라미터는 기본값 → `--params` 프리셋 → `--set` 순으로 겹친다.
@@ -73,7 +73,10 @@ python scripts/train_gbdt.py --model xgb --configs f16 --set n_estimators=500  #
 채택된 값인지 기각된 값인지 적어 뒀다. **기각된 것도 등록돼 있다** — 그 구성으로 낸
 제출본을 재현할 수 있어야 해서다.
 
-DL 모델은 Kaggle에서 한 명령으로 세 단계 ladder를 실행한다.
+### 모델 학습 — 딥러닝
+
+한 명령으로 세 단계 DL ladder 를 실행한다. torch 는 CUDA 빌드가 필요하다
+(`requirements.txt` 상단 주석 참고).
 
 ```bash
 python scripts/run_dl_ladder.py --device cuda --seed 42
@@ -154,6 +157,9 @@ python scripts/run_gene_rule_ladder.py \
   --seed 42
 ```
 
+DL OOF 도 `fold_group5` 를 쓰므로 GBDT OOF 와 그대로 블렌딩된다. fold 파일이 같은지는
+`cancer_hack.provenance.check_fold_fingerprint` 가 확인한다.
+
 ### 예측 생성 · 제출 파일
 
 ```bash
@@ -167,7 +173,35 @@ python scripts/make_submission.py --predictions artifacts/test_predictions/test_
 python scripts/apply_pair_rule.py --submission a.csv b.csv --out-dir artifacts/submissions
 ```
 
-### 제출본 재현 노트북
+### 앞으로의 기본 경로 — `11_full_pipeline.ipynb`
+
+새 결과를 낼 때는 이 노트북 하나만 쓴다. 원본 csv 에서 fold · 피처 파켓 22개 · 모델 ·
+앙상블 · 짝 규칙 · 제출 파일 · 실행 로그까지 전부 만든다. 로직은 노트북에 복사하지 않고
+`scripts/` 와 `src/cancer_hack/` 을 불러 쓴다.
+
+**기존 산출물을 덮어쓰지 않는다.** `cancer_hack.paths.use_run_dirs(RUN_TAG)` 가 출력 위치를
+실행별로 가른다.
+
+```
+data/process_<RUN_TAG>/      이번에 만든 피처 파켓
+artifacts/runs/<RUN_TAG>/    oof · test_predictions · logs · submissions
+  ├── run.json               설정·환경·파켓 지문·단계별 시간·점수 전부
+  └── run.md                 사람이 읽는 요약
+```
+
+원본 `data/raw/*.csv` 는 읽기만 한다. 경로는 환경변수(`ONCO_PROCESS_DIR`·
+`ONCO_ARTIFACTS_DIR`)로 정해지고 **쓰는 시점에** 확인하므로, import 를 끝낸 뒤에 바꿔도
+반영된다.
+
+`data/process/` 와 `artifacts/` 는 **지금까지 낸 제출본의 근거**라 그대로 둔다. 그쪽
+숫자를 다시 확인할 때만 `reset_run_dirs()` 로 되돌린다.
+
+> 왜 새로 만드나 — `features_basic.encode_mutation` 이 바뀌어(`*931*` 같은 동의 정지코돈을
+> 2 가 아니라 1 로 센다) 기존 `mutation_encoded.parquet` 과 어긋난다. `enc3`·`comut`·
+> `lsvd`·`lnmf`·`gmod` 다섯 블록이 그 파일 하나에서 나오므로 **두 쪽 OOF 를 한 블렌드에
+> 넣으면 안 된다.**
+
+### 제출본 재현 노트북 (기존 결과 재검증용)
 
 대회는 코드를 `.ipynb` 로 낸다. 두 노트북이 원본 csv 에서 실제 제출 파일까지 간다.
 

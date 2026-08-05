@@ -52,7 +52,10 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ARTIFACTS = PROJECT_ROOT / "artifacts"
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_ARTIFACTS as ARTIFACTS  # noqa: E402
 TARGET_BLOCKS = ("gtype", "comut", "lsvd", "lnmf", "gmod", "csig")
 CV_SLUG = {"skf": "skf5", "sgkf": "group5"}
 SECONDS_PER_CONFIG = {"catboost": 270, "xgb": 290, "rf": 100, "lgbm": 320}

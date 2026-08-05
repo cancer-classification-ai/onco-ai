@@ -73,6 +73,26 @@ NOTEBOOKS: dict[str, dict] = {
             "PARAM_PRESETS",
         ),
     },
+    "12_greedy_blend_submission.ipynb": {
+        "pairs": {
+            "1층 (짝 규칙 전)": (
+                SUBMISSIONS / "submission_nb12_greedy_g5_dl.csv",
+                SUBMISSIONS / "submission_greedy_g5_dl.csv",
+            ),
+            "2층 (최종)": (
+                SUBMISSIONS / "submission_nb12_greedy_g5_dl_pairrule_m3.csv",
+                CANDIDATES / "submission_greedy_g5_dl_pairrule_m3.csv",
+            ),
+        },
+        "imports": (
+            "greedy_blend.py",
+            "--members-file",
+            "from cancer_hack.pair_rule import",
+            "build_pair_rule",
+            "check_fold_fingerprint",
+            "reset_run_dirs",
+        ),
+    },
 }
 
 CASES = [(nb, label) for nb, spec in NOTEBOOKS.items() for label in spec["pairs"]]
@@ -139,6 +159,41 @@ def test_notebook_states_it_does_not_upload(notebook):
     cells = json.loads((PROJECT_ROOT / "notebooks" / notebook).read_text(encoding="utf-8"))
     text = "\n".join("".join(cell["source"]) for cell in cells["cells"])
     assert "DACON" in text and "직접" in text
+
+
+def test_greedy_library_is_pinned_and_complete():
+    """그리디 결과는 후보가 무엇이었느냐에 통째로 달려 있다.
+
+    `artifacts/oof/` 는 실험할 때마다 늘어난다. 실제로 DL OOF 2개를 더 넣었더니 같은
+    명령이 0.5337 이 아니라 0.5323 을 냈다. 그래서 그때의 목록을 저장소에 박아 둔다.
+    """
+    spec_path = PROJECT_ROOT / "configs" / "greedy_g5_dl_library.json"
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+
+    assert len(spec["library"]) == 98, "라이브러리 크기가 98이 아니다"
+    assert len(set(spec["library"])) == 98, "중복된 멤버가 있다"
+    assert spec["expected_crossfit_macro_f1"] == pytest.approx(0.5336875292416042, abs=0)
+    assert spec["fold_column"] == "fold_group5"
+    # 그리디는 random_state 로 bagging 을 돌린다 — 안 박아 두면 재현이 안 된다.
+    assert spec["random_state"] == 0
+    assert spec["n_rounds"] == 30 and spec["bag_fraction"] == 0.6 and spec["bag_rounds"] == 5
+
+    oof_dir = PROJECT_ROOT / "artifacts" / "oof"
+    if not oof_dir.exists():
+        pytest.skip("artifacts/oof 없음")
+    missing = [n for n in spec["library"] if not (oof_dir / f"oof_{n}.csv").exists()]
+    if missing:
+        pytest.skip(f"OOF 라이브러리 {len(missing)}개 없음 (예: {missing[0][:50]})")
+
+
+def test_greedy_notebook_pins_the_library_instead_of_globbing():
+    """목록을 고정하지 않으면 `artifacts/oof/` 가 늘어날 때마다 답이 바뀐다."""
+    source = _code("12_greedy_blend_submission.ipynb")
+    assert "--members-file" in source
+    assert "greedy_g5_dl_library.json" in source
+    # 기대 점수를 assert 로 박아 둬야 조용히 다른 블렌드가 나오는 걸 잡는다.
+    assert "expected_crossfit_macro_f1" in source
+    assert "assert score == EXPECTED" in source
 
 
 def test_seed_ensemble_notebook_does_not_hardcode_hyperparameters():

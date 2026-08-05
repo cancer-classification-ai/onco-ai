@@ -88,6 +88,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_ARTIFACTS, artifacts_dir  # noqa: E402
 import optuna  # noqa: E402
 
 from cancer_hack.features_basic import BurdenBinner  # noqa: E402
@@ -127,7 +130,7 @@ from train_gbdt import (  # noqa: E402
     log,
 )
 
-ARTIFACTS = PROJECT_ROOT / "artifacts"
+ARTIFACTS = LAZY_ARTIFACTS
 TUNING_DIR = ARTIFACTS / "tuning"
 
 #: `artifacts/logs/xgb_v2_f4r_{skf5,group5}_k500_s42.json` 의 실측값. `--verify` 의 정답지다.
@@ -747,11 +750,8 @@ def run_study(data: Dataset, args) -> None:
 
     # trial 0 으로 기준선을 넣는다. 같은 코드·같은 fold 에서 나온 숫자여야 비교가 된다.
     if not study.trials:
-        study.enqueue_trial(
-            BASELINE_POINTS[args.model],
-            user_attrs={"note": f"{args.config} {args.model} baseline"},
-        )
-        log(f"기준선 {args.config} + {args.model} 파라미터를 trial 0 으로 넣었다.")
+        study.enqueue_trial(BASELINE_POINTS[args.model], user_attrs={"note": "baseline"})
+        log("기준선 f4r 을 trial 0 으로 넣었다.")
 
     log(f"study={args.study}  storage={storage}")
     log(f"분할 {args.cv_list} · 목적함수 {args.objective}")

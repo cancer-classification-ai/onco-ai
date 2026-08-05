@@ -31,14 +31,15 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_RAW, LazyDir, artifacts_dir, raw_dir  # noqa: E402
 from cancer_hack.io import average_probabilities, write_submission  # noqa: E402
 from cancer_hack.metrics import build_prediction_frame, read_prediction_frame  # noqa: E402
 from cancer_hack.pair_rule import DEFAULT_MIN_MUT, build_pair_rule  # noqa: E402
 
-RAW_DIR = PROJECT_ROOT / "data/raw"
-SUBMISSION_DIR = PROJECT_ROOT / "artifacts/submissions"
-
-
+RAW_DIR = LAZY_RAW
+SUBMISSION_DIR = LazyDir(lambda: artifacts_dir() / "submissions")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
