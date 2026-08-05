@@ -461,6 +461,33 @@ CONFIGS: dict[str, dict] = {
         "weight": "balanced",
         "desc": "외부데이터 없이 생성 가능한 비중복 full feature 기준선",
     },
+    # --- LightGBM 독립 스태킹 후보 ---------------------------------------
+    # v002와 다른 오류를 내는 독립 branch가 목적이다. exacttok은 coverage가 낮은
+    # 대조군이므로 넣지 않고, Pair rule은 OOF 비교에 적용하지 않는다.
+    #
+    # NMF 64 / TF-IDF top-K 1000은 CLI 기본값이다. 차원 sweep은 config를 복제하지
+    # 않고 각각 `--latent-components 32|64|128`, `--tfidf-topk 500|1000|2000`으로
+    # 실행한다. 아래 세 config는 기본 구성에서 정확히 한 블록만 제거한 ablation이다.
+    "lgbm_text_nmf": {
+        "blocks": ("domain", "rollup16", "sigtok", "ptok", "lnmf"),
+        "weight": "balanced",
+        "desc": "signature/parsed token + gene NMF LightGBM branch",
+    },
+    "lgbm_text_nmf_no_sigtok": {
+        "blocks": ("domain", "rollup16", "ptok", "lnmf"),
+        "weight": "balanced",
+        "desc": "lgbm_text_nmf - signature TF-IDF",
+    },
+    "lgbm_text_nmf_no_ptok": {
+        "blocks": ("domain", "rollup16", "sigtok", "lnmf"),
+        "weight": "balanced",
+        "desc": "lgbm_text_nmf - parsed token",
+    },
+    "lgbm_text_nmf_no_lnmf": {
+        "blocks": ("domain", "rollup16", "sigtok", "ptok"),
+        "weight": "balanced",
+        "desc": "lgbm_text_nmf - gene NMF",
+    },
     # --- 중복 처리 전략 --------------------------------------------------
     # 서명 TF-IDF 축. f5x 를 대조군으로 함께 둔다 — "서명이 원문 문자열보다 낫다"는
     # 주장이 CV 숫자로 남아야 리뷰가 된다.
@@ -615,9 +642,16 @@ CONFIGS: dict[str, dict] = {
     },
 }
 
-# `--configs all`은 기존 ladder의 의미와 실행 시간을 유지한다. 지도 evidence는
-# 계산비가 크고 아직 experimental이므로 config 이름을 명시해야만 실행한다.
+# `--configs all`은 기존 ladder의 의미와 실행 시간을 유지한다. 지도 evidence와
+# 독립 LightGBM branch는 계산비가 크거나 별도 실험 축이므로 이름을 명시해야만 실행한다.
 EXPERIMENTAL_EVIDENCE_CONFIGS = ("f4r_ebovr", "f4r_ebbnb", "f4r_ebboth")
+LGBM_TEXT_NMF_CONFIGS = (
+    "lgbm_text_nmf",
+    "lgbm_text_nmf_no_sigtok",
+    "lgbm_text_nmf_no_ptok",
+    "lgbm_text_nmf_no_lnmf",
+)
+EXPLICIT_ONLY_CONFIGS = EXPERIMENTAL_EVIDENCE_CONFIGS + LGBM_TEXT_NMF_CONFIGS
 
 #: 모델별 기본 하이퍼파라미터.
 #:
@@ -1229,14 +1263,24 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
     evidence_blocks = [b for b in spec["blocks"] if b in EVIDENCE_BLOCKS]
     topk = args.topk if gene_blocks else None
     k_slug = f"k{topk}" if topk else "kall"
-    # sparse 축을 stem 에 안 넣으면 --sparse-topk 를 바꿔 두 번 돌릴 때 두 번째가
+    tfidf_topk, parsed_topk = _resolve_sparse_topks(args)
+    has_tfidf = any(block != "ptok" for block in sparse_blocks)
+    has_parsed = "ptok" in sparse_blocks
+    # sparse 축을 stem 에 안 넣으면 top-K 를 바꿔 두 번 돌릴 때 두 번째가
     # 첫 번째 로그를 조용히 덮는다. write_matrix 가 디스크를 재스캔하므로 비교표까지
-    # 반쪽이 된다.
-    sparse_slug = (
-        f"_sp{args.sparse_topk}m{args.tfidf_min_df}" if sparse_blocks else ""
-    )
-    if "ptok" in sparse_blocks:
-        sparse_slug += f"p{args.parsed_min_df}"
+    # 반쪽이 된다. 두 top-K가 같을 때는 과거 stem을 그대로 보존한다.
+    if not sparse_blocks:
+        sparse_slug = ""
+    elif has_tfidf and has_parsed and tfidf_topk != parsed_topk:
+        sparse_slug = (
+            f"_sp{tfidf_topk}x{parsed_topk}m{args.tfidf_min_df}"
+            f"p{args.parsed_min_df}"
+        )
+    else:
+        effective_topk = tfidf_topk if has_tfidf else parsed_topk
+        sparse_slug = f"_sp{effective_topk}m{args.tfidf_min_df}"
+        if has_parsed:
+            sparse_slug += f"p{args.parsed_min_df}"
     # 공변이 축도 같은 이유로 slug 가 필요하다. 파라미터가 11개라 전부 펴면 파일명을
     # 못 읽으니, 사다리로 실제로 바꾸는 4축(topk·pool·value·mode)만 노출하고 나머지는
     # digest 하나로 접는다. 전체 dict 는 결과 JSON 의 comut.params 에 그대로 남아서
@@ -1414,7 +1458,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
                         train_index,
                         data.y[train_index],
                         prefix="count__ptok__",
-                        topk=args.sparse_topk,
+                        topk=parsed_topk,
                         min_df=args.parsed_min_df,
                     )
                 )
@@ -1425,7 +1469,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
                     train_index,
                     data.y[train_index],
                     prefix=f"tfidf__{block}__",
-                    topk=args.sparse_topk,
+                    topk=tfidf_topk,
                     min_df=args.tfidf_min_df,
                 )
             selected.setdefault(block, {})[str(fold)] = sparse_names
@@ -1646,7 +1690,11 @@ def run_config(data: Dataset, *, config: str, cv: str, args, fit_model=None) -> 
                 "blocks": sparse_blocks,
                 "min_df": args.tfidf_min_df,
                 "parsed_min_df": args.parsed_min_df,
-                "topk": args.sparse_topk,
+                # `topk`는 과거 로그 소비자 호환용이다. 두 sparse family를 함께
+                # 쓸 때는 아래 명시 필드를 읽어야 어느 축을 바꿨는지 알 수 있다.
+                "topk": tfidf_topk if has_tfidf else parsed_topk,
+                "tfidf_topk": tfidf_topk if has_tfidf else None,
+                "parsed_topk": parsed_topk if has_parsed else None,
             }
             if sparse_blocks
             else None
@@ -1873,6 +1921,22 @@ def _resolve_latent_methods(latent_blocks: list[str], default_method: str) -> li
     return ["nmf" if block == "lnmf" else default_method for block in latent_blocks]
 
 
+def _resolve_sparse_topks(args) -> tuple[int, int]:
+    """TF-IDF와 parsed-token의 실제 top-K를 독립적으로 정한다.
+
+    과거 `--sparse-topk` 하나가 두 블록을 함께 움직였으므로 그 동작은 기본값으로
+    보존한다. 독립 실험에서는 family별 override만 주어 다른 family를 고정한다.
+    """
+    shared = int(args.sparse_topk)
+    tfidf = getattr(args, "tfidf_topk", None)
+    parsed = getattr(args, "parsed_topk", None)
+    tfidf = shared if tfidf is None else int(tfidf)
+    parsed = shared if parsed is None else int(parsed)
+    if tfidf < 1 or parsed < 1:
+        raise ValueError(f"sparse top-K는 1 이상이어야 한다: tfidf={tfidf}, parsed={parsed}")
+    return tfidf, parsed
+
+
 def _comut_slug(comut_kwargs: dict, *, manual: bool) -> str:
     """공변이 파라미터 -> stem 슬러그. `comut_kwargs` 가 비어 있으면(블록 없음) `""`.
 
@@ -2003,7 +2067,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--topk", type=int, default=500, help="유전자 블록 chi2 상위 K")
     # 유전자 블록의 K 와 분리한다. --topk 를 건드리면 f3/f4 기준선과 비교가 안 된다.
     parser.add_argument(
-        "--sparse-topk", type=int, default=1000, help="TF-IDF 블록 chi2 상위 K"
+        "--sparse-topk",
+        type=int,
+        default=1000,
+        help="sparse 블록 공통 chi2 상위 K (family별 override가 없을 때)",
+    )
+    parser.add_argument(
+        "--tfidf-topk",
+        type=int,
+        default=None,
+        help="sigtok/exacttok TF-IDF 전용 top-K. 생략하면 --sparse-topk",
+    )
+    parser.add_argument(
+        "--parsed-topk",
+        type=int,
+        default=None,
+        help="ptok 전용 top-K. 생략하면 --sparse-topk",
     )
     parser.add_argument(
         "--tfidf-min-df", type=int, default=3, help="TF-IDF 최소 문서 빈도"
@@ -2238,7 +2317,7 @@ def main() -> None:
     resolve_model_params(args)  # 조기 검증 — Dataset 생성(수십 초) 전에 죽는다
 
     configs = (
-        [c for c in CONFIGS if c not in EXPERIMENTAL_EVIDENCE_CONFIGS]
+        [c for c in CONFIGS if c not in EXPLICIT_ONLY_CONFIGS]
         if args.configs == "all"
         else [c.strip() for c in args.configs.split(",") if c.strip()]
     )

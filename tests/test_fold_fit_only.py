@@ -1137,6 +1137,49 @@ def test_full_all_contains_every_production_feature_family_without_controls():
     assert blocks.isdisjoint({"rollup", "gec", "exacttok", "lnmf"})
 
 
+def test_lgbm_text_nmf_configs_form_single_block_ablation_ladder():
+    base = ("domain", "rollup16", "sigtok", "ptok", "lnmf")
+    expected = {
+        "lgbm_text_nmf_no_sigtok": "sigtok",
+        "lgbm_text_nmf_no_ptok": "ptok",
+        "lgbm_text_nmf_no_lnmf": "lnmf",
+    }
+
+    assert train_gbdt.CONFIGS["lgbm_text_nmf"]["blocks"] == base
+    assert train_gbdt.CONFIGS["lgbm_text_nmf"]["weight"] == "balanced"
+    assert "exacttok" not in base
+
+    for config, removed in expected.items():
+        spec = train_gbdt.CONFIGS[config]
+        assert spec["blocks"] == tuple(block for block in base if block != removed)
+        assert spec["weight"] == "balanced"
+
+
+def test_lgbm_text_nmf_configs_require_explicit_selection():
+    assert set(train_gbdt.LGBM_TEXT_NMF_CONFIGS) == {
+        "lgbm_text_nmf",
+        "lgbm_text_nmf_no_sigtok",
+        "lgbm_text_nmf_no_ptok",
+        "lgbm_text_nmf_no_lnmf",
+    }
+    assert set(train_gbdt.LGBM_TEXT_NMF_CONFIGS) <= set(
+        train_gbdt.EXPLICIT_ONLY_CONFIGS
+    )
+
+
+def test_sparse_topk_family_override_changes_only_requested_axis():
+    parser = train_gbdt.build_parser()
+
+    default = parser.parse_args([])
+    assert train_gbdt._resolve_sparse_topks(default) == (1000, 1000)
+
+    tfidf_only = parser.parse_args(["--tfidf-topk", "500"])
+    assert train_gbdt._resolve_sparse_topks(tfidf_only) == (500, 1000)
+
+    parsed_only = parser.parse_args(["--parsed-topk", "2000"])
+    assert train_gbdt._resolve_sparse_topks(parsed_only) == (1000, 2000)
+
+
 def test_frequency_fold_builder_does_not_fit_valid_or_test_rows():
     raw_train = pd.DataFrame(
         {
