@@ -17,7 +17,7 @@ def _load_train_dl_module():
     return module
 
 
-def test_full_feature_configs_enable_frequency_and_latent() -> None:
+def test_full_feature_configs_enable_frequency_and_both_latent_methods() -> None:
     root = Path(__file__).resolve().parents[1]
     for name in (
         "mlp_full_features.yaml",

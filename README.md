@@ -95,6 +95,51 @@ python scripts/run_dl_ladder.py --models set_encoder --device cuda --seed 42
 python scripts/run_dl_ladder.py --models hybrid --device cuda --seed 42
 ```
 
+Full-feature 설정은 `freq21`과 `aatrans9`를 항상 사용한다. 중복 YAML을 만들지 않고
+`--latent-methods`로 SVD/NMF를 선택한다.
+
+```bash
+# 1) 권장 기준선: frequency + SVD
+python scripts/train_dl.py \
+  --model mlp \
+  --config configs/mlp_full_features.yaml \
+  --latent-methods svd \
+  --cv skf --device cuda --seed 42 --tag mlp_full_svd_s42
+
+# 2) frequency + NMF
+python scripts/train_dl.py \
+  --model mlp \
+  --config configs/mlp_full_features.yaml \
+  --latent-methods nmf \
+  --cv skf --device cuda --seed 42 --tag mlp_full_nmf_s42
+
+# 3) frequency + SVD + NMF
+python scripts/train_dl.py \
+  --model mlp \
+  --config configs/mlp_full_features.yaml \
+  --latent-methods svd nmf \
+  --cv skf --device cuda --seed 42 --tag mlp_full_svd_nmf_s42
+```
+
+같은 `frequency + SVD` 피처를 고정하고 weighted CE, smoothing, Focal Loss,
+완화 class weight를 한 번에 비교하려면 loss ladder를 실행한다. A-D를 먼저 모두
+학습한 뒤 C/D 중 OOF Macro F1이 가장 높은 설정에 smoothing 0.02를 적용한 E를
+자동 실행한다.
+
+```bash
+python scripts/run_dl_loss_ladder.py \
+  --model mlp \
+  --base-config configs/mlp_full_features.yaml \
+  --latent-methods svd \
+  --device cuda \
+  --seed 42
+```
+
+중단 후 이어서 돌릴 때는 `--skip-existing`을 추가한다. 최종 비교표는
+`artifacts/comparisons/dl_loss_ladder_mlp_skf5_s42.{csv,md}`에 저장되며 OOF
+Macro F1, singleton Macro F1, fold 표준편차, 희귀 5개 클래스 Macro F1을 함께
+보여준다. 이 ladder는 비교 실험이라 submission은 만들지 않는다.
+
 Gene Set Encoder의 유전자별 count·중복·유형·위치 통계를 누적 비교하려면 별도
 ablation ladder를 실행한다.
 
