@@ -143,8 +143,15 @@ BASELINE_CV = {
 }
 BASELINE_N_FEATURES = 1055
 
-#: 탐색 대상이 아닌 고정값. 기준선과 같아야 한다.
-FIXED_PARAMS = {"objective": "multi:softprob", "tree_method": "hist"}
+#: 탐색 대상이 아닌 고정값. 기준선과 같아야 한다. 모델별로 다르다.
+FIXED_PARAMS_BY_MODEL = {
+    "xgb": {"objective": "multi:softprob", "tree_method": "hist"},
+    "catboost": {},
+    "rf": {},
+}
+
+#: `--model` 기본값이 xgb 라 기존 호출은 그대로 돈다.
+FIXED_PARAMS = FIXED_PARAMS_BY_MODEL["xgb"]
 
 # train_gbdt.py CLI 기본값과 바이트 단위로 같은 피처 설정. Optuna는 모델
 # 하이퍼파라미터만 탐색하므로 이 축들은 고정한다. 최종 재실행 명령도 기본값을
@@ -195,7 +202,7 @@ FOLD_FEATURE_DEFAULTS = {
 }
 
 
-def suggest_params(trial: optuna.Trial) -> dict:
+def _suggest_xgb(trial: optuna.Trial) -> dict:
     """탐색 공간. 기준선을 안쪽에 품도록 잡았다.
 
     `reg_alpha`·`gamma` 는 기준선이 0 이라 log 스케일을 쓰지 않는다. log 로 잡으면
@@ -215,21 +222,86 @@ def suggest_params(trial: optuna.Trial) -> dict:
     }
 
 
-#: 기준선 f4r 을 탐색 공간의 좌표로 옮긴 것. `MODEL_PARAMS["xgb"]` 에 없는 축은
-#: XGBoost 기본값(0/1)을 적는다. trial 0 으로 넣어 "기준선보다 나은가" 를 같은
-#: 자로 재게 만든다.
-BASELINE_POINT = {
-    "n_estimators": 300,
-    "learning_rate": 0.1,
-    "max_depth": 6,
-    "min_child_weight": 1,
-    "reg_lambda": 1.0,
-    "reg_alpha": 0.0,
-    "gamma": 0.0,
-    "subsample": 0.8,
-    "colsample_bytree": 0.5,
-    "colsample_bylevel": 1.0,
+def _suggest_catboost(trial: optuna.Trial) -> dict:
+    """CatBoost 탐색 공간. 기준선(iterations=1000, lr=0.05, depth=6)을 품는다.
+
+    `rsm` 은 넣지 않는다 — GPU 에서 CatBoost 가 지원하지 않아 `models_gbdt._build()`
+    가 조용히 빼 버린다(`research/04` §4 경고). 탐색축으로 넣으면 로그에 값이 찍히는데
+    실제로는 안 걸리는 유령 축이 된다.
+
+    `bagging_temperature` 도 안 된다. 래퍼 기본이 `bootstrap_type="Bernoulli"` 인데
+    그 값은 Bayesian bootstrap 전용이라 CatBoost 가 예외를 던진다. 같은 자리의
+    Bernoulli 용 축이 `subsample` 이다.
+    """
+    return {
+        "iterations": trial.suggest_int("iterations", 400, 1600, step=100),
+        "learning_rate": trial.suggest_float("learning_rate", 0.02, 0.20, log=True),
+        "depth": trial.suggest_int("depth", 4, 9),
+        "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1.0, 30.0, log=True),
+        "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+    }
+
+
+def _suggest_rf(trial: optuna.Trial) -> dict:
+    """RandomForest 탐색 공간.
+
+    `models_gbdt.RFModel` 주석이 "튜닝 이력이 없다" 고 적어 둔 대로 이 모델은 한 번도
+    안 뒤졌다. 대신 앙상블 지분이 0.10 이라 최종 효과도 그만큼 작다.
+    """
+    return {
+        "n_estimators": trial.suggest_int("n_estimators", 300, 1200, step=100),
+        "max_features": trial.suggest_categorical("max_features", ["sqrt", "log2", 0.1, 0.3]),
+        "min_samples_leaf": trial.suggest_int("min_samples_leaf", 1, 8),
+        "min_samples_split": trial.suggest_int("min_samples_split", 2, 12),
+        "max_depth": trial.suggest_categorical("max_depth", [None, 12, 20, 30]),
+    }
+
+
+SUGGEST_BY_MODEL = {
+    "xgb": _suggest_xgb,
+    "catboost": _suggest_catboost,
+    "rf": _suggest_rf,
 }
+
+
+def suggest_params(trial: optuna.Trial, model: str = "xgb") -> dict:
+    return SUGGEST_BY_MODEL[model](trial)
+
+
+#: 기준선을 탐색 공간의 좌표로 옮긴 것. `MODEL_PARAMS` 에 없는 축은 라이브러리
+#: 기본값을 적는다. trial 0 으로 넣어 "기준선보다 나은가" 를 같은 자로 재게 만든다.
+BASELINE_POINTS = {
+    "xgb": {
+        "n_estimators": 300,
+        "learning_rate": 0.1,
+        "max_depth": 6,
+        "min_child_weight": 1,
+        "reg_lambda": 1.0,
+        "reg_alpha": 0.0,
+        "gamma": 0.0,
+        "subsample": 0.8,
+        "colsample_bytree": 0.5,
+        "colsample_bylevel": 1.0,
+    },
+    # `l2_leaf_reg`·`subsample` 은 `MODEL_PARAMS["catboost"]` 에 없어 래퍼
+    # `CatBoostModel.default_params()` 값(5.0 / 0.8)이 실제로 쓰인다. 그걸 적는다.
+    "catboost": {
+        "iterations": 1000,
+        "learning_rate": 0.05,
+        "depth": 6,
+        "l2_leaf_reg": 5.0,
+        "subsample": 0.8,
+    },
+    "rf": {
+        "n_estimators": 500,
+        "max_features": "sqrt",
+        "min_samples_leaf": 1,
+        "min_samples_split": 2,
+        "max_depth": None,
+    },
+}
+
+BASELINE_POINT = BASELINE_POINTS["xgb"]
 
 
 # ---------------------------------------------------------------- CV
@@ -406,10 +478,12 @@ def cross_validate(
     n_splits: int,
     seed: int,
     use_gpu,
+    model_name: str = "xgb",
     track_train: bool = True,
     trial: optuna.Trial | None = None,
     verbose: bool = False,
     prune_state: dict | None = None,
+    threads: int | None = None,
 ) -> dict:
     """선택 config의 fold 루프. `train_gbdt.run_config` 와 학습 경로가 같다.
 
@@ -449,7 +523,8 @@ def cross_validate(
         weight = resolve_sample_weight(
             spec["weight"], data.y[train_index], group_keys[train_index]
         )
-        model = _fit(params, x_train[train_index], data.y[train_index], weight, seed, use_gpu)
+        model = _fit(params, x_train[train_index], data.y[train_index], weight, seed, use_gpu,
+                     model_name=model_name, threads=threads)
 
         if list(model.classes_) != list(data.classes):
             raise RuntimeError(f"fold {fold} 의 클래스 순서가 전체와 다르다")
@@ -524,10 +599,12 @@ def evaluate(data: Dataset, params: dict, args, *, trial=None, verbose=False) ->
             n_splits=args.n_splits,
             seed=args.seed,
             use_gpu=args.device,
+            model_name=getattr(args, "model", "xgb"),
             track_train=not args.no_track_train,
             trial=trial,
             verbose=verbose,
             prune_state=prune_state,
+            threads=getattr(args, "threads", None),
         )
         per_cv[cv] = result
         for key, value in result.items():
@@ -548,7 +625,23 @@ def evaluate(data: Dataset, params: dict, args, *, trial=None, verbose=False) ->
     if "skf" in scores and "sgkf" in scores:
         out["sgkf_minus_skf"] = float(scores["sgkf"] - scores["skf"])
 
-    out["objective_value"] = _objective_value(scores, args.objective)
+    raw_objective = _objective_value(scores, args.objective)
+    out["objective_raw"] = raw_objective
+
+    # 과적합 페널티. CV 만 최대화하면 train 을 더 외우는 설정이 뽑힐 수 있다 —
+    # `research/10` §6 에서 실제로 skf 를 올리고 sgkf 를 깎는 trial 이 17개였다.
+    # 격차가 `--gap-floor` 를 넘는 만큼만 벌해서, 같은 CV 면 덜 외우는 쪽을 고르게 한다.
+    penalty = 0.0
+    lam = float(getattr(args, "gap_penalty", 0.0) or 0.0)
+    if lam > 0:
+        gaps = [out[f"{cv}_generalization_gap"] for cv in per_cv
+                if out.get(f"{cv}_generalization_gap") is not None]
+        if gaps:
+            excess = max(0.0, float(np.mean(gaps)) - float(getattr(args, "gap_floor", 0.20)))
+            penalty = lam * excess
+            out["gap_mean"] = float(np.mean(gaps))
+            out["gap_penalty_applied"] = penalty
+    out["objective_value"] = raw_objective - penalty
     return out
 
 
@@ -566,17 +659,19 @@ def _objective_value(scores: dict[str, float], objective: str) -> float:
     return float(scores[objective])
 
 
-def _fit(params, x, y, weight, seed, use_gpu):
+def _fit(params, x, y, weight, seed, use_gpu, model_name="xgb", threads=None):
     """GPU 로 학습하고 실패하면 CPU 로 재시도. `train_gbdt.fit_with_fallback` 과 같다."""
-    full = {**FIXED_PARAMS, **params}
+    full = {**FIXED_PARAMS_BY_MODEL.get(model_name, {}), **params}
+    if threads is not None:
+        full.setdefault("n_jobs", threads)   # catboost 는 _normalize 가 thread_count 로 바꾼다
     if use_gpu is not False:
         try:
-            model = create_model("xgb", use_gpu=use_gpu, random_state=seed, **full)
+            model = create_model(model_name, use_gpu=use_gpu, random_state=seed, **full)
             model.fit(x, y, sample_weight=weight)
             return model
         except Exception as error:  # noqa: BLE001
             log(f"    GPU 실패 -> CPU 재시도: {type(error).__name__}: {str(error)[:120]}")
-    model = create_model("xgb", use_gpu=False, random_state=seed, **full)
+    model = create_model(model_name, use_gpu=False, random_state=seed, **full)
     model.fit(x, y, sample_weight=weight)
     return model
 
@@ -588,13 +683,15 @@ def verify(data: Dataset, args) -> int:
     이게 통과해야 탐색 결과를 믿을 수 있다. 재현이 안 되면 파이프라인이 어딘가
     달라진 것이고, 그 위에서 고른 최적값은 f4r 의 최적값이 아니다.
     """
-    if args.config != "f4r":
-        raise SystemExit(
-            "--verify 정답지는 기존 f4r 실측값뿐이다. 다른 config는 정답지가 없어 "
-            "재현 여부를 판정할 수 없다."
-        )
+    # `BASELINE_CV`·`BASELINE_N_FEATURES` 는 f4r · xgb 실측값이다. 다른 조합에서는
+    # 정답지가 없으므로 통과/실패를 판정할 수 없다 — 조용히 FAIL 을 뱉는 대신 막는다.
+    if args.model != "xgb" or args.config != "f4r":
+        log(f"[skip] --verify 는 f4r · xgb 전용이다 "
+            f"(지금 --model {args.model} --config {args.config}). "
+            f"다른 조합은 정답지가 없어 판정할 수 없다.")
+        return 0
     log(f"=== 재현 검증: 기준선 파라미터로 f4r {'/'.join(args.cv_list)} 를 다시 돈다 ===")
-    baseline = dict(MODEL_PARAMS["xgb"])
+    baseline = dict(MODEL_PARAMS[args.model])
     log(f"파라미터: {baseline}")
     result = evaluate(data, baseline, args, verbose=True)
 
@@ -651,17 +748,17 @@ def run_study(data: Dataset, args) -> None:
     # trial 0 으로 기준선을 넣는다. 같은 코드·같은 fold 에서 나온 숫자여야 비교가 된다.
     if not study.trials:
         study.enqueue_trial(
-            BASELINE_POINT,
-            user_attrs={"note": f"{args.config} default-parameter baseline"},
+            BASELINE_POINTS[args.model],
+            user_attrs={"note": f"{args.config} {args.model} baseline"},
         )
-        log(f"기준선 {args.config} + 기본 파라미터를 trial 0 으로 넣었다.")
+        log(f"기준선 {args.config} + {args.model} 파라미터를 trial 0 으로 넣었다.")
 
     log(f"study={args.study}  storage={storage}")
     log(f"분할 {args.cv_list} · 목적함수 {args.objective}")
     log(f"기존 trial {len(study.trials)}개 · 이번에 {args.n_trials}개 추가")
 
     def objective(trial: optuna.Trial) -> float:
-        params = suggest_params(trial)
+        params = suggest_params(trial, args.model)
         result = evaluate(data, params, args, trial=trial)
         for key, value in result.items():
             trial.set_user_attr(key, value)
@@ -685,7 +782,7 @@ def report(study: optuna.Study, args) -> None:
         log("완료된 trial 이 없다.")
         return
 
-    baseline = next((t for t in done if t.params == BASELINE_POINT), None)
+    baseline = next((t for t in done if t.params == BASELINE_POINTS[args.model]), None)
     if baseline is None:
         raise SystemExit(
             "기준선 trial 이 study 에 없다. 비교 기준이 없으면 표가 거짓말을 한다 — "
@@ -821,7 +918,8 @@ def _train_command(params: dict, args) -> str:
     sets = " ".join(f"--set {k}={v!r}" if isinstance(v, float) else f"--set {k}={v}"
                     for k, v in sorted(params.items()))
     return (
-        f".\\.venv\\Scripts\\python.exe scripts\\train_gbdt.py --model xgb --tag opt "
+        f".\\.venv\\Scripts\\python.exe scripts\\train_gbdt.py "
+        f"--model {getattr(args, 'model', 'xgb')} --tag opt "
         f"--configs {args.config} --cv all --topk {args.topk} --seed {args.seed} {sets}"
     )
 
@@ -840,6 +938,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--objective", default=None,
         help="최대화할 값: mean / min / skf / sgkf. 기본값은 both 면 mean, 아니면 그 분할",
     )
+    parser.add_argument(
+        "--model", default="xgb", choices=["xgb", "catboost", "rf"],
+        help="탐색할 모델. 탐색 공간·기준선·고정값이 모델마다 다르다",
+    )
+    parser.add_argument(
+        "--gap-penalty", type=float, default=0.0,
+        help="일반화 격차 페널티 계수. 목적값에서 `계수 x max(0, 격차 - --gap-floor)` 를 뺀다. "
+        "0 이면 끄기(기존 동작). CV 만 최대화하면 train 을 더 외우는 쪽이 뽑힐 수 있다",
+    )
+    parser.add_argument(
+        "--gap-floor", type=float, default=0.20,
+        help="이 값까지의 격차는 벌하지 않는다. CatBoost 실측 격차가 0.18 이라 그 근처로 뒀다",
+    )
     parser.add_argument("--topk", type=int, default=500)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42, help="모델 시드")
@@ -851,6 +962,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="study 이름 = db 파일명. 기본: {config}_xgb_{cv}",
     )
     parser.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
+    parser.add_argument(
+        "--threads", type=int, default=None, metavar="N",
+        help="CPU 스레드 수 (기본 전 코어). GPU 잡과 CPU 잡을 동시에 돌릴 때 나눠 쓴다",
+    )
     parser.add_argument("--no-track-train", action="store_true",
                         help="train 점수를 안 잰다. 빨라지지만 격차를 못 본다")
     parser.add_argument("--verify", action="store_true",

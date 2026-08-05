@@ -60,7 +60,20 @@ pip install -r requirements.txt
 
 ### 모델 학습
 
-Kaggle에서는 한 명령으로 세 단계 DL ladder를 실행한다.
+진입점은 `scripts/train_gbdt.py` 다. 피처셋은 `--configs`(스크립트 안 `CONFIGS` dict),
+하이퍼파라미터는 기본값 → `--params` 프리셋 → `--set` 순으로 겹친다.
+
+```bash
+python scripts/train_gbdt.py --model catboost --configs f16 --cv sgkf --seed 42
+python scripts/train_gbdt.py --model catboost --configs f16 --params cbopt10   # 이름 붙은 프리셋
+python scripts/train_gbdt.py --model xgb --configs f16 --set n_estimators=500  # 한 축만 덮어쓰기
+```
+
+`--params` 로 고를 수 있는 프리셋은 `PARAM_PRESETS` 에 있고, 각 항목의 `desc` 에 그게
+채택된 값인지 기각된 값인지 적어 뒀다. **기각된 것도 등록돼 있다** — 그 구성으로 낸
+제출본을 재현할 수 있어야 해서다.
+
+DL 모델은 Kaggle에서 한 명령으로 세 단계 ladder를 실행한다.
 
 ```bash
 python scripts/run_dl_ladder.py --device cuda --seed 42
@@ -96,10 +109,38 @@ python scripts/run_gene_rule_ladder.py \
   --seed 42
 ```
 
-### 예측 생성
+### 예측 생성 · 제출 파일
 
 ```bash
-python src/predict.py
+# 확률 파일에서 제출 csv (여러 개 주면 평균)
+python scripts/make_submission.py --predictions artifacts/test_predictions/test_X.csv
+
+# 짝 라벨 규칙까지 한 번에 (LB +0.0829, docs/pair_rule.md)
+python scripts/make_submission.py --predictions artifacts/test_predictions/test_X.csv --pair-rule
+
+# 이미 만들어 둔 제출 csv 에 규칙만 얹기 (여러 개 한 번에)
+python scripts/apply_pair_rule.py --submission a.csv b.csv --out-dir artifacts/submissions
+```
+
+### 제출본 재현 노트북
+
+대회는 코드를 `.ipynb` 로 낸다. 두 노트북이 원본 csv 에서 실제 제출 파일까지 간다.
+
+| 노트북 | 구성 | LB |
+|---|---|---|
+| `notebooks/09_final_submission.ipynb` | f16 · seed 42 · 기본 파라미터 + 짝 규칙 | **0.4818** (최고) |
+| `notebooks/10_seed_ensemble_submission.ipynb` | f16 · seed 42/7/2024 · `cbopt10` + 짝 규칙 | 0.4725 |
+
+10 은 기각된 구성이지만 재현은 되어야 한다 — 재현이 안 되면 그 판정 자체를 못 믿는다.
+`REUSE_CACHE = True` 면 캐시된 예측으로 결합부터만 다시 해 몇 초에 끝난다.
+
+`tests/test_final_notebook_reproduces.py` 가 두 노트북의 산출물을 실제 제출 파일과
+전 행 대조한다. **노트북을 고쳤으면 반드시 다시 실행한다** — 안 그러면 이 테스트가 낡은
+산출물을 보고 통과한다.
+
+```bash
+python -m nbconvert --to notebook --execute --inplace \
+    --ExecutePreprocessor.timeout=3600 notebooks/09_final_submission.ipynb
 ```
 
 ### 하이퍼파라미터 탐색

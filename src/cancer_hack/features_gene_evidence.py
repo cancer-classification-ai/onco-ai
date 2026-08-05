@@ -187,4 +187,3 @@ def build_fold_gene_evidence_block(
     if fold.test is None:
         raise AssertionError("GBDT block adapter requires test features")
     return list(fold.feature_names), train_out, fold.test, diagnostics
-

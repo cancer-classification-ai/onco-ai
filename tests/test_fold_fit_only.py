@@ -933,6 +933,54 @@ def test_latent_slug_distinguishes_all_params():
         seen.add(slug)
 
 
+def test_latent_method_is_resolved_per_block():
+    """`lnmf` 는 자기 이름으로 방식을 정하고 나머지는 `--latent-method` 를 따른다.
+
+    config 전체에 방식 하나만 정하면 `lsvd`·`lnmf`가 같은 config 에 있을 때 둘 다
+    nmf 로 돌아간다 — 실제로 있었던 버그다.
+    """
+    assert train_gbdt._resolve_latent_methods(["lsvd"], "svd") == ["svd"]
+    assert train_gbdt._resolve_latent_methods(["lnmf"], "svd") == ["nmf"]
+    assert train_gbdt._resolve_latent_methods(["lsvd", "lnmf"], "svd") == ["svd", "nmf"]
+    assert train_gbdt._resolve_latent_methods(["lnmf", "lsvd"], "svd") == ["nmf", "svd"]
+
+
+def test_latent_slug_is_byte_identical_for_single_block():
+    """단일 블록 슬러그가 디스크의 기존 로그 파일명과 문자 그대로 같아야 한다.
+
+    `xgb_lat_f4rl_..._lt64svdl25beb91_...json` · `xgb_lat_f4rn_..._lt64nmfl2bb3575_...json`
+    이 이미 쌓여 있다. 잠재 방식을 블록별로 다시 푸는 리팩터 뒤에도 이 문자열이
+    그대로 나와야 비교표가 안 끊긴다.
+    """
+    base = dict(
+        n_components=64, row_norm="l2", value="proj", mode="mutated",
+        gene_weight="none", min_gene_support=5, random_state=0,
+    )
+    svd_kwargs = {**base, "method": "".join(dict.fromkeys(
+        train_gbdt._resolve_latent_methods(["lsvd"], "svd")
+    ))}
+    nmf_kwargs = {**base, "method": "".join(dict.fromkeys(
+        train_gbdt._resolve_latent_methods(["lnmf"], "svd")
+    ))}
+    assert train_gbdt._latent_slug(svd_kwargs) == "_lt64svdl25beb91"
+    assert train_gbdt._latent_slug(nmf_kwargs) == "_lt64nmfl2bb3575"
+
+
+def test_latent_slug_distinguishes_combined_methods():
+    """svd·nmf·svdnmf 세 슬러그가 서로 달라야 한다 — 조합 config 가 단일 config 를 안 덮는다."""
+    base = dict(
+        n_components=64, row_norm="l2", value="proj", mode="mutated",
+        gene_weight="none", min_gene_support=5, random_state=0,
+    )
+    slugs = set()
+    for blocks in (["lsvd"], ["lnmf"], ["lsvd", "lnmf"]):
+        methods = train_gbdt._resolve_latent_methods(blocks, "svd")
+        kwargs = {**base, "method": "".join(dict.fromkeys(methods))}
+        slug = train_gbdt._latent_slug(kwargs)
+        assert slug not in slugs, f"충돌: {blocks} -> {slug}"
+        slugs.add(slug)
+
+
 def test_module_slug_distinguishes_all_params():
     base = dict(
         value="share",
@@ -1012,6 +1060,49 @@ def test_every_config_block_belongs_to_a_known_family():
         for block in spec["blocks"]:
             assert block in known, f"{config} 의 {block} 이 소스 표에 없다"
             assert block in train_gbdt.BLOCK_DESC, f"{block} 설명이 없다"
+
+
+def test_f11_uses_only_cached_blocks():
+    """gtype·parsed19·burden8·aa9·ptok 은 test 쪽 parquet 이 없어 즉시 멈춘다.
+
+    앙상블 입력용 config 는 지금 캐시된 것만 써야 `--configs f11` 이 바로 돈다.
+    """
+    uncached = {"gtype", "parsed19", "burden8", "aa9", "ptok"}
+    assert not (set(train_gbdt.CONFIGS["f11"]["blocks"]) & uncached)
+
+
+def test_f11_covers_every_cached_block():
+    """11개가 다 들어 있어야 한다 — 누가 하나 빼면 앙상블 입력 열이 조용히 줄어든다."""
+    expected = {
+        "domain", "rollup16", "enc3", "gec", "sigtok", "exacttok",
+        "comut", "lsvd", "lnmf", "gmod", "csig",
+    }
+    assert set(train_gbdt.CONFIGS["f11"]["blocks"]) == expected
+
+
+def test_f16_matches_the_shared_teammate_config():
+    """팀원 `repo_allfeat` 재현용이라 블록 구성이 그쪽 config.json 과 같아야 한다.
+
+    스태킹 멤버로 쓰려면 "같은 피처를 우리 fold 로 다시 뽑은 것"이어야 하는데,
+    블록이 하나라도 어긋나면 그 전제가 조용히 깨진다. 순서까지 고정한다 — 열 순서가
+    바뀌면 CatBoost 의 `rsm`(열 샘플링)이 다른 열을 뽑는다.
+    """
+    shared = (
+        "domain", "rollup", "enc3", "gec", "gtype", "parsed19", "burden8",
+        "aa9", "sigtok", "exacttok", "ptok", "comut", "lsvd", "lnmf",
+        "gmod", "csig",
+    )
+    assert train_gbdt.CONFIGS["f16"]["blocks"] == shared
+
+
+def test_f16_runs_both_latent_methods():
+    """팀원 실행은 lsvd·lnmf 동거 버그로 NMF 만 두 번 돌았다(슬러그 lt64nmf...).
+
+    고쳐진 코드에서는 SVD 와 NMF 가 각각 돌아야 한다. 여기가 되돌아가면 f16 이
+    재현하려던 16블록이 실제로는 15블록 + 중복 64열이 된다.
+    """
+    latent = [b for b in train_gbdt.CONFIGS["f16"]["blocks"] if b in train_gbdt.LATENT_BLOCKS]
+    assert train_gbdt._resolve_latent_methods(latent, "svd") == ["svd", "nmf"]
 
 
 def test_frequency_configs_are_wired_as_fold_only_blocks():

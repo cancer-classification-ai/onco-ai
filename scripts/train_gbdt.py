@@ -67,6 +67,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import time
 import traceback
@@ -175,7 +177,7 @@ ROBUST_ROLLUP_COLUMNS = (
 )
 
 #: chi2 top-K 대상 블록. 나머지는 전부 통과시킨다.
-GENE_BLOCKS = ("enc3", "gec", "gtype")
+GENE_BLOCKS = ("enc3", "gec", "gecr", "gtype")
 
 #: fold 안에서 어휘째 다시 만드는 블록. gene 블록과 달리 열의 *정체* 가 fold 마다
 #: 바뀌므로 `Dataset` 이 행렬을 미리 못 만든다. 들고 있는 건 문서 문자열이다.
@@ -239,6 +241,9 @@ BLOCK_SOURCES = {
     "rollup16": "{split}_sample_mutation_features_rollup.parquet",
     "enc3": "{split}_mutation_encoded.parquet",
     "gec": "{split}_gene_event_count_matrix.parquet",
+    # gec 와 같은 파일이다. `SELECT_KIND` 로 캐시 키를 갈라 두지 않으면
+    # rollup/rollup16 때와 똑같이 정규화 안 된 배열이 조용히 재사용된다.
+    "gecr": "{split}_gene_event_count_matrix.parquet",
     "gtype": "{split}_gene_mutation_type_matrix.parquet",
     "parsed19": "{split}_mutation_parsed_features.parquet",
     "burden8": "{split}_additional_burden_features.parquet",
@@ -275,7 +280,33 @@ SELECT_KIND = {
     "fe25": "fe25",
     "rollup": "rollup46",
     "rollup16": "rollup16",
+    "gecr": "gecr",
 }
+
+
+def _row_normalize(matrix: np.ndarray) -> np.ndarray:
+    """행 합을 1 로 맞춘다 — 카운트를 상대빈도로 바꾼다.
+
+    **왜 필요한가.** test 는 train 보다 샘플당 변이 유전자가 2.21배 많다. 원인이
+    실제 종양 차이가 아니라 주석 파이프라인 차이라면 유전자별 원시 카운트는
+    그 배율만큼 통째로 부풀고, 모델은 그걸 "고TMB 암종" 신호로 오독한다
+    (`research/03` §2.3, `research/07` §5). 실제로 `gec` 4,384열 중 70.2% 가
+    train→test 평균 배율 2배 밖이고 중앙값이 2.68배다.
+
+    행 안에서 총합을 1 로 맞추면 이 배율이 약분돼 사라진다. 유전자 **사이의
+    상대적 구성**만 남는데, 암종을 가르는 신호는 원래 거기 있다.
+
+    같은 발상이 이미 `gmod`·`csig` 의 `share` 값 모드에 들어가 있다("행의 변이
+    유전자 수로 나눠 시프트 내성이 있다" — `--module-value` 도움말). 여기서는
+    그 규약을 f16 최대 블록인 `gec` 로 넓히는 것뿐이다.
+
+    **규정.** 한 행 안에서만 나누므로 다른 행도 test 통계도 보지 않는다.
+    test 한 행만 따로 넣어도 같은 결과가 나온다.
+
+    변이가 하나도 없는 행은 합이 0 이라 그대로 0 벡터로 둔다.
+    """
+    total = matrix.sum(axis=1, keepdims=True)
+    return np.divide(matrix, total, out=np.zeros_like(matrix), where=total > 0)
 
 
 def block_cache_key(name: str) -> tuple[str, str]:
@@ -293,6 +324,7 @@ BLOCK_DESC = {
     "rollup16": "rollup 시프트내성 16",
     "enc3": "유전자 3단계",
     "gec": "유전자 토큰수",
+    "gecr": "유전자 토큰수 행정규화(상대빈도)",
     "sigtok": "서명 TF-IDF",
     "exacttok": "원문토큰 TF-IDF (대조군)",
     "ptok": "일반화 ParsedToken CountVectorizer",
@@ -518,6 +550,69 @@ CONFIGS: dict[str, dict] = {
         "weight": "balanced",
         "desc": "도메인 + 시프트내성 rollup + 클래스 서명 (enc3 없음, 중복성 대조군)",
     },
+    # 앙상블 입력: 캐시가 있는 11블록 전부. 사다리 규칙(한 번에 한 축)의 의도적
+    # 예외다 — 목적이 "한 축의 델타"가 아니라 "모델 여러 종에 같은 넓은 입력을 주고
+    # 앙상블 이득을 재는 것"이라서다. gtype/parsed19/burden8/aa9/ptok 은 뺐다 —
+    # data/process/ 에 test 쪽 parquet 이 없어 즉시 멈춘다. 특히 gtype 은 원본
+    # 26,304열(920MB)이라 다른 블록과 같은 프로세스에서 돌리면 안 된다.
+    "f11": {
+        "blocks": (
+            "domain", "rollup16", "enc3", "gec", "sigtok", "exacttok",
+            "comut", "lsvd", "lnmf", "gmod", "csig",
+        ),
+        "weight": "balanced",
+        "desc": "캐시 11블록 전부 — 앙상블 입력",
+    },
+    # 팀원(CatBoost 담당)이 Colab 에서 돌린 `repo_allfeat` 재현용. 블록 구성과 CLI
+    # 기본값을 그쪽 config.json 그대로 맞췄다 — `rollup16` 이 아니라 `rollup` 이고
+    # `kpath` 는 제외다.
+    #
+    # 그쪽 결과와 숫자가 그대로 맞지는 않는다. 이유가 둘 있다.
+    #   1. fold 가 다르다. 그쪽은 Colab 에서 새로 만든 group 분할이라 우리 두 분할
+    #      어느 쪽과도 20% 밖에 안 겹친다. 스태킹을 하려면 우리 fold 로 다시 뽑아야 한다.
+    #   2. 그쪽 실행에는 lsvd·lnmf 동거 버그가 있었다. 슬러그가 `lt64nmfl2bb3575`
+    #      (NMF 단독)라 SVD 는 안 돌고 NMF 64열이 두 벌 붙었다. 여기서는 고쳐진 코드로
+    #      도니 SVD 64 + NMF 64 가 제대로 들어간다.
+    #
+    # gtype 은 원본 26,304열이라 이 config 를 돌리면 메모리를 900MB 쯤 더 쓴다.
+    "f16": {
+        "blocks": (
+            "domain", "rollup", "enc3", "gec", "gtype", "parsed19", "burden8",
+            "aa9", "sigtok", "exacttok", "ptok", "comut", "lsvd", "lnmf",
+            "gmod", "csig",
+        ),
+        "weight": "balanced",
+        "desc": "구현된 피처 16블록 전부 — 팀원 repo_allfeat 재현",
+    },
+    # `f16` 에서 rollup 46 -> rollup16 만 바꾼다. 나머지 15블록은 그대로다.
+    # f16 은 LB 0.3896 을 낸 앙상블의 입력인데 rollup 46열을 쓰고 있어서,
+    # `duplicate_signature_count`(train 1.30 / test 52.8) 같은 시프트 노출 30열이
+    # 그대로 들어가 있다. 같은 교체를 f4 -> f4r 로 재 봤을 때 CV 는 +0.0002 로
+    # 측정이 안 됐지만 LB 는 +0.0109 였다(`research/07_codex_verification_and_pair_rule.md` §1).
+    # 그 델타가 넓은 입력에서도 남는지 보는 config 다.
+    "f16r": {
+        "blocks": (
+            "domain", "rollup16", "enc3", "gec", "gtype", "parsed19", "burden8",
+            "aa9", "sigtok", "exacttok", "ptok", "comut", "lsvd", "lnmf",
+            "gmod", "csig",
+        ),
+        "weight": "balanced",
+        "desc": "f16 에서 rollup 46 을 시프트내성 rollup16 으로 바꾼 것",
+    },
+    # `f16` 에서 gec 만 행정규화판 gecr 로 바꾼다. gec 는 f16 최대 블록(4,384열)
+    # 이면서 노출도 가장 크다 — 70.2% 가 train->test 평균 배율 2배 밖이고
+    # 중앙값 2.68배다. 행 합으로 나누면 그 배율이 약분된다.
+    #
+    # rollup 은 건드리지 않는다. f16r 에서 두 축을 같이 움직이면 델타가 섞인다.
+    "f16n": {
+        "blocks": (
+            "domain", "rollup", "enc3", "gecr", "gtype", "parsed19", "burden8",
+            "aa9", "sigtok", "exacttok", "ptok", "comut", "lsvd", "lnmf",
+            "gmod", "csig",
+        ),
+        "weight": "balanced",
+        "desc": "f16 에서 gec 를 행정규화(상대빈도) gecr 로 바꾼 것",
+    },
 }
 
 # `--configs all`은 기존 ladder의 의미와 실행 시간을 유지한다. 지도 evidence는
@@ -541,6 +636,37 @@ MODEL_PARAMS: dict[str, dict] = {
     ),
     "lgbm": dict(n_estimators=800, learning_rate=0.05),
     "catboost": dict(iterations=1000, learning_rate=0.05, depth=6),
+    # RF 는 튜닝 이력이 없다. 값의 근거는 `models_gbdt.RFModel.default_params()` 의
+    # docstring 에 있고, 여기 다시 적는 이유는 이 dict 가 "이번 실행이 실제로 쓴 값"을
+    # 보는 자리라서다.
+    "rf": dict(n_estimators=500, max_features="sqrt"),
+}
+
+#: 이름 붙인 하이퍼파라미터 프리셋. `--params <이름>` 으로 고른다.
+#:
+#: LB 를 받은 구성을 `--set` 나열로만 재현하면, 그 명령줄이 셸 히스토리에서 사라지는
+#: 순간 재현이 불가능해진다. 실제로 `cbopt10` 은 EXP_041 제출본(LB 0.4725)의 CatBoost
+#: 파라미터인데 저장소 어디에도 없어서 학습 로그의 `model_params` 에서 되찾았다.
+#:
+#: **여기 있다고 쓰라는 뜻이 아니다.** 아래 프리셋은 실측으로 기각된 것도 있고,
+#: `desc` 에 그 판정을 같이 적어 둔다.
+PARAM_PRESETS: dict[str, dict] = {
+    # EXP_039 의 Optuna 탐색 trial 10. OOF 는 CatBoost 기본값보다 세 seed 모두에서
+    # 1.6%p 높은데(0.4932 -> 0.5089) LB 는 -0.0084 였고, 짝 규칙을 얹은 뒤에도
+    # -0.0093 으로 크기가 같았다(EXP_041). 튜닝 이득이 train 분포에 붙어 있다는 뜻이다.
+    # **채택하지 않는다.** 등록해 두는 이유는 그 제출본을 재현할 수 있게 하기 위해서다.
+    "cbopt10": {
+        "model": "catboost",
+        "params": dict(
+            iterations=1600,
+            learning_rate=0.1002086028456688,
+            depth=6,
+            l2_leaf_reg=1.0629966259002686,
+            subsample=0.510491669178009,
+            rsm=1,
+        ),
+        "desc": "EXP_039 Optuna trial10 — OOF +0.016 / LB -0.0084. 기각됨, 재현 전용",
+    },
 }
 
 _LOGGED_PARAMS = (
@@ -563,6 +689,15 @@ _LOGGED_PARAMS = (
     "device",
     "random_seed",
     "random_state",
+    "min_samples_leaf",
+    "min_samples_split",
+    "max_features",
+    "max_samples",
+    "bootstrap",
+    "criterion",
+    "class_weight",
+    "n_jobs",
+    "thread_count",   # catboost 쪽 이름. 스레드 수도 재현성 축이라 로그에 남긴다
 )
 
 
@@ -590,6 +725,93 @@ def effective_params(model) -> dict[str, str]:
     return {k: str(actual[k]) for k in _LOGGED_PARAMS if actual.get(k) is not None}
 
 
+#: 데스크톱 스파이크에 남겨 둘 GPU 메모리(MiB). 이 GPU 는 화면 출력도 함께 하고 있어서
+#: 브라우저 탭 하나가 순간적으로 1GB 넘게 잡는다. `fit_with_fallback` docstring 참고 —
+#: 폴백으로 CPU 로 끌려가면 그 fold 만 느려지는 게 아니라 시간 비교가 통째로 깨진다.
+GPU_RESERVE_MIB = 2600
+
+#: 자동 산정의 하한·상한. 하한은 기존 고정값(0.4)이라 자동이 실패해도 이전만큼은 쓴다.
+GPU_RAM_PART_MIN = 0.40
+GPU_RAM_PART_MAX = 0.75
+
+
+def resolve_gpu_ram_part(requested: float | str) -> float:
+    """`--gpu-ram-part auto` 면 지금 비어 있는 GPU 메모리에서 정한다.
+
+    고정 비율은 "브라우저가 떠 있을 때" 와 "없을 때" 를 구별하지 못한다. 낮게 박으면
+    평소에 손해고, 높게 박으면 스파이크에 죽는다. 실행 시점의 여유를 보고 정하면
+    둘 다 피한다.
+
+    nvidia-smi 가 없거나 파싱이 안 되면 하한으로 떨어진다 — 조용히 크게 잡지 않는다.
+    """
+    if not isinstance(requested, str) or requested != "auto":
+        return float(requested)
+    try:
+        output = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15, check=True,
+        ).stdout.strip().splitlines()[0]
+        free_mib, total_mib = (int(x) for x in output.split(","))
+    except Exception as error:  # noqa: BLE001
+        log(f"[gpu] 여유 메모리를 못 읽었다({type(error).__name__}) — 하한 {GPU_RAM_PART_MIN} 을 쓴다")
+        return GPU_RAM_PART_MIN
+
+    usable = max(0, free_mib - GPU_RESERVE_MIB)
+    part = min(GPU_RAM_PART_MAX, max(GPU_RAM_PART_MIN, usable / total_mib))
+    log(f"[gpu] 여유 {free_mib}/{total_mib} MiB · 예약 {GPU_RESERVE_MIB} "
+        f"-> gpu_ram_part {part:.2f} ({int(part * total_mib)} MiB)")
+    return part
+
+
+def model_params_for(name: str) -> dict:
+    """`MODEL_PARAMS` 조회 — 없으면 즉시 죽는다.
+
+    `main()` 의 config 루프가 예외를 잡아 `*_ERROR.json` 만 남기고 다음 config 로
+    넘어가기 때문에, 여기서 안 막으면 "모델 표에 항목이 없다"가 config 실패로
+    위장된다. 데이터 로딩(수십 초) 전에 죽어야 원인이 안 묻힌다.
+    """
+    if name not in MODEL_PARAMS:
+        raise SystemExit(
+            f"MODEL_PARAMS 에 {name!r} 항목이 없다. 사용 가능: {sorted(MODEL_PARAMS)} "
+            "(별칭이 아니라 대표 이름을 쓴다)"
+        )
+    return dict(MODEL_PARAMS[name])
+
+
+def preset_params_for(name: str | None, model: str) -> dict:
+    """`--params` 프리셋 조회. 이름이 없으면 빈 dict.
+
+    프리셋마다 어느 모델용인지 박아 두고 안 맞으면 죽는다. CatBoost 파라미터를
+    XGBoost 에 넘기면 백엔드가 조용히 무시하는 게 아니라 fold 한복판에서 터지는데,
+    그때는 이미 Dataset 준비에 수십 초를 쓴 뒤다.
+    """
+    if not name:
+        return {}
+    if name not in PARAM_PRESETS:
+        raise SystemExit(
+            f"PARAM_PRESETS 에 {name!r} 이 없다. 사용 가능: {sorted(PARAM_PRESETS)}"
+        )
+    entry = PARAM_PRESETS[name]
+    if entry["model"] != model:
+        raise SystemExit(
+            f"프리셋 {name!r} 은 {entry['model']} 용인데 --model 이 {model} 이다"
+        )
+    return dict(entry["params"])
+
+
+def resolve_model_params(args) -> dict:
+    """기본값 -> `--params` 프리셋 -> `--set` 순으로 겹쳐 실제 쓸 파라미터를 만든다.
+
+    `--set` 이 프리셋을 이긴다. 프리셋 한 축만 바꿔 보는 게 흔한 사용이라서다.
+    `args` 에 `params_preset` 이 없어도(예전 호출자·노트북) 동작한다.
+    """
+    params = model_params_for(args.model)
+    params.update(preset_params_for(getattr(args, "params_preset", None), args.model))
+    params.update(args.override)
+    return params
+
+
 def fit_with_fallback(args, x_train, y_train, weight):
     """GPU 로 학습하고, 실패하면 그 fold 만 CPU 로 다시 돌린다.
 
@@ -598,8 +820,11 @@ def fit_with_fallback(args, x_train, y_train, weight):
     폴백으로 `use_gpu=False` 가 된 인스턴스를 재사용하면 이후 fold 가 전부 CPU 로
     끌려가서 비교가 깨진다.
     """
-    params = dict(MODEL_PARAMS[args.model])
-    params.update(args.override)
+    params = resolve_model_params(args)
+    if args.threads is not None:
+        # 공통 이름 -> 백엔드 이름은 `BaseGBDT._normalize` 가 한다 (catboost 는 thread_count).
+        # `--set n_jobs=..` 를 직접 준 경우엔 그쪽을 존중한다.
+        params.setdefault("n_jobs", args.threads)
     if args.model == "catboost":
         params["gpu_ram_part"] = args.gpu_ram_part
 
@@ -632,7 +857,7 @@ class Dataset:
     바뀌어서 미리 만들어 둘 수가 없다.
     """
 
-    def __init__(self, blocks: set[str], *, n_splits: int) -> None:
+    def __init__(self, blocks: set[str], *, n_splits: int, folds_path: Path | None = None) -> None:
         t0 = time.perf_counter()
 
         # 라벨과 ID 는 도메인 블록에서 받는다 — 어떤 config 든 domain 을 쓴다.
@@ -691,7 +916,7 @@ class Dataset:
             target[name] = (columns, train_array, test_array)
             log(f"[block] {name:9s} {len(columns):>6,}열  {BLOCK_DESC[name]}")
 
-        self.folds = self._load_folds(n_splits=n_splits)
+        self.folds = self._load_folds(n_splits=n_splits, folds_path=folds_path)
         sizes = self.folds.groupby("group_key").size()
         singleton_groups = set(sizes[sizes == 1].index)
         self.singleton_mask = self.folds["group_key"].isin(singleton_groups).to_numpy()
@@ -844,20 +1069,26 @@ class Dataset:
         aligned = test_frame.reindex(columns=["ID", *columns])
         if aligned[columns].isna().to_numpy().any():
             raise ValueError(f"{name} test 재정렬 후 결측이 생겼다")
-        return (
-            columns,
-            train_frame[columns].to_numpy(np.float32),
-            aligned[columns].to_numpy(np.float32),
-        )
+        train_array = train_frame[columns].to_numpy(np.float32)
+        test_array = aligned[columns].to_numpy(np.float32)
+        if name == "gecr":
+            train_array = _row_normalize(train_array)
+            test_array = _row_normalize(test_array)
+        return columns, train_array, test_array
 
-    def _load_folds(self, *, n_splits: int) -> pd.DataFrame:
+    def _load_folds(self, *, n_splits: int, folds_path: Path | None = None) -> pd.DataFrame:
         """사전계산 fold 파일을 **읽기만** 한다. 없으면 만들지 않고 멈춘다.
 
         예전에는 파일이 없으면 여기서 만들어 저장했다. 그러면 같은 이름의 파일이
         두 경로에서 나오고, `artifacts/oof/` 의 예측이 어느 분할에서 나왔는지
         사후에 확인할 수 없다. fold 를 쓰는 쪽과 만드는 쪽을 갈라 둔다.
+
+        `folds_path` 는 팀원이 쓴 분할로 다시 뽑을 때 쓴다. 스태킹은 모든 멤버가
+        같은 분할이어야 하는데, 팀원이 각자 만든 fold 는 우리 것과 다르다. 기본
+        파일을 덮어쓰면 기존 OOF 129개가 어느 분할에서 나왔는지 알 수 없게 되므로
+        경로를 갈아끼우는 쪽을 택한다.
         """
-        path = PROC_DIR / "train_folds.parquet"
+        path = Path(folds_path) if folds_path else PROC_DIR / "train_folds.parquet"
         if not path.exists():
             raise FileNotFoundError(
                 f"{path} 가 없다. scripts/make_folds.py 로 먼저 만든다."
@@ -1018,14 +1249,12 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     comut_slug = _comut_slug(comut_kwargs, manual=args.comut_manual)
     # 잠재·모듈 축도 같은 이유로 slug 가 필요하다. 셋 다 빈 dict 면 `""` 를 내므로
     # 기존 로그 129개의 파일명이 바이트 단위로 그대로 유지된다.
-    # `lnmf` 는 이름 자체가 방식을 정하므로 `--latent-method` 를 덮는다. 그 해석을
-    # **여기서** 끝내야 slug 와 로그의 `latent.params.method` 가 실제 돌아간 방식과
-    # 일치한다 — fold 루프 안에서만 덮으면 파일명은 svd 라고 적혀 있는데 nmf 가
-    # 돌아간다(실제로 한 번 그렇게 나왔다).
-    latent_method = "nmf" if "lnmf" in latent_blocks else args.latent_method
+    latent_methods = _resolve_latent_methods(latent_blocks, args.latent_method)
     latent_kwargs = (
         dict(
-            method=latent_method,
+            # 단일 블록이면 기존 문자열 그대로("svd"/"nmf") 나와 슬러그가 바이트
+            # 단위로 보존된다. 조합일 때만 이어붙인 문자열("svdnmf")이 된다.
+            method="".join(dict.fromkeys(latent_methods)),
             n_components=args.latent_components,
             row_norm=args.latent_row_norm,
             value=args.latent_value,
@@ -1110,6 +1339,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
     oof = np.zeros((len(data.y), len(data.classes)), dtype=np.float64)
     test_proba = np.zeros((len(data.test_ids), len(data.classes)), dtype=np.float64)
     fold_scores: list[float] = []
+    fold_train_scores: list[float] = []
     fold_seconds: list[float] = []
     fold_widths: list[int] = []
     devices: list[str] = []
@@ -1253,7 +1483,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         # 잠재 기저 — SVD/NMF 를 fold 의 train 부분에서만 fit 한다. test 행렬은
         # transform 만 받는다 (features_latent.fit_latent_basis 는 test 도 y 도
         # 인자로 받지 않는다).
-        for block in latent_blocks:
+        for block, method in zip(latent_blocks, latent_methods):
             columns, latent_train, latent_test = data.pairs[block]
             lat_names, lat_tr, lat_te, lat_diag, basis = build_fold_latent_block(
                 latent_train,
@@ -1261,7 +1491,7 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
                 train_index,
                 data.y[train_index],
                 gene_names=columns,
-                **latent_kwargs,
+                **{**latent_kwargs, "method": method},
             )
             # `selected` 에 넣지 않는다 — 열 이름이 매 fold `lat__svd__c000` 으로
             # 같아서 Jaccard 가 항상 1.000 이 나온다. 안정성을 모르는 대상에 대해
@@ -1363,6 +1593,16 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             data.y[valid_index], data.classes[oof[valid_index].argmax(axis=1)]
         )
         fold_scores.append(score)
+        # 일반화 격차(train − valid)용. 기본은 끈다 — 켜면 fold 마다 train 행 전체를
+        # 한 번 더 예측해야 해서 느려지고, 기존 로그 129개와 키 구성이 달라진다.
+        # `--track-train` 을 준 실행에만 붙는다.
+        if getattr(args, "track_train", False):
+            fold_train_scores.append(
+                macro_f1(
+                    data.y[train_index],
+                    data.classes[model.predict_proba(x_train[train_index]).argmax(axis=1)],
+                )
+            )
         fold_seconds.append(time.perf_counter() - t0)
         log(
             f"  [{stem}] fold {fold + 1}/{args.n_splits}  dim={n_features:,}  "
@@ -1433,6 +1673,9 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
             {
                 "blocks": latent_blocks,
                 "params": latent_kwargs,
+                # 블록마다 실제로 돌아간 방식. `params.method` 는 slug 용으로 이어붙인
+                # 문자열이라("svdnmf") 블록별 진실은 여기서 봐야 한다.
+                "methods": dict(zip(latent_blocks, latent_methods)),
                 # 열 이름이 고정이라 Jaccard 는 무의미하다. fold 쌍마다 주각 코사인
                 # 평균을 내서 "같은 부분공간을 보고 있나"를 잰다 — 1 이면 완전 일치.
                 "subspace_alignment": {
@@ -1486,6 +1729,16 @@ def run_config(data: Dataset, *, config: str, cv: str, args) -> dict:
         "seed": args.seed,
         "fold_macro_f1": fold_scores,
         "fold_seconds": fold_seconds,
+        # `--track-train` 없이는 빈 리스트 -> 아래에서 통째로 빠져 기존 로그와 같아진다.
+        **(
+            {
+                "fold_train_macro_f1": fold_train_scores,
+                "train_macro_f1": float(np.mean(fold_train_scores)),
+                "generalization_gap": float(np.mean(fold_train_scores) - summary["macro_f1"]),
+            }
+            if fold_train_scores
+            else {}
+        ),
         "oof_macro_f1": summary["macro_f1"],
         "oof_macro_f1_singleton": singleton,
         "n_singleton": int(mask.sum()),
@@ -1589,6 +1842,18 @@ def _selection_overlap(selected: dict[str, list[str]]) -> float:
             union = a | b
             scores.append(len(a & b) / len(union) if union else 1.0)
     return float(np.mean(scores))
+
+
+def _resolve_latent_methods(latent_blocks: list[str], default_method: str) -> list[str]:
+    """블록마다 실제로 돌릴 잠재 방식을 정한다.
+
+    `lnmf` 는 이름 자체가 방식을 정하므로 `--latent-method` 를 덮는다. **블록마다**
+    풀어야 한다 — config 전체에 방식 하나만 정하면 `lsvd`·`lnmf`가 같은 config 에
+    있을 때 둘 다 nmf 로 돌아간다. 두 블록은 소스 parquet·시드·성분 수가 전부 같아서
+    결과가 바이트 단위로 같은 64열 두 벌이 되고, 열 이름도 `lat__nmf__c000` 으로
+    같아서 예외도 경고도 없이 SVD 가 사라진다.
+    """
+    return ["nmf" if block == "lnmf" else default_method for block in latent_blocks]
 
 
 def _comut_slug(comut_kwargs: dict, *, manual: bool) -> str:
@@ -1713,7 +1978,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--model", default="xgb", help="xgb / lgbm / catboost")
+    parser.add_argument("--model", default="xgb", help="xgb / lgbm / catboost / rf")
     parser.add_argument(
         "--configs", default="all", help=f"쉼표 구분. 사용 가능: {','.join(CONFIGS)}"
     )
@@ -1739,7 +2004,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="fold 파일에서 읽을 분할 수. 파일과 다르면 멈춘다 (분할은 make_folds.py 담당)",
     )
     parser.add_argument(
+        "--folds",
+        type=Path,
+        default=None,
+        help=(
+            "fold parquet 경로. 기본은 data/process/train_folds.parquet. "
+            "팀원이 쓴 분할로 다시 뽑아 스태킹 멤버를 맞출 때 갈아끼운다"
+        ),
+    )
+    parser.add_argument(
         "--seed", type=int, default=42, help="모델 시드. fold 분할과는 무관하다."
+    )
+    parser.add_argument(
+        "--params",
+        dest="params_preset",
+        default=None,
+        help="이름 붙인 하이퍼파라미터 프리셋. 사용 가능: "
+        + ", ".join(f"{k} ({v['desc']})" for k, v in PARAM_PRESETS.items()),
     )
     parser.add_argument(
         "--set",
@@ -1750,10 +2031,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="모델 하이퍼파라미터 덮어쓰기 (여러 번 지정 가능)",
     )
     parser.add_argument("--device", choices=["auto", "gpu", "cpu"], default="auto")
-    parser.add_argument("--gpu-ram-part", type=float, default=0.4, help="CatBoost 전용")
+    parser.add_argument(
+        "--threads", type=int, default=None, metavar="N",
+        help=f"CPU 스레드 수 (기본 전 코어 {os.cpu_count()}개). GPU 잡과 CPU 잡을 동시에 "
+             "돌릴 때 둘의 합이 코어 수를 넘지 않게 나눈다. 주의: xgb 는 스레드 수가 "
+             "바뀌면 트리도 바뀐다 — 섞을 OOF 끼리는 같은 값을 쓴다",
+    )
+    parser.add_argument(
+        "--gpu-ram-part", default="auto",
+        help="CatBoost 전용. 'auto' 면 실행 시점의 GPU 여유에서 정한다 "
+        f"(예약 {GPU_RESERVE_MIB} MiB, 범위 {GPU_RAM_PART_MIN}~{GPU_RAM_PART_MAX}). "
+        "숫자를 주면 그 값을 그대로 쓴다",
+    )
     parser.add_argument("--tag", default="v2", help="파일명에 들어가는 실험 이름")
     parser.add_argument("--submission", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true", help="파일을 쓰지 않는다")
+    parser.add_argument(
+        "--track-train", action="store_true",
+        help="fold 마다 train 점수도 재서 일반화 격차를 남긴다. fold 당 train 행 전체를 "
+        "한 번 더 예측하므로 느려진다. 끄면 기존 로그와 키 구성이 같다",
+    )
 
     # --- supervised gene evidence encoding (ebovr / ebbnb) ----------------
     parser.add_argument(
@@ -1920,6 +2217,8 @@ def main() -> None:
     args = build_parser().parse_args()
     args.device = {"gpu": True, "cpu": False, "auto": "auto"}[args.device]
     args.override = _parse_override(args.overrides)
+    args.gpu_ram_part = resolve_gpu_ram_part(args.gpu_ram_part)
+    resolve_model_params(args)  # 조기 검증 — Dataset 생성(수십 초) 전에 죽는다
 
     configs = (
         [c for c in CONFIGS if c not in EXPERIMENTAL_EVIDENCE_CONFIGS]
@@ -1931,7 +2230,8 @@ def main() -> None:
         raise SystemExit(f"알 수 없는 config {unknown}. 사용 가능: {list(CONFIGS)}")
     cvs = ["skf", "sgkf"] if args.cv == "all" else [c.strip() for c in args.cv.split(",")]
 
-    log(f"gpu_available() = {gpu_available()}  ·  요청 device = {args.device}")
+    log(f"gpu_available() = {gpu_available()}  ·  요청 device = {args.device}"
+        f"  ·  threads = {args.threads if args.threads is not None else f'전부({os.cpu_count()})'}")
     log(f"model = {args.model} · config {configs} · cv {cvs} · seed {args.seed}")
     if args.override:
         log(f"파라미터 덮어쓰기: {args.override}")
@@ -1939,7 +2239,7 @@ def main() -> None:
     needed: set[str] = set()
     for config in configs:
         needed |= set(CONFIGS[config]["blocks"])
-    data = Dataset(needed, n_splits=args.n_splits)
+    data = Dataset(needed, n_splits=args.n_splits, folds_path=args.folds)
 
     results = []
     for config in configs:

@@ -132,3 +132,70 @@ def read_prediction_frame(path) -> tuple[pd.DataFrame, list[str]]:
     if not classes:
         raise ValueError(f"{path} 에 {PROBABILITY_PREFIX}* 확률 컬럼이 없다")
     return frame, classes
+
+
+def label_distribution(labels: Sequence, classes: Sequence[str]) -> dict[str, float]:
+    """고정된 클래스 순서로 라벨 비율을 계산한다.
+
+    예측 분포 진단은 실제 test 정답을 추정하는 장치가 아니다. train 실제 분포와 test
+    예측 분포가 크게 벌어지는지를 보는 경보용이라, 등장하지 않은 클래스도 0으로 남긴다.
+    """
+
+    labels = np.asarray(labels, dtype=str)
+    if labels.ndim != 1 or len(labels) == 0:
+        raise ValueError("labels 는 비어 있지 않은 1차원 배열이어야 한다")
+    classes = [str(label) for label in classes]
+    unknown = sorted(set(labels.tolist()) - set(classes))
+    if unknown:
+        raise ValueError(f"classes 에 없는 라벨: {unknown[:5]}")
+    return {label: float((labels == label).mean()) for label in classes}
+
+
+def total_variation_distance(
+    reference: dict[str, float], observed: dict[str, float]
+) -> float:
+    """두 이산 분포의 총변동거리(TVD)를 계산한다."""
+
+    if set(reference) != set(observed):
+        missing = sorted(set(reference) ^ set(observed))
+        raise ValueError(f"분포의 클래스 구성이 다르다: {missing[:5]}")
+    for name, distribution in (("reference", reference), ("observed", observed)):
+        values = np.asarray(list(distribution.values()), dtype=np.float64)
+        if not np.isfinite(values).all() or (values < 0).any():
+            raise ValueError(f"{name} 분포에 유효하지 않은 값이 있다")
+        if not np.isclose(values.sum(), 1.0, atol=1e-8):
+            raise ValueError(f"{name} 분포의 합이 1이 아니다: {values.sum()}")
+    return float(
+        0.5 * sum(abs(reference[label] - observed[label]) for label in reference)
+    )
+
+
+def prediction_distribution_report(
+    reference_labels: Sequence,
+    predicted_labels: Sequence,
+    classes: Sequence[str],
+    *,
+    warning_threshold: float = 0.10,
+) -> dict:
+    """train 실제 분포와 예측 분포의 차이를 경보 형태로 요약한다.
+
+    `warning_threshold` 는 제출 선택 기준이 아니라 운영 경보다. test 의 실제 클래스
+    사전확률을 모르므로 TVD를 낮추기 위해 test 예측을 강제로 보정하면 안 된다.
+    """
+
+    if not 0 <= warning_threshold <= 1:
+        raise ValueError("warning_threshold 는 0~1이어야 한다")
+    reference = label_distribution(reference_labels, classes)
+    predicted = label_distribution(predicted_labels, classes)
+    tvd = total_variation_distance(reference, predicted)
+    return {
+        "tvd": tvd,
+        "warning_threshold": float(warning_threshold),
+        "warning": bool(tvd > warning_threshold),
+        "reference_distribution": reference,
+        "predicted_distribution": predicted,
+        "interpretation": (
+            "guardrail_only: test 실제 클래스 비율은 알 수 없으므로 "
+            "TVD를 직접 최소화하거나 train 분포에 강제로 맞추지 않는다"
+        ),
+    }

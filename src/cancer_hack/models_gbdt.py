@@ -1,4 +1,4 @@
-"""GBDT 모델 래퍼 — XGBoost / LightGBM / CatBoost를 하나의 인터페이스로 쓴다.
+"""GBDT 모델 래퍼 — XGBoost / LightGBM / CatBoost / RandomForest를 하나의 인터페이스로 쓴다.
 
     from cancer_hack.models_gbdt import create_model, balanced_sample_weight
 
@@ -38,6 +38,7 @@ __all__ = [
     "XGBModel",
     "LGBMModel",
     "CatBoostModel",
+    "RFModel",
     "create_model",
     "create_models",
     "available_models",
@@ -313,6 +314,15 @@ class XGBModel(BaseGBDT):
             "tree_method": "hist",
             "eval_metric": "mlogloss",
             "verbosity": 0,
+            # -1 = 전 코어. CPU 잡을 GPU 잡과 같이 돌릴 때만 줄인다.
+            #
+            # 주의: xgboost 는 **스레드 수가 바뀌면 예측이 바뀐다.** hist 가 히스토그램을
+            # 스레드로 나눠 더하는데 그 합산 순서가 스레드 수를 따라가서, 부동소수점
+            # 차이가 분할 선택까지 번진다. 실측(합성 3000×600, 26클래스, n_est=120):
+            # 같은 스레드 수로 두 번 = 완전 동일, 16 -> 4 로 바꾸면 확률 최대차 0.156.
+            # 그래서 스레드 수는 device·라이브러리 버전과 같은 재현성 축이다 —
+            # 섞을 OOF 끼리는 같은 값을 써야 한다. (lgbm·catboost·rf 는 영향 없음)
+            "n_jobs": -1,
         }
 
     @classmethod
@@ -407,6 +417,7 @@ class CatBoostModel(BaseGBDT):
         "reg_lambda": "l2_leaf_reg",
         "min_child_samples": "min_data_in_leaf",
         "random_state": "random_seed",
+        "n_jobs": "thread_count",
     }
 
     @classmethod
@@ -422,6 +433,10 @@ class CatBoostModel(BaseGBDT):
             "bootstrap_type": "Bernoulli",
             "subsample": 0.8,
             "allow_writing_files": False,
+            # -1 = 전 코어. CPU 학습에서만 속도에 영향을 주고 결과는 바뀌지 않는다.
+            # task_type=GPU 면 데이터 읽기에만 쓰이고 학습은 메인 스레드 1개 +
+            # GPU 1개로 도므로, CatBoost-GPU 잡은 코어를 거의 안 물고 있는다.
+            "thread_count": -1,
         }
 
     @classmethod
@@ -456,6 +471,70 @@ class CatBoostModel(BaseGBDT):
         self.best_iteration_ = est.get_best_iteration() if eval_set is not None else None
 
 
+class RFModel(BaseGBDT):
+    """sklearn RandomForestClassifier. GPU 백엔드가 없다 — 항상 CPU 로 돈다.
+
+    `aliases` 를 비워 둔다. `colsample_bytree`(트리당 열 표본) 는 `max_features`
+    (분할당 열 표본) 와 다른 개념이고, `min_child_weight`(헤시안 합) 도
+    `min_samples_leaf`(표본 개수) 와 다르다. 억지로 이으면 `--set` 이 모델마다
+    다른 뜻이 된다.
+    """
+
+    name = "rf"
+
+    @classmethod
+    def default_params(cls) -> dict[str, Any]:
+        # max_depth 는 일부러 안 넣는다 — sklearn 기본은 None(무제한)인데
+        # `--set max_depth=None` 은 `_parse_override` 가 문자열 "None" 으로 남기고
+        # `BaseGBDT.__init__` 은 파이썬 None 을 조용히 드롭한다. 빼는 게 유일하게
+        # 안전한 표현이다.
+        #
+        # class_weight 도 안 넣는다 — fold 루프가 `resolve_sample_weight("balanced")`
+        # 로 이미 평균 1 가중치를 준다. 이중 가중은 실측에서 macro F1 을
+        # 0.4480 -> 0.3917 로 떨어뜨렸다.
+        return {
+            "n_estimators": 500,
+            "criterion": "gini",
+            "max_features": "sqrt",
+            "min_samples_leaf": 1,
+            "bootstrap": True,
+            "n_jobs": -1,
+        }
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return importlib.util.find_spec("sklearn") is not None
+
+    def _default_gpu(self) -> bool:
+        return False
+
+    def _build(self):
+        from sklearn.ensemble import RandomForestClassifier
+
+        if self.use_gpu:
+            # `_default_gpu` 는 "auto" 일 때만 걸린다 — `--device gpu` 로 명시하면
+            # `__init__` 이 그걸 우회해 `self.use_gpu=True` 를 그대로 세팅한다.
+            # 여기서 되돌려야 `describe()["device"]` 가 항상 정직하다.
+            warnings.warn(
+                "RandomForest 는 CPU 전용이다 — device 기록을 cpu 로 되돌린다.",
+                stacklevel=2,
+            )
+            self.use_gpu = False
+        p = dict(self.params)
+        p["random_state"] = self.random_state
+        return RandomForestClassifier(**p)
+
+    def _fit_backend(self, est, X, yi, sample_weight, eval_set, early_stopping_rounds, verbose):
+        if eval_set is not None or early_stopping_rounds is not None:
+            warnings.warn(
+                "RandomForest 는 eval_set·early stopping 을 안 쓴다 — 무시한다.",
+                stacklevel=2,
+            )
+        est.set_params(verbose=1 if verbose else 0)
+        est.fit(X, yi, sample_weight=sample_weight)
+        self.best_iteration_ = None
+
+
 _REGISTRY: dict[str, type[BaseGBDT]] = {
     "xgb": XGBModel,
     "xgboost": XGBModel,
@@ -463,6 +542,7 @@ _REGISTRY: dict[str, type[BaseGBDT]] = {
     "lightgbm": LGBMModel,
     "cat": CatBoostModel,
     "catboost": CatBoostModel,
+    "rf": RFModel,
 }
 
 
