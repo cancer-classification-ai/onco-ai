@@ -7,15 +7,19 @@
 
 암은 유전자 수준에서 발생하는 다양한 변이(mutation)에 의해 아형(subtype)이 결정되며, 아형에 따라 치료 방침과 예후가 크게 달라집니다. 본 프로젝트는 방대한 유전자 변이 정보 속에서 암의 정확한 아형을 판별하는 AI 모델을 개발하여 정밀 의료 발전에 기여하는 것을 목표로 합니다.
 
+> [초격차] AI 헬스케어 5기 해커톤 — 암환자 유전체 데이터의 변이 정보를 활용한 암종 분류 AI 모델 개발
+
 
 # 팀 구성
 
+모든 팀원이 데이터 전처리·피처 엔지니어링·모델링·앙상블·제출까지 전 과정을 함께 수행했습니다. 각자 독립적으로 실험(EXP 시리즈)을 진행하고 결과를 공유·비교하며 최종 모델을 선정했습니다.
+
 | 이름 | 역할 |
 |---|---|
-| 권민재 | |
-| 권병학 | |
-| 정현우 | |
-| 한금준 | |
+| 한금준 (팀장) | 데이터 전처리 · 피처 엔지니어링 · 모델링 · 앙상블 · 제출 (전 과정 공동 수행) |
+| 권민재 | 데이터 전처리 · 피처 엔지니어링 · 모델링 · 앙상블 · 제출 (전 과정 공동 수행) |
+| 정현우 | 데이터 전처리 · 피처 엔지니어링 · 모델링 · 앙상블 · 제출 (전 과정 공동 수행) |
+| 권병학 | 데이터 전처리 · 피처 엔지니어링 · 모델링 · 앙상블 · 제출 (전 과정 공동 수행) |
 
 
 # 데이터 설명
@@ -31,23 +35,58 @@
 
 # 데이터 전처리
 
+원본 데이터는 6,199개 유전자 컬럼에 각 유전자의 변이 여부가 `WT`(정상) 또는 변이 문자열로 들어 있습니다. 문자열을 그대로 쓰지 않고 파서로 변이 사건(event) 단위까지 분해한 뒤 여러 층위의 파생변수를 만듭니다. 통계량을 이용하는 모든 전처리는 **train fold에만 `fit()`, validation/test에는 `transform()`만** 적용해 데이터 누수를 차단합니다.
+
+- **변이 문자열 파싱** (`parser.py`) — 각 유전자 셀을 변이 사건으로 분해하고 유형(missense·nonsense·frameshift·indel·synonymous·complex), 위치, 참조·대체 아미노산을 추출합니다.
+- **유전자별 Wide 피처** — 각 유전자를 3단계로 인코딩(WT=0 / 동의변이=1 / 기능성 변이=2)하고, 변이 존재 여부(0/1)·사건 수·상대빈도·유형별 존재 플래그를 생성합니다(현재 4,384개 유전자 기준).
+- **행 단위 파생변수** — 변이 부담(변이 유전자 수·전체 사건 수 및 로그 변환), 유형별 수·비율, 복합변이(multihit), deletion/indel/LoF, 변이 문자열 구조 통계(위치 mean/std/median, hotspot, 아미노산 다양성) 등.
+- **아미노산 물리화학 피처** — 치환 페널티 합·평균·최대, 급진적/보존적 치환 수 등 9종.
+- **도메인 피처(542개)** — 드라이버 유전자 변이(`A_`, `A2_`), 변이 부담(`B_`), 치환 조성(`C_`, `D_`), 돌연변이 서명 역추론(`N_`: SBS6·CpG·transition), MSI/면역회피(`M_`).
+- **Fold 동적 피처** — 누수 방지를 위해 fold-train에서만 학습: 빈도·희귀도(`freq21`, `aatrans9`), TF-IDF/Count 토큰(`sigtok`, `exacttok`, `ptok`), 공변이 쌍(`comut`), 잠재표현 SVD·NMF(`lsvd`, `lnmf`), KMeans 유전자 모듈(`gmod`), 클래스 서명(`csig`), EB-shrinkage 근거 점수(`ebovr`, `ebbnb`).
+- **검증 틀** — SUBCLASS 기준 Stratified K-Fold(5/10), 일부 실험은 StratifiedGroupKFold(`group5`)로 fold를 고정합니다. 원본 CSV는 `.parquet`으로 정제해 공유합니다.
 
 
 # 모델링
 
-- 사용 모델
+- **사용 모델**
+  - 트리 계열(주력): XGBoost, CatBoost, LightGBM, RandomForest — 피처셋 프리셋(`f0`~`f16`)과 `group5` CV, Optuna 하이퍼파라미터 튜닝, SHAP 기반 변수 선택.
+  - 선형: Logistic Regression (베이스라인 및 메타 모델).
+  - 딥러닝 ladder: full dense **MLP baseline** → mutation token만 쓰는 **Hierarchical Gene Set Encoder** → 두 표현을 결합한 **Hybrid**. SVD/NMF 잠재피처 결합, weighted CE·Label smoothing·Focal Loss 비교.
+  - 앙상블·후처리: OOF 기반 스태킹/블렌딩, 기하평균, 그리디 가중, 교차적합(cross-fit), 시드 앙상블, 클래스별 확률 보정(calibration), 짝 라벨 규칙(pair rule, LB +0.0829), 클래스쌍 residual/gate 보정.
+- **평가지표**: Macro F1 (OOF·singleton·희귀 클래스 별도 관리)
 
 
 # 실험 결과
 
-| 모델 | Score |
-|---|---|
+주요 마일스톤 기준이며, 점수는 대회 리더보드 Macro F1(Public / Private)입니다.
+
+| Experiment | 모델 | Public | Private | 결과 |
+|---|---|---|---|---|
+| EXP_001 | XGBoost (token) | 0.0921 | 0.130 | 채택 |
+| EXP_002 | Encoding · LightGBM | 0.266 | 0.330 | 채택 |
+| EXP_006 | XGBoost `f0` baseline (SKF5) | 0.290 | 0.428 | 채택 |
+| EXP_015 | XGBoost `f4r` + group5 | 0.352 | 0.479 | 채택 |
+| EXP_026 | 앙상블 (XGB + CatBoost + RF) | 0.390 | 0.517 | 채택 |
+| EXP_040 | f16 + group5 + 앙상블(XGB/Cat/RF) + 짝 규칙 | 0.482 | 0.517 | 채택 |
+| EXP_042 | 그리디 앙상블(Cat/XGB/RF/MLP) + 교차적합 | 0.476 | 0.536 | 채택 |
+| EXP_055 | OOF-driven Adaptive Ensemble | 0.487 | 0.529 | 채택 |
+| EXP_053 | Geo60-ACat20-AMLP7.5-Greedy2.5-XCR10 | 0.494 | 0.553 | 채택 |
+| EXP_048 | Geo85-XCR-Crossfit10-Greedy05 + group5 | 0.495 | 0.546 | 채택 |
+| **EXP_065** | **V036 → V035 + PCPG→BRCA pair residual** | **0.495** | **0.562** | **최종 채택** |
+
+전체 실험 이력(EXP_001~066)은 노션 「모델 성능 기록」 DB와 `manifests/experiment_registry.csv`에 기록되어 있습니다.
 
 
 # 최종 모델
 
+**EXP_065 — `V036 → V035 + PCPG→BRCA pair residual`** (Public 0.4953 / Private 0.5623)
 
-- 선택 이유
+NMF32 잠재표현과 GBMLGG·SARC 전용(specialist) 모델을 결합한 기하평균 기반 앙상블(V030)을 뼈대로, 검증된 클래스쌍 residual·gate 보정을 누적 적용한 V-시리즈의 최종 버전입니다. `V033`(COAD/GBMLGG/TGCT residual trio) → `V034`(OV→BRCA quantile gate) → `V035`(LUSC→LUAD NMF32 gate)를 거쳐, 마지막으로 **PCPG→BRCA 짝 residual** 보정을 얹었습니다.
+
+- **선택 이유**
+  - Public LB 최고 구간(0.4953)이면서 Private LB 0.5623으로 상위권을 유지해, 단일 모델·초기 앙상블 대비 일반화 성능이 가장 안정적이었습니다.
+  - 오분류가 잦은 특정 암종 쌍(예: PCPG↔BRCA, LUSC↔LUAD, OV↔BRCA)을 근거 기반 residual/gate로 개별 보정해, 희귀·혼동 클래스에서 Macro F1을 끌어올렸습니다.
+  - 뒤이은 `V037`(EXP_066, Private 0.5627)은 Private가 근소하게 높았으나 Public 검증 값이 없어, Public·Private 균형과 재현성이 확인된 EXP_065를 최종본으로 채택했습니다.
 
 
 # 실행 방법
@@ -303,5 +342,18 @@ onco-ai/
 
 # 사용 기술
 
+- **언어·데이터**: Python, pandas, NumPy, PyArrow(Parquet)
+- **머신러닝**: scikit-learn, XGBoost, CatBoost, LightGBM
+- **딥러닝**: PyTorch (MLP · Gene Set Encoder · Hybrid)
+- **피처·표현학습**: TF-IDF / CountVectorizer, TruncatedSVD, NMF, KMeans, SHAP
+- **튜닝·검증**: Optuna, StratifiedKFold / StratifiedGroupKFold, OOF 스태킹, 확률 Calibration
+- **협업·인프라**: Git/GitHub(Git Flow), Kaggle(GPU) · Colab(GPU) · VS Code
+- **재현·자동화**: YAML 설정, nbconvert, pytest(무결성 테스트)
+
 
 # 향후 개선 방향
+
+- **딥러닝 표현 고도화** — Gene Set Encoder / Hybrid의 유전자 count·유형·위치 통계를 추가 반영하고, GNN·Autoencoder 임베딩을 앙상블에 정식 편입.
+- **클래스 불균형 대응** — singleton·희귀 클래스 전용 손실(Focal/weighted CE)과 클래스별 임계값 보정을 표준화해 Macro F1 안정화.
+- **앙상블 자동화** — residual/gate 규칙을 수작업이 아닌 검증 기반 자동 탐색으로 전환하고, 다중 seed·다중 fold의 편차를 줄이는 나이브한 규칙 정리.
+- **재현성·문서화** — 실험 매니페스트와 제출 레지스트리를 CI에 연동해, 노트북 산출물과 제출 파일의 일치를 자동 검증.
