@@ -58,6 +58,9 @@ for _stream in (sys.stdout, sys.stderr):
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_PROCESS, LazyDir, artifacts_dir, process_dir  # noqa: E402
 from cancer_hack.features_latent import (  # noqa: E402
     _binarize,
     fit_gene_modules,
@@ -67,9 +70,8 @@ from cancer_hack.features_latent import (  # noqa: E402
 )
 from cancer_hack.validation import fold_column  # noqa: E402
 
-PROC_DIR = PROJECT_ROOT / "data/process"
-OUT_DIR = PROJECT_ROOT / "artifacts/features/modules/preflight"
-
+PROC_DIR = LAZY_PROCESS
+OUT_DIR = LazyDir(lambda: artifacts_dir() / "features/modules/preflight")
 #: 중단 규칙 — 선두 성분이 이만큼 burden 에 정렬되고 시프트가 이만큼이면 멈춘다.
 BURDEN_CORR_LIMIT = 0.90
 SHIFT_RATIO_LIMIT = 1.80

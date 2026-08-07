@@ -1,0 +1,62 @@
+{
+  "families": [
+    "catboost",
+    "xgb",
+    "rf",
+    "mlp"
+  ],
+  "depth": 5,
+  "exclude": [],
+  "members": {
+    "catboost": [
+      "oof_catboost_cbopt10_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s2024.csv",
+      "oof_catboost_cbopt10_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s7.csv",
+      "oof_catboost_cbopt10_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42.csv",
+      "oof_catboost_repo16r_f16r_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42.csv",
+      "oof_catboost_repo16n_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s7.csv"
+    ],
+    "xgb": [
+      "oof_xgb_sig_f4rsig_group5_k500_sg30sha71bc36_s2024.csv",
+      "oof_xgb_sig_f4rsig_group5_k500_sg30sha71bc36_s42.csv",
+      "oof_xgb_sig_f2sig_group5_kall_sg30sha71bc36_s42.csv",
+      "oof_xgb_repo16n_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s1234.csv",
+      "oof_xgb_final_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42.csv"
+    ],
+    "rf": [
+      "oof_rf_repo16n_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s2024.csv",
+      "oof_rf_repo16_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s7.csv",
+      "oof_rf_repo16n_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s7.csv",
+      "oof_rf_repo16n_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42.csv",
+      "oof_rf_final_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42.csv"
+    ],
+    "mlp": [
+      "oof_dl_hybrid_hybrid_set_mlp_svd64_group5.csv",
+      "oof_dl_hybrid_hybrid_svd64_g5_s7_group5.csv",
+      "oof_dl_set_encoder_gene_set_encoder_full_group5.csv",
+      "oof_dl_mlp_mlp_full_features_group5.csv",
+      "oof_dl_mlp_mlp_full_svd_g5_s42_group5.csv"
+    ]
+  },
+  "solo_macro_f1": {
+    "oof_catboost_cbopt10_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s2024.csv": 0.511005,
+    "oof_catboost_cbopt10_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s7.csv": 0.509728,
+    "oof_catboost_cbopt10_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42.csv": 0.508916,
+    "oof_catboost_repo16r_f16r_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42.csv": 0.495888,
+    "oof_catboost_repo16n_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s7.csv": 0.493812,
+    "oof_xgb_sig_f4rsig_group5_k500_sg30sha71bc36_s2024.csv": 0.497476,
+    "oof_xgb_sig_f4rsig_group5_k500_sg30sha71bc36_s42.csv": 0.496509,
+    "oof_xgb_sig_f2sig_group5_kall_sg30sha71bc36_s42.csv": 0.494934,
+    "oof_xgb_repo16n_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s1234.csv": 0.493921,
+    "oof_xgb_final_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42.csv": 0.492171,
+    "oof_rf_repo16n_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s2024.csv": 0.481187,
+    "oof_rf_repo16_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s7.csv": 0.479653,
+    "oof_rf_repo16n_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s7.csv": 0.479468,
+    "oof_rf_repo16n_f16n_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42.csv": 0.478697,
+    "oof_rf_final_f16_group5_k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36_s42.csv": 0.477376,
+    "oof_dl_hybrid_hybrid_set_mlp_svd64_group5.csv": 0.438806,
+    "oof_dl_hybrid_hybrid_svd64_g5_s7_group5.csv": 0.434432,
+    "oof_dl_set_encoder_gene_set_encoder_full_group5.csv": 0.40917,
+    "oof_dl_mlp_mlp_full_features_group5.csv": 0.395734,
+    "oof_dl_mlp_mlp_full_svd_g5_s42_group5.csv": 0.387161
+  }
+}

@@ -28,10 +28,16 @@ import argparse
 import json
 import re
 import statistics
+import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-LOGS_DIR = PROJECT_ROOT / "artifacts" / "logs"
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LazyDir, artifacts_dir  # noqa: E402
+
+LOGS_DIR = LazyDir(lambda: artifacts_dir() / "logs")
 
 #: 그룹 안에서 상수여야 하는 열 — 다르면 두 설정이 한 stem 에 충돌했다는 뜻이다.
 _CONSTANT_KEYS = ("n_features", "blocks", "cv", "config")

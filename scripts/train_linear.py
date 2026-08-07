@@ -44,8 +44,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from cancer_hack.metrics import macro_f1  # noqa: E402
 from cancer_hack.models_linear import SCALERS, create_logistic_model  # noqa: E402
 
+from cancer_hack.paths import LAZY_ARTIFACTS  # noqa: E402
+
 DEFAULT_CONFIG = PROJECT_ROOT / "configs/linear.yaml"
-DEFAULT_ARTIFACTS = PROJECT_ROOT / "artifacts"
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다. 여기서 상수로 굳히면
+# `use_run_dirs()` 로 출력 위치를 옮겨도 기준선 artifacts/ 에 써 버린다.
+DEFAULT_ARTIFACTS = LAZY_ARTIFACTS
 
 
 def log(message: str) -> None:

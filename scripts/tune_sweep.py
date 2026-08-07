@@ -67,7 +67,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-TUNING_DIR = PROJECT_ROOT / "artifacts" / "tuning"
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LazyDir, artifacts_dir  # noqa: E402
+from cancer_hack.validation import SEED_ENSEMBLE  # noqa: E402
+TUNING_DIR = LazyDir(lambda: artifacts_dir() / "tuning")
 #: 서브프로세스로 부를 파이썬. **`sys.executable` 이 먼저다** — Colab·Linux 에는
 #: `.venv/Scripts/python.exe` 가 없고, 있더라도 지금 이 스크립트를 돌리는 인터프리터와
 #: 다른 것을 부르면 라이브러리 버전이 갈려 OOF 가 조용히 어긋난다(requirements.txt
@@ -240,7 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gap-penalty", type=float, default=0.5)
     parser.add_argument("--gap-floor", type=float, default=0.20)
     parser.add_argument("--top-k-revalidate", type=int, default=3)
-    parser.add_argument("--revalidate-seeds", type=int, nargs="+", default=[42, 7, 2024])
+    parser.add_argument("--revalidate-seeds", type=int, nargs="+", default=list(SEED_ENSEMBLE))
     parser.add_argument("--skip-revalidate", action="store_true")
     parser.add_argument(
         "--device", choices=["auto", "gpu", "cpu"], default="auto",

@@ -62,13 +62,15 @@ for _stream in (sys.stdout, sys.stderr):
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from cancer_hack.ensemble import GreedyEnsembleSelector, weighted_average  # noqa: E402
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_ARTIFACTS, LAZY_RAW, LazyDir, artifacts_dir, process_dir, raw_dir  # noqa: E402
+from cancer_hack.ensemble import GreedyEnsembleSelector, combine  # noqa: E402
 from cancer_hack.metrics import macro_f1  # noqa: E402
 
-ARTIFACTS = PROJECT_ROOT / "artifacts"
-RAW = PROJECT_ROOT / "data" / "raw"
-FOLDS = PROJECT_ROOT / "data" / "process" / "train_folds.parquet"
-
+ARTIFACTS = LAZY_ARTIFACTS
+RAW = LAZY_RAW
+FOLDS = LazyDir(lambda: process_dir() / "train_folds.parquet")
 #: 그 자체가 다른 멤버의 평균인 파일. 기본으로 제외한다.
 DERIVED = re.compile(r"^oof_(ens|blend|stack|xc)|_raw_blend|_uniform_blend|_cal$")
 
@@ -114,18 +116,40 @@ def test_path_for(oof_path: Path) -> Path:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--cv", default="group5", choices=["group5", "skf5"])
+    parser.add_argument("--cv", default="group5",
+                        choices=["group5", "skf5", "group10", "skf10"],
+                        help="라이브러리를 이 문자열로 거른다. 분할 수가 다르면 "
+                             "--folds 도 같이 준다")
     parser.add_argument("--fold-column", default=None, help="기본은 fold_<cv>")
+    parser.add_argument("--folds", type=Path, default=None,
+                        help="fold parquet 경로. 기본은 data/process/train_folds.parquet. "
+                             "`--cv group10` 처럼 5분할이 아닌 판을 돌릴 때 갈아끼운다")
     parser.add_argument("--n-rounds", type=int, default=30)
     parser.add_argument("--bag-fraction", type=float, default=0.6,
                         help="라운드마다 후보로 둘 라이브러리 비율. 1.0 이면 bagging 끄기")
     parser.add_argument("--bag-rounds", type=int, default=5)
     parser.add_argument("--random-state", type=int, default=0)
+    parser.add_argument("--form", default="mean", choices=["mean", "geometric"],
+                        help="담긴 멤버를 합치는 방식. 선택 과정에도 같이 적용된다")
     parser.add_argument("--include-blends", action="store_true",
                         help="파생 블렌드(ens/blend/stack)도 라이브러리에 넣는다")
     parser.add_argument("--allow-missing-test", action="store_true",
                         help="test 예측이 없는 멤버도 라이브러리에 넣는다 (제출 파일은 못 만든다)")
     parser.add_argument("--list-only", action="store_true", help="라이브러리만 찍고 끝낸다")
+    parser.add_argument(
+        "--members-file",
+        type=Path,
+        default=None,
+        help="라이브러리를 이 목록으로 고정한다. 예전 실행의 로그(json)를 그대로 주면 된다 "
+        "— `library` 키를 읽는다. 예전 산출물을 재현할 때 쓴다.",
+    )
+    parser.add_argument(
+        "--exclude",
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help="라이브러리에서 뺄 멤버 이름 (--members-file 을 주면 무시된다)",
+    )
     parser.add_argument("--tag", default="greedy", help="산출물 이름")
     parser.add_argument("--top", type=int, default=15, help="보고할 상위 멤버 수")
     return parser
@@ -137,7 +161,13 @@ def main() -> int:
 
     labels = pd.read_csv(RAW / "train.csv", usecols=["ID", "SUBCLASS"]).set_index("ID")["SUBCLASS"]
     classes = sorted(labels.unique())
-    folds = pd.read_parquet(FOLDS)
+    folds_path = args.folds or Path(FOLDS)
+    folds = pd.read_parquet(folds_path)
+    if fold_column not in folds.columns:
+        raise SystemExit(
+            f"{folds_path.name} 에 `{fold_column}` 열이 없다 (있는 열: "
+            f"{[c for c in folds.columns if c.startswith('fold_')]}). "
+            "`--cv` 와 `--folds` 가 같은 분할을 가리켜야 한다.")
     ids = folds["ID"].to_numpy()
     y = labels.reindex(ids).astype(str).to_numpy()
     fold_ids = folds[fold_column].to_numpy()
@@ -145,6 +175,27 @@ def main() -> int:
     named = collect(args.cv, args.include_blends)
     log(f"라이브러리 후보 {len(named)}개 ({args.cv}, 파생 블렌드 "
         f"{'포함' if args.include_blends else '제외'})")
+
+    # 라이브러리를 고정한다. 그리디 결과는 **라이브러리가 무엇이었느냐에 통째로 달려
+    # 있는데**, 이 디렉터리는 실험할 때마다 늘어난다. 예전 산출물을 재현하려면 그때의
+    # 목록이 필요하다 — `--members-file` 로 그때 로그의 `library` 를 그대로 넘긴다.
+    if args.members_file:
+        wanted = json.loads(Path(args.members_file).read_text(encoding="utf-8"))
+        wanted = set(wanted["library"] if isinstance(wanted, dict) else wanted)
+        have = {n for n, _ in named}
+        missing = sorted(wanted - have)
+        if missing:
+            raise SystemExit(
+                f"고정 목록의 멤버 {len(missing)}개가 라이브러리에 없다 (예: {missing[:3]}). "
+                "그 OOF 를 먼저 만들거나 목록을 고친다."
+            )
+        named = [(n, p) for n, p in named if n in wanted]
+        log(f"  --members-file 로 {len(named)}개만 남김")
+    elif args.exclude:
+        drop = set(args.exclude)
+        before = len(named)
+        named = [(n, p) for n, p in named if n not in drop]
+        log(f"  --exclude 로 {before - len(named)}개 제외")
     # test 예측이 없는 멤버는 **선택되기 전에** 뺀다. 뒤에서 걸러 내면 그 멤버가 뽑혔을 때
     # 제출 파일을 못 만들고, 남은 것만으로 다시 정규화하면 교차적합 점수와 다른 앙상블이 된다.
     if not args.allow_missing_test:
@@ -174,8 +225,9 @@ def main() -> int:
         selector = GreedyEnsembleSelector(
             n_rounds=args.n_rounds, bag_fraction=args.bag_fraction,
             bag_rounds=args.bag_rounds, random_state=args.random_state,
+            form=args.form,
         ).fit([a[train] for a in arrays], y[train], classes)
-        crossfit[valid] = weighted_average([a[valid] for a in arrays], selector.weights_)
+        crossfit[valid] = combine([a[valid] for a in arrays], selector.weights_, args.form)
         score = macro_f1(y[valid], np.asarray(classes)[crossfit[valid].argmax(1)])
         per_fold.append(float(score))
         chosen = int((selector.counts_ > 0).sum())
@@ -198,6 +250,7 @@ def main() -> int:
     final = GreedyEnsembleSelector(
         n_rounds=args.n_rounds, bag_fraction=args.bag_fraction,
         bag_rounds=args.bag_rounds, random_state=args.random_state,
+        form=args.form,
     ).fit(arrays, y, classes)
     log(f"전체 적합 macro F1 = {final.train_macro_f1_:.4f}   (낙관적 — 선택·보고 금지)")
 
@@ -228,7 +281,7 @@ def main() -> int:
             frame = frame.set_index("ID").reindex(sample["ID"]).reset_index()
             test_arrays.append(np.asarray(frame[cols], dtype=float))
             weights.append(final.weights_[i])
-        blended = weighted_average(test_arrays, weights)
+        blended = combine(test_arrays, weights, args.form)
         out_dir = ARTIFACTS / "test_predictions"
         pd.DataFrame({"ID": sample["ID"], **{c: blended[:, j] for j, c in enumerate(cols)}}).to_csv(
             out_dir / f"test_{args.tag}.csv", index=False)
@@ -243,6 +296,12 @@ def main() -> int:
         "tag": args.tag, "cv": args.cv, "fold_column": fold_column,
         "library_size": len(kept), "n_rounds": args.n_rounds,
         "bag_fraction": args.bag_fraction, "bag_rounds": args.bag_rounds,
+        "random_state": args.random_state, "form": args.form,
+        "folds_path": str(folds_path),
+        # 라이브러리 **전체** 목록. 선택된 멤버만 남기면 나중에 이 실행을 다시 못 만든다 —
+        # 그리디 결과는 후보가 무엇이었느냐에 통째로 달려 있고 이 디렉터리는 계속 늘어난다.
+        # 이 목록을 `--members-file` 로 그대로 넘기면 같은 결과가 나온다.
+        "library": names,
         "crossfit_macro_f1": crossfit_score, "crossfit_fold_macro_f1": per_fold,
         "full_fit_macro_f1": {"value": final.train_macro_f1_,
                               "warning": "optimistic_not_for_model_selection"},

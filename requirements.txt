@@ -1,22 +1,60 @@
-# pip install -r requirements.txt
+# 설치:  python -m pip install -r requirements.txt
+# 확인:  python scripts/check_models.py      # 모델 4종 + 버전 핀 일치까지 본다
+#
+# 버전을 == 로 박아 둔 이유
+# ---------------------------------------------------------------------------
+# 우리는 멤버마다 다른 기계(로컬 / Colab)에서 뽑은 OOF 를 한데 모아 블렌딩한다.
+# 그런데 GBDT 3종과 scikit-learn 은 버전이 바뀌면 같은 seed·같은 파라미터로도
+# 트리가 달라진다. 그러면 각자의 CV 점수는 멀쩡해 보이는데 합쳐 놓은 OOF 만
+# 조용히 어긋난다. 예측을 바꾸는 라이브러리는 그래서 전부 고정한다.
+#
+# 기준 환경은 Python 3.14.6 (Windows), code/.venv 다.
+# 이 venv 를 통째로 복원하려면 transitive 까지 담긴 requirements.lock.txt 를 쓴다.
 
-# Core
-numpy
-pandas
-scipy
-scikit-learn
-pyarrow
-joblib
-PyYAML
-torch
 
-# GBDT
-xgboost
-lightgbm
-catboost
+# 예측을 바꾸는 것들 — 올리려면 팀에 먼저 알리고 OOF 를 다시 뽑는다
+scikit-learn==1.9.0
+xgboost==3.3.0
+lightgbm==4.7.0
+catboost==1.2.10
 
-# 하이퍼파라미터 탐색 (scripts/tune_optuna.py)
-# sqlite storage 를 쓰므로 sqlalchemy 가 같이 딸려 온다.
-optuna
+# 수치 계산 기반
+numpy==2.5.1
+scipy==1.18.0
 
-# 설치 확인: python scripts/check_models.py
+# 데이터 입출력
+pandas==3.0.5
+pyarrow==25.0.0         # pandas 의 parquet 엔진. 직접 import 하는 곳은 없다
+joblib==1.5.3           # BaseGBDT.save / load
+
+# 하이퍼파라미터 탐색 (scripts/tune_optuna.py) — sqlite storage 라 sqlalchemy 가 딸려온다
+optuna==4.9.0
+
+# 설정 파일 (configs/*.yaml)
+PyYAML==6.0.3
+
+# 딥러닝 (scripts/train_dl.py, src/cancer_hack/models_dl.py)
+#
+# 이 venv 에 깔린 건 CUDA 12.8 빌드다(RTX 5070). PyPI 기본 휠은 CPU 전용이라
+# `pip install torch==2.11.0` 만 하면 GPU 를 못 쓴다. CUDA 빌드는 인덱스를 지정한다:
+#
+#   pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+#
+# GBDT 파이프라인은 torch 없이 그대로 돈다 — DL 을 안 돌릴 사람은 건너뛰어도 된다.
+torch==2.11.0
+
+# 개발용. 학습 자체에는 필요 없다
+pytest==9.1.1           # tests/
+ipykernel==7.3.0        # 제출용 노트북 커널 (kernelspec: oncoai)
+
+
+# Colab 에서 돌릴 때
+# ---------------------------------------------------------------------------
+# Colab 은 파이썬이 3.14 가 아니라서 이 파일을 그대로 install 하면 numpy·pandas
+# 휠을 못 찾고 깨진다. 맨 위 "예측을 바꾸는 것들" 네 줄만 맞추면 된다:
+#
+#   !pip install -q scikit-learn==1.9.0 xgboost==3.3.0 lightgbm==4.7.0 catboost==1.2.10
+#
+# 설치한 뒤 런타임을 재시작해야 실제로 반영된다. numpy 는 Colab 기본값을 그대로
+# 둔다 — 억지로 올리면 런타임 스택이 먼저 깨지고, 트리 재현에는 위 네 개가 걸린다.
+# 버전이 다른 채로 뽑은 OOF 는 블렌딩에 넣지 않는다.

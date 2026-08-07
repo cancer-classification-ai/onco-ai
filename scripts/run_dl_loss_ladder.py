@@ -20,9 +20,12 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_ARTIFACTS, artifacts_dir  # noqa: E402
 from cancer_hack.validation import CV_SLUG  # noqa: E402
 
-ARTIFACTS = PROJECT_ROOT / "artifacts"
+ARTIFACTS = LAZY_ARTIFACTS
 CONFIG_DIR = ARTIFACTS / "configs" / "dl_loss_ladder"
 COMPARISON_DIR = ARTIFACTS / "comparisons"
 

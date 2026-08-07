@@ -1103,8 +1103,6 @@ def test_f16_runs_both_latent_methods():
     """
     latent = [b for b in train_gbdt.CONFIGS["f16"]["blocks"] if b in train_gbdt.LATENT_BLOCKS]
     assert train_gbdt._resolve_latent_methods(latent, "svd") == ["svd", "nmf"]
-
-
 def test_frequency_configs_are_wired_as_fold_only_blocks():
     assert train_gbdt.CONFIGS["f4r_freq"]["blocks"][-1] == "freq21"
     assert train_gbdt.CONFIGS["f4r_aatrans"]["blocks"][-1] == "aatrans9"

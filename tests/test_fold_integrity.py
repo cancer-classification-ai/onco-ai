@@ -304,10 +304,10 @@ def test_make_folds_cli_handles_external_input_path(tmp_path: Path, monkeypatch)
     _frame_with_duplicates().to_csv(raw_path, index=False)
     out_path = tmp_path / "train_folds.parquet"
 
-    # `GROUP_CACHE` 는 CLI 인자가 아니라 모듈 상수(실제 repo 의 data/process/ 를
-    # 가리킨다) — 여기서 리다이렉트하지 않으면 테스트가 실제 데이터용 캐시를
-    # 합성 ID(`s0`..)로 덮어써 버린다.
-    monkeypatch.setattr(make_folds, "GROUP_CACHE", tmp_path / "group_keys_cache.parquet")
+    # 그룹 캐시 경로는 CLI 인자가 아니라 `cancer_hack.paths` 의 process 디렉터리에서
+    # 나온다(실제 repo 의 data/process/). 여기서 리다이렉트하지 않으면 테스트가
+    # 실제 데이터용 캐시를 합성 ID(`s0`..)로 덮어써 버린다.
+    monkeypatch.setenv("ONCO_PROCESS_DIR", str(tmp_path))
     monkeypatch.setattr(
         sys, "argv", ["make_folds.py", "--input", str(raw_path), "--out", str(out_path)]
     )

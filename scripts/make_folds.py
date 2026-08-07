@@ -49,10 +49,23 @@ from cancer_hack.validation import (  # noqa: E402
     fold_column,
 )
 
-RAW_TRAIN = PROJECT_ROOT / "data/raw/train.csv"
-PROC_DIR = PROJECT_ROOT / "data/process"
-OUT_PATH = PROC_DIR / "train_folds.parquet"
-GROUP_CACHE = PROC_DIR / "train_group_keys.parquet"
+from cancer_hack.paths import (  # noqa: E402
+    LAZY_PROCESS as PROC_DIR,
+    LAZY_RAW as RAW_DIR,
+)
+
+
+# 경로는 쓰는 시점에 정한다 — 노트북이 `use_run_dirs()` 로 출력 위치를 옮길 수 있게.
+def default_train_csv():
+    return RAW_DIR / "train.csv"
+
+
+def default_out_path():
+    return PROC_DIR / "train_folds.parquet"
+
+
+def group_cache_path():
+    return PROC_DIR / "train_group_keys.parquet"
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,8 +80,8 @@ def parse_args() -> argparse.Namespace:
         help="fold 분할 시드. 모델 시드(`train_gbdt --seed`)와 별개다.",
     )
     parser.add_argument("--label-col", type=str, default="SUBCLASS")
-    parser.add_argument("--input", type=Path, default=RAW_TRAIN)
-    parser.add_argument("--out", type=Path, default=OUT_PATH, help="저장할 Parquet 경로")
+    parser.add_argument("--input", type=Path, default=None)
+    parser.add_argument("--out", type=Path, default=None, help="저장할 Parquet 경로")
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -84,6 +97,10 @@ def meta_path(out_path: Path) -> Path:
 
 def main() -> None:
     args = parse_args()
+    if args.input is None:
+        args.input = default_train_csv()
+    if args.out is None:
+        args.out = default_out_path()
 
     if args.out.exists() and not args.overwrite:
         raise SystemExit(
@@ -102,7 +119,7 @@ def main() -> None:
         label_column=args.label_col,
         n_splits=args.n_splits,
         seed=args.seed,
-        group_cache_path=GROUP_CACHE,
+        group_cache_path=group_cache_path(),
     )
     columns = [fold_column(kind, args.n_splits) for kind in ("skf", "sgkf")]
     n_groups = folds["group_key"].nunique()

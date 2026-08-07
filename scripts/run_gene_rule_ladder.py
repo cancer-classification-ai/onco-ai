@@ -18,6 +18,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import artifacts_dir  # noqa: E402
 from cancer_hack.validation import CV_SLUG  # noqa: E402
 from run_dl_ladder import check_inputs  # noqa: E402
 
@@ -106,14 +109,13 @@ def main() -> None:
         tag = f"{experiment}_s{args.seed}"
         stem = f"dl_{model}_{tag}_{CV_SLUG[args.cv]}"
         expected = [
-            PROJECT_ROOT / "artifacts/oof" / f"oof_{stem}.csv",
-            PROJECT_ROOT / "artifacts/test_predictions" / f"test_{stem}.csv",
-            PROJECT_ROOT / "artifacts/logs" / f"{stem}.json",
+            artifacts_dir() / "oof" / f"oof_{stem}.csv",
+            artifacts_dir() / "test_predictions" / f"test_{stem}.csv",
+            artifacts_dir() / "logs" / f"{stem}.json",
         ]
         if not args.no_submission:
             expected.append(
-                PROJECT_ROOT
-                / "artifacts/submissions"
+                artifacts_dir() / "submissions"
                 / f"submission_{stem}.csv"
             )
         if args.skip_existing and not args.dry_run and all(path.exists() for path in expected):

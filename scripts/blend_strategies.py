@@ -57,11 +57,15 @@ for _stream in (sys.stdout, sys.stderr):
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import LAZY_RAW, LazyDir, artifacts_dir, process_dir, raw_dir  # noqa: E402
+from cancer_hack.validation import SEED_ENSEMBLE  # noqa: E402
 from cancer_hack.metrics import macro_f1  # noqa: E402
 
-RAW = PROJECT_ROOT / "data" / "raw"
-OOF = PROJECT_ROOT / "artifacts" / "oof"
-FOLDS = PROJECT_ROOT / "data" / "process" / "train_folds.parquet"
+RAW = LAZY_RAW
+OOF = LazyDir(lambda: artifacts_dir() / "oof")
+FOLDS = LazyDir(lambda: process_dir() / "train_folds.parquet")
 SLUG = "k500_sp1000m3p2_cm20drishamm83824c_lt64svdnmfl257c23c_gm24shac918bc_sg30sha71bc36"
 MODELS = ["xgb", "catboost", "rf"]
 FIXED_WEIGHTS = np.array([0.45, 0.45, 0.10])
@@ -137,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--cv", default="group5", choices=["group5", "skf5"])
-    parser.add_argument("--seeds", type=int, nargs="+", default=[42, 7, 2024])
+    parser.add_argument("--seeds", type=int, nargs="+", default=list(SEED_ENSEMBLE))
     parser.add_argument("--config", default="f16")
     parser.add_argument("--tag", default="repo16")
     parser.add_argument("--tempera-grid", type=float, nargs="+",
@@ -206,7 +210,7 @@ def main() -> int:
     for name, score in sorted(results.items(), key=lambda r: -r[1]):
         log(f"{name:18s} {score:18.4f}")
 
-    out = PROJECT_ROOT / "artifacts" / "logs" / f"blend_strategies_{args.config}_{args.cv}.json"
+    out = artifacts_dir() / "logs" / f"blend_strategies_{args.config}_{args.cv}.json"
     out.write_text(json.dumps({"config": args.config, "cv": args.cv, "seeds": args.seeds,
                                "crossfit_macro_f1": results}, ensure_ascii=False, indent=2),
                    encoding="utf-8")

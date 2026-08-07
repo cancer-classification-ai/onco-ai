@@ -450,7 +450,21 @@ class CatBoostModel(BaseGBDT):
         p["random_seed"] = self.random_state
         p["task_type"] = "GPU" if self.use_gpu else "CPU"
         if self.use_gpu:
-            p.pop("rsm", None)  # GPU 모드는 rsm 미지원
+            # GPU 는 `rsm != 1` 을 못 받는다 (CatBoostError: "rsm on GPU is supported for
+            # pairwise modes only"). 예전에는 여기서 **조용히 빼 버렸다.** 그러면 같은
+            # 설정을 줘도 device 에 따라 다른 모델이 나온다 — GPU 는 열 샘플링 없이,
+            # CPU 는 `rsm` 대로. 실제로 f2l 에서 두 결과가 0.0089 벌어졌고 그게 device
+            # 차이인지 rsm 차이인지 구별할 수 없었다.
+            #
+            # 조용히 바꾸는 대신 막는다. GPU 로 돌리려면 호출자가 `rsm=1` 을 명시해야 한다.
+            rsm = p.get("rsm")
+            if rsm is not None and float(rsm) != 1.0:
+                raise ValueError(
+                    f"CatBoost GPU 는 rsm={rsm} 을 지원하지 않는다(1 만 가능). "
+                    "`--set rsm=1` 로 명시하거나 `--device cpu` 로 돌린다. "
+                    "조용히 무시하면 GPU 와 CPU 가 다른 모델이 된다."
+                )
+            p.pop("rsm", None)
         return CatBoostClassifier(**p)
 
     def _fit_backend(self, est, X, yi, sample_weight, eval_set, early_stopping_rounds, verbose):

@@ -18,14 +18,18 @@ import pandas as pd
 import pytest
 
 from cancer_hack.provenance import (
+    EXPECTED_FEATURE_FINGERPRINTS,
     EXPECTED_FOLD_FINGERPRINT,
+    check_feature_fingerprints,
     check_fold_fingerprint,
     fold_fingerprint,
     frame_fingerprint,
+    parquet_fingerprint,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FOLDS = PROJECT_ROOT / "data" / "process" / "train_folds.parquet"
+PROCESS = PROJECT_ROOT / "data" / "process"
+FOLDS = PROCESS / "train_folds.parquet"
 
 
 def _require_folds() -> Path:
@@ -76,6 +80,45 @@ def test_fingerprint_changes_when_a_fold_moves():
     moved.loc[0, "fold_group5"] = 3
     columns = ("ID", "fold_skf5", "fold_group5")
     assert frame_fingerprint(frame, columns) != frame_fingerprint(moved, columns)
+
+
+def test_feature_parquets_are_the_ones_the_artifacts_were_built_with():
+    """피처 캐시가 바뀌면 기존 OOF 와 새 예측을 섞을 수 없다.
+
+    특히 `mutation_encoded` 는 **지금 코드와 이미 어긋나 있다.** develop 을 머지하면서
+    `features_basic.encode_mutation` 이 `*931*` 같은 동의 정지코돈을 2 가 아니라 1 로
+    세도록 바뀌었는데(정정이 맞다) 이 파켓은 그 전 코드로 만들어졌다. 그래서
+    `make_features.py` 를 다시 돌리면 enc3·comut·lsvd·lnmf·gmod 가 전부 달라진다.
+    재생성은 전부 다시 학습할 때만 한다.
+    """
+    if not PROCESS.exists():
+        pytest.skip("data/process 없음")
+    missing = [n for n in EXPECTED_FEATURE_FINGERPRINTS if not (PROCESS / n).exists()]
+    if missing:
+        pytest.skip(f"피처 캐시 {len(missing)}개 없음 (예: {missing[0]})")
+    check_feature_fingerprints(PROCESS)
+
+
+def test_parquet_fingerprint_ignores_row_order(tmp_path: Path):
+    frame = pd.DataFrame({"ID": ["b", "a", "c"], "x": [1, 2, 3], "y": [4, 5, 6]})
+    a, b = tmp_path / "a.parquet", tmp_path / "b.parquet"
+    frame.to_parquet(a)
+    frame.iloc[::-1].to_parquet(b)
+    assert parquet_fingerprint(a) == parquet_fingerprint(b)
+
+
+def test_parquet_fingerprint_catches_a_changed_value(tmp_path: Path):
+    frame = pd.DataFrame({"ID": ["a", "b"], "x": [1, 2]})
+    a, b = tmp_path / "a.parquet", tmp_path / "b.parquet"
+    frame.to_parquet(a)
+    frame.assign(x=[1, 3]).to_parquet(b)
+    assert parquet_fingerprint(a) != parquet_fingerprint(b)
+
+
+def test_feature_check_raises_with_an_actionable_message(tmp_path: Path):
+    pd.DataFrame({"ID": ["a"], "x": [1]}).to_parquet(tmp_path / "toy.parquet")
+    with pytest.raises(ValueError, match="피처 파켓이 예측을 만들 때와 다르다"):
+        check_feature_fingerprints(tmp_path, {"toy.parquet": "0000000000000000"})
 
 
 def test_check_raises_with_an_actionable_message(tmp_path: Path):

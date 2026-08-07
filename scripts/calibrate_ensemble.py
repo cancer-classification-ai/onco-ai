@@ -44,9 +44,20 @@ from cancer_hack.metrics import (  # noqa: E402
     read_prediction_frame,
 )
 
-ARTIFACTS = PROJECT_ROOT / "artifacts"
-DEFAULT_FOLDS = PROJECT_ROOT / "data/process/train_folds.parquet"
-DEFAULT_SAMPLE = PROJECT_ROOT / "data/raw/sample_submission.csv"
+# 경로는 `cancer_hack.paths` 가 정한다 — 값은 쓰는 시점에 정해진다.
+from cancer_hack.paths import (  # noqa: E402
+    LAZY_ARTIFACTS as ARTIFACTS,
+    process_dir,
+    raw_dir,
+)
+
+
+def default_folds() -> Path:
+    return process_dir() / "train_folds.parquet"
+
+
+def default_sample() -> Path:
+    return raw_dir() / "sample_submission.csv"
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--oof", type=Path, nargs="+", required=True)
     parser.add_argument("--test", type=Path, nargs="+", required=True)
-    parser.add_argument("--folds", type=Path, default=DEFAULT_FOLDS)
+    parser.add_argument("--folds", type=Path, default=None)
     parser.add_argument("--fold-column", default="fold_skf5")
     parser.add_argument("--tag", required=True)
     parser.add_argument(
@@ -70,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tvd-warning-threshold", type=float, default=0.10)
     parser.add_argument("--submission", action="store_true")
-    parser.add_argument("--sample-submission", type=Path, default=DEFAULT_SAMPLE)
+    parser.add_argument("--sample-submission", type=Path, default=None)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -148,6 +159,11 @@ def _check_output_paths(paths: list[Path], *, overwrite: bool) -> None:
 
 def main() -> None:
     args = parse_args()
+    # 기본값은 파싱 시점이 아니라 여기서 정한다 — 노트북이 출력 위치를 옮겼을 수 있다.
+    if args.folds is None:
+        args.folds = default_folds()
+    if args.sample_submission is None:
+        args.sample_submission = default_sample()
     if len(args.oof) != len(args.test):
         raise ValueError("--oof 와 --test 파일 수가 같아야 한다")
 
